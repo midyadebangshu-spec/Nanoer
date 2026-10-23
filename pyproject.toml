@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nanoer"
+version = "0.1.0"
+description = "Chunked compression with live extraction: play huge compressed files without extracting them"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+
+[project.optional-dependencies]
+zstd = ["zstandard>=0.22"]
+
+[project.scripts]
+nanoer = "nanoer.cli:main"
+
+[tool.setuptools]
+packages = ["nanoer"]
