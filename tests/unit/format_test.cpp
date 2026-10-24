@@ -114,6 +114,19 @@ TEST(Superblock, InconsistentFieldsAreInvalid) {
   EXPECT_EQ(check([](Superblock& s) { s.data_start = 4096; }), S::invalid);
 }
 
+TEST(Superblock, ReservedBytesAreIgnored) {
+  // Found by fuzzing: a valid superblock may carry non-zero reserved bytes
+  // (written by a later minor version); they must not change the fields.
+  Superblock sb = sample();
+  Bytes block = encode_superblock(sb);
+  block[300] = 0x5a;                    // reserved area
+  block[144 + sb.label.size() + 5] = 1;  // after the label's NUL
+  DecodedSuperblock d = decode_superblock(reseal(block));
+  ASSERT_EQ(d.state, DecodedSuperblock::State::valid) << d.reason;
+  EXPECT_EQ(d.sb.label, sb.label);
+  EXPECT_EQ(encode_superblock(d.sb), encode_superblock(sb));
+}
+
 TEST(Superblock, LabelLimit) {
   Superblock sb = sample();
   sb.label = std::string(63, 'x');

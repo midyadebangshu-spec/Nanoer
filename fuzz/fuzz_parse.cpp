@@ -18,8 +18,15 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
   std::copy_n(data, std::min<std::size_t>(size, block.size()), block.begin());
   nanoer::DecodedSuperblock sb = nanoer::decode_superblock(block);
   if (sb.state == nanoer::DecodedSuperblock::State::valid) {
-    // Anything accepted must re-encode to the same bytes.
-    if (nanoer::encode_superblock(sb.sb) != block) __builtin_trap();
+    // Reserved bytes are ignored when read and written as zero, so an
+    // accepted block need not re-encode to the same bytes. Its canonical
+    // encoding must, though, decode to the same fields and be stable.
+    nanoer::Bytes canonical = nanoer::encode_superblock(sb.sb);
+    nanoer::DecodedSuperblock again = nanoer::decode_superblock(canonical);
+    if (again.state != nanoer::DecodedSuperblock::State::valid ||
+        nanoer::encode_superblock(again.sb) != canonical) {
+      __builtin_trap();
+    }
   }
 
   nanoer::Uuid uuid{};

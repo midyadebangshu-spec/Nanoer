@@ -52,11 +52,18 @@ jobs:
         run: cmake --preset fuzz -DNANOER_WERROR=ON && cmake --build --preset fuzz
       - name: Run fuzzers
         run: |
+          mkdir -p crashes
           for target in decompress roundtrip parse; do
             mkdir -p corpus/$target
             ./build/fuzz/fuzz/fuzz_$target -max_total_time=120 -rss_limit_mb=2048 \
-              corpus/$target fuzz/seeds/$target
+              -artifact_prefix=crashes/ corpus/$target fuzz/seeds/$target
           done
+      - name: Keep crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: crashes/
 
   integration:
     name: integration (real FUSE mount, pjdfstest, xfstests fsx)

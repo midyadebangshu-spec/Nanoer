@@ -797,6 +797,13 @@ table fallback that processes 8 bytes per step.
 - **Lesson:** a test that copies a tree and compares it must use a tree
   nothing else is writing to. Copying the source tree failed spuriously
   while a build was running inside it.
+- **Lesson:** a fuzzer's checks must follow the specification, not a
+  stricter guess. `fuzz_parse` demanded that an accepted superblock
+  re-encode to the same bytes, but the format ignores reserved bytes, so CI's
+  fuzzer (after ~2 million inputs, by constructing a valid CRC) found a valid
+  superblock that "failed". The check is now "the canonical encoding is
+  stable", and a unit test pins the reserved-bytes rule. CI now keeps
+  crashing inputs as artifacts.
 - **Benchmarks** compared with ext4 (no compression) and Btrfs + zstd: space
   used, throughput, latency, CPU time.
 
