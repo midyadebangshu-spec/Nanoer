@@ -464,6 +464,36 @@ the **on-disk format must be specified independently of the C++ code**
 - **Image-based OSes** do this today: SteamOS, Fedora Silverblue, Android
   (EROFS system partitions).
 
+### 9.5 Memory: demand paging, and why Nanoer does not reduce RAM
+
+A common assumption is that loading a chunk instead of the whole program
+saves RAM. It does not, because Linux already loads programs lazily:
+
+- **Demand paging:** executables and libraries are memory-mapped (`mmap`).
+  A 4 KiB page is read into RAM only when the program first touches it, and
+  unused clean pages can be dropped under memory pressure and re-read later.
+  The whole program is never loaded at once, with or without Nanoer.
+- **A program's RAM use is mostly its own data:** heap allocations, decoded
+  textures, levels, documents, browser tabs. Storage format does not change
+  it.
+- **Nanoer adds RAM:** the safe space (configurable), metadata, and possible
+  double caching with the kernel page cache (§8.3).
+- **What Nanoer does save:** disk space, and fewer bytes read from disk. On
+  slow storage (HDD, SD card, USB) that can make loading faster, at the cost
+  of CPU time for decompression.
+
+**Technologies that do reduce RAM use** compress memory pages themselves,
+separately from the filesystem:
+
+- **zram:** a compressed block device in RAM, used as swap. Fedora enables it
+  by default (since Fedora 33).
+- **zswap:** a compressed in-RAM cache in front of a swap device.
+- Windows and macOS have built-in memory compression too.
+
+They typically fit 2–3× more inactive memory into the same RAM *(approx.)*,
+at some CPU cost. A later Nanoer stage could configure them with good
+defaults, but they are not part of the Nanoer filesystem.
+
 ---
 
 ## 10. Existing systems and how Nanoer differs
