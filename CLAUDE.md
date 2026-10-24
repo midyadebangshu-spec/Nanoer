@@ -12,24 +12,24 @@ Guidance for Claude when working in this repository.
   through, stop and get the new plan approved too.
 - Single-step requests (answering a question, a one-line fix, a typo) can go
   ahead without a plan.
+- **Keep `KNOWLEDGE.md` current.** Whenever a technology, algorithm, design
+  decision, measurement or rejected alternative is added or changed, record
+  it in `KNOWLEDGE.md` (including the reason) in the same commit. New
+  decisions also go in its decision log.
 
 ## Project overview
 
-Nanoer is a chunked compression format with **live extraction**: large files
-are compressed in independent chunks and read, played or streamed without full
-extraction. Only a bounded "safe space" of decompressed chunks is kept in
-memory.
+Nanoer is transparent, OS-level compression for Linux: data is stored as
+independently compressed chunks and decompressed on demand (**live
+extraction**) within a bounded memory budget (the **safe space**). The goal is
+that a system needing 800 GB without Nanoer needs about 500 GB with it.
 
-- `nanoer/format.py`: on-disk layout (header, chunks, index, trailer)
-- `nanoer/codecs.py`: zlib / bz2 / lzma / optional zstd
-- `nanoer/packer.py`: builds `.nnr` archives
-- `nanoer/reader.py`: `Archive` (chunk window, prefetch) and `ArchiveFile` (seekable file object)
-- `nanoer/server.py`: HTTP server with Range support for media players
-- `nanoer/cli.py`: `pack`, `info`, `play`, `serve`, `cat`, `unpack`
+- Stage 1 (current): C++20 engine + read-write FUSE filesystem `nanoerfs`.
+  Plan: `docs/STAGE1_PLAN.md`.
+- Stage 2: whole OS on Nanoer. Stage 3: kernel driver in C or Rust.
+- `KNOWLEDGE.md`: all technical background, reasoning, measurements and the
+  decision log.
+- Licence: Apache-2.0. A future kernel module will be Dual MIT/GPL.
 
-## Commands
-
-```bash
-python -m unittest -v      # run tests (the video test needs ffmpeg)
-python -m nanoer --help
-```
+No code exists yet; the previous Python prototype was removed and remains in
+git history.

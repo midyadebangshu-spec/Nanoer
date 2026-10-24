@@ -1,5 +1,13 @@
-__pycache__/
-*.egg-info/
+# Build output
 build/
-dist/
+build-*/
+cmake-build-*/
+compile_commands.json
+
+# Editors
+.vscode/
+.idea/
+
+# Test and benchmark artifacts
 *.nnr
+*.img
