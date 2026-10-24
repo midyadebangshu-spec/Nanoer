@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  PACKAGES: >-
+    cmake ninja-build pkg-config clang libclang-rt-18-dev
+    libzstd-dev liblz4-dev liblzma-dev libxxhash-dev libgtest-dev libfuse3-dev
+
+jobs:
+  test:
+    name: ${{ matrix.compiler }} / ${{ matrix.preset }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { compiler: gcc, preset: debug }
+          - { compiler: gcc, preset: release }
+          - { compiler: gcc, preset: asan }
+          - { compiler: clang, preset: asan }
+          - { compiler: clang, preset: tsan }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y $PACKAGES
+      - name: Verify vendored BLAKE3
+        run: cd third_party/blake3 && sha256sum -c SHA256SUMS
+      - name: Configure
+        run: |
+          if [ "${{ matrix.compiler }}" = clang ]; then export CC=clang CXX=clang++; else export CC=gcc CXX=g++; fi
+          cmake --preset ${{ matrix.preset }} -DNANOER_WERROR=ON
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }}
+      - name: Test
+        run: ctest --preset ${{ matrix.preset }}
+
+  fuzz:
+    name: fuzz (smoke, 2 min per target)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y $PACKAGES
+      - name: Build fuzzers
+        run: cmake --preset fuzz -DNANOER_WERROR=ON && cmake --build --preset fuzz
+      - name: Run fuzzers
+        run: |
+          for target in decompress roundtrip parse; do
+            mkdir -p corpus/$target
+            ./build/fuzz/fuzz/fuzz_$target -max_total_time=120 -rss_limit_mb=2048 \
+              corpus/$target fuzz/seeds/$target
+          done

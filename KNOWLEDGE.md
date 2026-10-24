@@ -53,9 +53,15 @@ is ever fully extracted to disk.
 
 Linux first. Windows and macOS come later.
 
+**Status:** stage 1, milestone **M1 (foundation) complete** (2026-10-24):
+codecs, checksums, backing stores, on-disk format (superblocks, segments,
+records), `mkfs.nanoer`, `nanoer info/bench`, tests, fuzzing, CI. Next: M2,
+the working filesystem.
+
 **Saving 37.5 % of the disk (800 → 500) needs an average compression ratio of
 1.6 : 1.** That is realistic for OS files, applications, code and documents
-(measured at about 3 : 1, see §14) and impossible for already-encoded media
+(measured at 42.5 % of original size with fast zstd, 37.2 % with maximum
+zstd, see §14) and impossible for already-encoded media
 (about 1 : 1). Total savings depend on what is on the disk.
 
 ---
@@ -123,7 +129,8 @@ LZ4 dominate modern filesystems.
 ## 3. Codecs
 
 Typical single-core figures *(approx.)*. Exact numbers depend heavily on data
-and CPU.
+and CPU. **Measured on Linux system files with Nanoer's own benchmark: see
+§14.**
 
 | Codec | Method | Compress | Decompress | Ratio | Nanoer role |
 |---|---|---|---|---|---|
@@ -172,7 +179,32 @@ licence 0BSD in current releases.
 > backdoor (CVE-2024-3094, found in March 2024). Nanoer pins dependency
 > versions, builds them from known sources, and documents each one here.
 
-### 3.4 Incompressibility detection
+### 3.4 How Nanoer calls the codecs (M1 implementation)
+
+- **LZ4:** the raw **block** format (`LZ4_compress_default`, or
+  `LZ4_compress_HC` for levels 3–12), not the LZ4 frame format. Nanoer's
+  record header already stores sizes and checksums, so a frame would only add
+  overhead.
+- **zstd:** one frame per chunk. Compression and decompression contexts are
+  created once **per thread** and reused (`thread_local`), because creating
+  a context costs more than compressing a small chunk.
+- **LZMA:** an **.xz stream with check type None** (Nanoer has its own
+  checksums) holding a single LZMA2 filter. The xz container was chosen
+  because the Linux kernel's xz decoder reads it directly (stage 3). The
+  LZMA2 **dictionary is shrunk to the chunk size**: liblzma's one-shot API
+  otherwise allocates the preset's full dictionary (8 MiB at preset 6) for
+  every call, which is pure waste for a 128 KiB chunk. The decoder refuses
+  streams needing more than 128 MiB of memory, so damaged data cannot cause
+  huge allocations.
+- **Null pointers:** an empty buffer may have a null data pointer, and
+  liblz4's HC compressor crashes on null even with length 0 (found by
+  Nanoer's tests). Nanoer passes a valid dummy address for empty buffers to
+  every codec.
+- **Kernel availability:** the kernel already contains decoders for LZ4,
+  zstd and xz (`lib/lz4`, `lib/zstd`, `lib/xz`). No other codec is used,
+  so a stage 3 kernel driver needs no new decompressors.
+
+### 3.5 Incompressibility detection
 
 Compressing data that will not shrink wastes CPU. Strategies, cheapest first:
 
@@ -242,6 +274,9 @@ data**.
   requires reading and decompressing the candidate and is too slow.
 - The checksum covers the **uncompressed** data, and verification happens
   after decompression. This catches codec bugs as well as disk errors.
+- Every record also carries a **CRC-32C of its stored payload** and one of
+  its header. These let scans (log replay, `fsck`, GC) check a record without
+  decompressing it, and detect torn writes at the end of the log.
 
 ---
 
@@ -274,6 +309,34 @@ cold-data recompaction.
 ---
 
 ## 7. Storage engine design
+
+### 7.0 Nanoer's on-disk format (version 1)
+
+The byte-level specification is `docs/format.md`. Its main design choices:
+
+- **Two superblocks, alternating.** Generation `g` goes to slot `g mod 2`, so
+  writing a new superblock never touches the newest valid one. A torn
+  superblock write therefore cannot lose the filesystem (tested by simulating
+  power cuts mid-write).
+- **Never fall back past an unsupported superblock.** If the newest intact
+  superblock is from a newer format version, mounting is refused. Using the
+  older slot instead would silently throw away newer changes.
+- **Feature flags** in three classes, as in ext4: compat (ignore),
+  ro_compat (mount read-only), incompat (refuse).
+- **Segments carry the filesystem UUID and a sequence number.** A segment
+  is in use only if its header names this filesystem. So `mkfs` does not
+  need to clear segments, and stays instant even on a 1 TB disk.
+- **Records carry their segment's sequence number.** When GC frees a segment
+  and the log reuses it, old records left behind beyond the new log's end
+  still look intact, but have an older sequence number. The scanner rejects
+  them. Without this, stale data could be replayed after a crash.
+- **8-byte record alignment.** 4 KiB alignment would waste on average 2 KiB
+  per chunk (over 5 % on compressed 128 KiB chunks); 8 bytes keeps integer
+  fields aligned at negligible cost.
+- **Data starts at 1 MiB** (partition and SSD erase-block alignment, and room
+  reserved for future structures). Segment headers are one 4 KiB block.
+- **Data chunks record their owner** (inode, file offset), so `fsck` and GC
+  can identify a chunk from a segment scan alone.
 
 ### 7.1 Why not update compressed data in place
 
@@ -548,6 +611,30 @@ Dependencies come from distribution packages located through `pkg-config`,
 at pinned minimum versions. Every dependency and its licence is listed here
 (supply-chain hygiene, §3.3).
 
+**Versions in use** (Ubuntu 24.04, 2026-10-24): zstd 1.5.5, LZ4 1.9.4,
+XZ Utils / liblzma 5.4.5 (from before the 5.6.0/5.6.1 backdoor), xxHash
+0.8.2, libfuse 3.14.0 (used from M2), GoogleTest 1.14.0, CMake 3.28,
+GCC 13.3, Clang 18. Minimum versions required by the build: zstd 1.4.5,
+LZ4 1.9.0, liblzma 5.2.0, xxHash 0.8.0.
+
+**BLAKE3** is vendored in `third_party/blake3`: the official C
+implementation 1.3.1, taken from Ubuntu's `librust-blake3-dev` package
+(signed archive) because GitHub downloads were blocked in the build
+environment. `SHA256SUMS` pins every file, and CI checks it. The portable,
+SSE2, SSE4.1, AVX2, AVX-512 and NEON code paths are built with runtime CPU
+detection.
+
+**Error handling:** the engine throws `nanoer::Error`, which carries a
+category (I/O, corrupt, invalid argument, unsupported, no space, busy) and
+the system errno. The FUSE adapter converts it to an errno at the boundary.
+Corruption is reported as `EUCLEAN`, as Btrfs and ext4 do. Exceptions were
+chosen over error-code returns because they keep the many layers of
+storage code readable, and C++ is never used in the kernel anyway (§9.3).
+
+**CRC-32C** is Nanoer's own code: the SSE4.2 `crc32` instruction on x86-64
+or the ARMv8 CRC instructions, detected at run time, with a slicing-by-8
+table fallback that processes 8 bytes per step.
+
 ---
 
 ## 12. Testing and verification techniques
@@ -567,6 +654,13 @@ at pinned minimum versions. Every dependency and its licence is listed here
 - **Fuzzing:** feed corrupted or random images to the mounter and `fsck`.
   They must reject them cleanly, never crash or return wrong data.
 - **Sanitizers** on every CI run.
+- **In M1:** 59 unit tests (GoogleTest), an end-to-end test of the tools,
+  ASan + UBSan builds with GCC and Clang, a ThreadSanitizer build, and three
+  libFuzzer targets (decompressors, codec round trips, on-disk structure
+  parsing) with seed inputs in `fuzz/seeds`. **Lesson:** fuzz coverage was
+  near zero until the library itself was compiled with
+  `-fsanitize=fuzzer-no-link`. Instrumenting only the fuzzer's entry file
+  is not enough.
 - **Benchmarks** compared with ext4 (no compression) and Btrfs + zstd: space
   used, throughput, latency, CPU time.
 
@@ -613,9 +707,43 @@ container), compressed in independent chunks. Stored-raw fallback applied.
 | 128 KiB | 35.9 % | 31.5 % |
 | 4 MiB | 35.5 % | 29.9 % |
 
-**Conclusions:** system files compress about **3 : 1**, so 800 → 500 GB is
-achievable for OS and application data. Bigger chunks help only slightly, so
+**Conclusions:** system files compress well, so 800 → 500 GB is achievable
+for OS and application data. (This sample was later found to be skewed
+toward a few large files; the 2026-10-24 C++ benchmark is the reference.) Bigger chunks help only slightly, so
 128 KiB is a sound default for writable data.
+
+### 2026-10-24: codec benchmark on Linux system files (C++ engine)
+
+`nanoer bench --max-size 256M --per-file 1M /usr/bin /usr/lib /usr/share
+/usr/include`: 256 MiB from 4,158 files, 128 KiB chunks, one thread,
+incompressible chunks stored raw. Release build, Intel Xeon @ 2.80 GHz
+(cloud VM, 4 cores), Ubuntu 24.04.
+
+| Codec | Level | Stored | Compress MB/s | Decompress MB/s |
+|---|---:|---:|---:|---:|
+| lz4 | 0 | 51.9 % | 365 | 3218 |
+| lz4 | 9 | 45.2 % | 32 | 3373 |
+| zstd | 1 | 42.5 % | 248 | 1099 |
+| zstd | 3 | 41.0 % | 188 | 1055 |
+| zstd | 9 | 39.0 % | 51 | 976 |
+| zstd | 19 | 37.2 % | 2 | 782 |
+| lzma | 1 | 36.7 % | 13 | 41 |
+| lzma | 6 | 35.5 % | 4 | 42 |
+
+**Conclusions:**
+- Even the fastest setting (LZ4) stores OS files at about half their size,
+  and the default for new writes (zstd 1, 42.5 %) is well below the 62.5 %
+  target.
+- **Hot/cold tiering is confirmed worthwhile:** recompressing cold data from
+  zstd 1 to zstd 19 saves another ~5 points of the original size, and still
+  decompresses at ~780 MB/s.
+- **LZMA is a poor default even for cold data:** only ~1.7 points smaller
+  than zstd 19, but decompresses ~19× slower (42 vs 782 MB/s). Keep it for
+  explicit "max" policies only.
+- The earlier Python measurement (§14, 2026-10-23: 31.5–35.9 %) used a
+  different sample (the first 300 MB of a directory walk, dominated by a few
+  large files) and is not directly comparable. This one, spread over many
+  files, is the reference.
 
 ### 2026-10-23: media and raw video (Python prototype)
 
@@ -650,8 +778,17 @@ rejected.
 | 2026-10-24 | Default chunk ~128 KiB for writable data | measured: larger chunks gain only ~1.5 points; smaller chunks are cheaper to rewrite | 4–50 MiB chunks |
 | 2026-10-24 | BLAKE3 for dedup identity, XXH3 for integrity, CRC-32C for metadata | collision resistance where correctness depends on it, speed elsewhere | SHA-256 (slower), XXH3 for dedup (unsafe) |
 
-*Entries dated 2026-10-24 that describe the engine design are proposals in
-the stage 1 plan, final once that plan is approved.*
+| 2026-10-24 | Stage 1 plan approved with the recommended defaults: image file **and** block device; metadata in memory first (M2), on-disk B+tree in M6; dedup in M4; 128 KiB chunks + zstd level 1 for new writes; GitHub Actions CI; Ubuntu packages + vendored BLAKE3 | user approval of `docs/STAGE1_PLAN.md` | see plan §9 |
+| 2026-10-24 | Engine errors are C++ exceptions (`nanoer::Error`), mapped to errno at the FUSE boundary; corruption is `EUCLEAN` | readable layered storage code; matches Btrfs/ext4 reporting | error-code returns everywhere, `std::expected` (C++23) |
+| 2026-10-24 | Superblock written to slot `generation mod 2`; never fall back past an unsupported newest superblock | torn writes never lose the filesystem; no silent data loss on version skew | fixed primary + backup copy |
+| 2026-10-24 | Segment headers carry UUID + sequence number; mkfs does not clear segments | free segments are recognised without clearing; instant mkfs | zeroing the whole disk |
+| 2026-10-24 | Every record carries its segment's sequence number, a header CRC-32C and a payload CRC-32C | rejects stale records in reused segments and torn writes, without decompressing | rely on XXH3 of decompressed data only |
+| 2026-10-24 | Records 8-byte aligned; data starts at 1 MiB | 4 KiB alignment would waste >5 % on compressed chunks | 4 KiB alignment, byte alignment |
+| 2026-10-24 | LZ4 block format; zstd frame; .xz (check None, LZMA2 only) for lzma, with the dictionary shrunk to the chunk | minimal overhead; all decodable by in-kernel decoders; avoids 8 MiB allocation per chunk | LZ4 frames, raw LZMA2, .lzma |
+| 2026-10-24 | Own CRC-32C (hardware + slicing-by-8 fallback) | no extra dependency; hardware speed | a CRC library |
+| 2026-10-24 | BLAKE3 1.3.1 vendored from Ubuntu's package with SHA-256 pins | GitHub downloads blocked; signed source; reproducible | fetching at build time |
+| 2026-10-24 | Exclusive `flock` on the backing store | two writers would destroy a store | no locking |
+| 2026-10-24 | LZMA only for explicit "max" policies, not as the cold-data default | measured: ~1.7 points smaller than zstd 19 but ~19× slower to read | LZMA for all cold data |
 
 ---
 
