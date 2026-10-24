@@ -1,8 +1,8 @@
 # Stage 1 plan: C++ engine and read-write FUSE filesystem
 
 **Status: APPROVED 2026-10-24** with the recommended answers to every
-question in §9. **M1 complete** (2026-10-24); M2 starts after its report is
-approved. Background and reasoning for each technology are in
+question in §9. **M1 complete** (2026-10-24). The detailed M2 plan is
+[`M2_PLAN.md`](M2_PLAN.md), waiting for approval. Background and reasoning for each technology are in
 [`KNOWLEDGE.md`](../KNOWLEDGE.md).
 
 ## 1. Goal
