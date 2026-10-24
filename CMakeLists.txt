@@ -7,6 +7,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(NANOER_BUILD_TESTS "Build unit tests" ON)
+option(NANOER_BUILD_FUSE "Build the FUSE mount program nanoerfs (needs libfuse 3.12+)" ON)
 option(NANOER_BUILD_FUZZERS "Build libFuzzer targets (needs Clang)" OFF)
 option(NANOER_WERROR "Treat compiler warnings as errors" OFF)
 set(NANOER_SANITIZE "" CACHE STRING "Sanitizers to enable, e.g. address,undefined or thread")
@@ -27,6 +28,9 @@ pkg_check_modules(ZSTD REQUIRED IMPORTED_TARGET libzstd>=1.4.5)
 pkg_check_modules(LZ4 REQUIRED IMPORTED_TARGET liblz4>=1.9.0)
 pkg_check_modules(LZMA REQUIRED IMPORTED_TARGET liblzma>=5.2.0)
 pkg_check_modules(XXHASH REQUIRED IMPORTED_TARGET libxxhash>=0.8.0)
+if(NANOER_BUILD_FUSE)
+  pkg_check_modules(FUSE3 REQUIRED IMPORTED_TARGET fuse3>=3.12)
+endif()
 
 add_subdirectory(third_party/blake3)
 

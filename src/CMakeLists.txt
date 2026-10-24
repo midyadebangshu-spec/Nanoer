@@ -1,12 +1,18 @@
 add_library(nanoer_core STATIC
+  core/cache.cpp
   core/checksum.cpp
   core/codec.cpp
+  core/encoding.cpp
   core/error.cpp
   core/format.cpp
+  core/fs.cpp
   core/io.cpp
+  core/journal.cpp
+  core/metadata.cpp
   core/mkfs.cpp
   core/record.cpp
   core/segment.cpp
+  core/thread_pool.cpp
 )
 target_include_directories(nanoer_core PUBLIC ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(nanoer_core
@@ -20,5 +26,21 @@ target_link_libraries(mkfs.nanoer PRIVATE nanoer_core nanoer_warnings)
 add_executable(nanoer tools/nanoer.cpp tools/common.cpp)
 target_link_libraries(nanoer PRIVATE nanoer_core nanoer_warnings)
 
+add_executable(nanoer-fsx tools/nanoer_fsx.cpp)
+target_link_libraries(nanoer-fsx PRIVATE nanoer_warnings)
+
 install(TARGETS mkfs.nanoer nanoer RUNTIME DESTINATION sbin)
+install(TARGETS nanoer-fsx RUNTIME DESTINATION bin)
+
+if(NANOER_BUILD_FUSE)
+  add_executable(nanoerfs fuse/nanoerfs.cpp)
+  target_link_libraries(nanoerfs PRIVATE nanoer_core nanoer_warnings PkgConfig::FUSE3)
+  # mount(8) runs /sbin/mount.TYPE for `mount -t TYPE`; it is the same program.
+  add_custom_command(TARGET nanoerfs POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E create_symlink nanoerfs mount.nanoer
+    WORKING_DIRECTORY $<TARGET_FILE_DIR:nanoerfs>)
+  install(TARGETS nanoerfs RUNTIME DESTINATION bin)
+  install(CODE "file(MAKE_DIRECTORY \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/sbin\")
+    file(CREATE_LINK ../bin/nanoerfs \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/sbin/mount.nanoer\" SYMBOLIC)")
+endif()
 target_compile_definitions(nanoer PRIVATE NANOER_VERSION="${PROJECT_VERSION}")

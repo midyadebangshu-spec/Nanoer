@@ -16,8 +16,11 @@ TEST(Mkfs, DefaultGeometry) {
   EXPECT_EQ(sb.chunk_size(), 128u << 10);
   EXPECT_EQ(sb.default_codec, CodecId::zstd);
   EXPECT_EQ(sb.default_level, 1);
-  EXPECT_EQ(sb.next_segment_seq, 1u);
-  EXPECT_EQ(sb.checkpoint_offset, 0u);
+  // The initial checkpoint sits at the start of segment 0, the first segment.
+  EXPECT_EQ(sb.checkpoint_offset, kDataStart + kSegmentHeaderSize);
+  EXPECT_EQ(sb.checkpoint_seq, 1u);
+  EXPECT_EQ(sb.next_segment_seq, 2u);
+  ASSERT_TRUE(read_segment_header(store, sb, 0));
   EXPECT_LE(sb.segment_offset(sb.segment_count), store.size());
   EXPECT_EQ(load_superblock(store).sb.uuid, sb.uuid);
 }
@@ -57,11 +60,11 @@ TEST(Mkfs, RejectsTooSmallStore) {
 TEST(Mkfs, ReformatMakesOldSegmentsFree) {
   MemStore store(64 << 20);
   Superblock old = make_filesystem(store, {.segment_shift = 20});
-  SegmentWriter writer(store, old, 0, 1);
+  SegmentWriter writer(store, old, 5, 9);
   writer.flush();
-  ASSERT_TRUE(read_segment_header(store, old, 0));
+  ASSERT_TRUE(read_segment_header(store, old, 5));
 
   Superblock fresh = make_filesystem(store, {.segment_shift = 20});
   EXPECT_NE(fresh.uuid, old.uuid);
-  EXPECT_FALSE(read_segment_header(store, fresh, 0)) << "segment from the old filesystem counted";
+  EXPECT_FALSE(read_segment_header(store, fresh, 5)) << "segment from the old filesystem counted";
 }

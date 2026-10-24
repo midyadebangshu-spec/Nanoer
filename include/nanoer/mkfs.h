@@ -18,13 +18,16 @@ struct FormatOptions {
   int level = 1;
   std::string label;
   std::optional<Uuid> uuid;  // random when not set
+  std::uint32_t root_uid = 0;  // owner of the root directory
+  std::uint32_t root_gid = 0;
 };
 
 // The smallest store that can hold a filesystem with this segment size.
 std::uint64_t min_store_size(unsigned segment_shift);
 
 // Writes an empty filesystem: clears the reserved area at the start of the
-// store and writes both superblocks. Segments are not touched; they count as
+// store, writes a first checkpoint (an empty root directory) into segment 0,
+// and writes both superblocks. Other segments are not touched; they count as
 // free because their headers carry another (or no) filesystem UUID. Returns
 // the newest superblock. Throws Error(invalid_argument) for bad options.
 Superblock make_filesystem(Store& store, const FormatOptions& options);

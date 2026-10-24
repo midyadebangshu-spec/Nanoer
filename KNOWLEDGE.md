@@ -53,10 +53,11 @@ is ever fully extracted to disk.
 
 Linux first. Windows and macOS come later.
 
-**Status:** stage 1, milestone **M1 (foundation) complete** (2026-10-24):
-codecs, checksums, backing stores, on-disk format (superblocks, segments,
-records), `mkfs.nanoer`, `nanoer info/bench`, tests, fuzzing, CI. Next: M2,
-the working filesystem.
+**Status:** stage 1, milestones **M1 (foundation)** and **M2 (working
+filesystem)** complete (2026-10-24). `nanoerfs` mounts a Nanoer store
+through FUSE as a normal read-write folder; data and metadata survive
+unmounting and power cuts. Next: M3, crash safety proven under every
+possible power cut, and `nanoer fsck`.
 
 **Saving 37.5 % of the disk (800 → 500) needs an average compression ratio of
 1.6 : 1.** That is realistic for OS files, applications, code and documents
@@ -421,11 +422,81 @@ files.
 
 ### 7.9 Crash consistency and `fsync`
 
-POSIX promises durability only after `fsync`/`fdatasync`. Before reporting a
-sync as complete, Nanoer must have written the data segment, flushed it,
-written the log or commit record, and flushed again. The ordering is enforced
-with `fdatasync` on the backing store. Write barriers ensure the disk does not
-reorder the commit record ahead of the data it describes.
+POSIX promises durability only after `fsync`/`fdatasync`. The classic way
+(ext4's journal) is two flushes per commit: write the data, flush, write the
+commit record, flush, so the disk cannot reorder the commit record ahead of
+the data it describes.
+
+**Nanoer needs only one flush per commit**, thanks to *prefix consistency*
+(§7.10): data chunks are appended before the transaction that refers to
+them, and replay stops at the first record that is not intact. If the disk
+persisted the transaction but not an earlier data chunk, replay stops at
+the missing chunk and never reaches the transaction. A crash therefore
+always recovers a state that really existed, even if the disk reorders
+writes. One `fdatasync` at the end makes the whole commit durable.
+
+### 7.10 How the M2 engine works
+
+- **One log for everything.** Data chunks, metadata transactions,
+  checkpoint parts and segment seals are appended to a single log that runs
+  through segments, linked by **seals** ("continue in segment N, sequence
+  S"). Replay follows seals only into a segment whose header is intact with
+  exactly that sequence number.
+- **Physical operations, one `apply()`.** Metadata changes are recorded as
+  small physical operations (put inode, set entry, set chunk, …; nine in
+  all, `docs/format.md` §8). The live filesystem and log replay run the
+  same `Metadata::apply()`, so a recovered state is, by construction, the
+  state that was live. The filesystem layer turns POSIX semantics (rename
+  rules, link counts, …) into operations; replay never re-runs that logic.
+- **Commits.** Operations take effect in memory at once and queue up; file
+  data is kept as whole dirty chunks. A commit compresses the dirty chunks
+  in parallel, appends them, appends one transaction (queued operations,
+  then the new chunk locations, then the attributes of every changed
+  inode), and flushes once. Commits happen on `fsync`, every 5 seconds,
+  when 64 MiB of dirty data builds up, or when the queued operations grow
+  past half of what a transaction may hold. **Every commit is durable**,
+  and `fsync` on one file commits everything queued before it (simpler
+  than per-file tracking, and a stronger guarantee).
+- **Holes.** A chunk that is entirely zeros is never written: it becomes a
+  hole. Files are cut on a fixed grid of `chunk_size`, so a write touches
+  only the chunks it overlaps.
+- **Checkpoints** (every 256 MiB of log, every 5 minutes if anything was
+  written, and at unmount) write the whole metadata as one or more parts and
+  point the superblock at them. In M2 the metadata is in memory, so a
+  checkpoint rewrites all of it; M6's on-disk B+tree removes that cost.
+- **Mount** scans every segment header (sequence numbers must exceed all of
+  them), reads the checkpoint, replays the transactions after it, frees
+  orphans (files deleted while open when the system went down), seals the
+  old log *at* its end (never appending after a possibly torn tail) and
+  continues in a new segment.
+- **Segment reuse.** Segments with no live data, older than the newest
+  checkpoint, are released when a checkpoint is written, and become free
+  only after the next one, because the previous superblock may still need
+  them if the newest superblock write tears. At mount they are free at
+  once: the superblock just read is durable and stays valid for two more
+  checkpoints. A reused segment gets a new, higher sequence number, so its
+  old records can never be replayed.
+- **Running out of space.** Each write is checked against free space before
+  anything changes, conservatively (dirty data counted uncompressed at a
+  full chunk each). If the check fails, Nanoer commits, writes two
+  checkpoints to free released segments, and checks again before returning
+  `ENOSPC`. A **reserve** of segments (3, plus room for 1.5× the last
+  checkpoint) is never used by normal writes, so a checkpoint and the next
+  mount always have room. **Deletes, rmdir, removing xattrs and shrinking
+  files skip the check**: they are how a full filesystem gets space back,
+  and their transactions are tiny. If a filesystem is so full that mount
+  cannot start a new segment, it mounts **read-only** with a warning rather
+  than refusing.
+- **If a write to the store fails** mid-commit, memory holds changes the log
+  does not. The filesystem then refuses further changes (`EIO`), like ext4's
+  `errors=remount-ro`, rather than let memory and disk drift apart.
+- **Limit found in M2:** without copying garbage collection (M4), only
+  segments whose data is *entirely* dead are reclaimed. Random rewrites leave
+  a little live data in many segments, so space runs out long before the
+  data fills it: in the model-based test, about 0.5 MB of live data held 16
+  of 23 segments (4 MiB each). Workloads that write files once (copies,
+  untar, builds) are unaffected; rewrite-heavy ones (databases, VM images)
+  need M4.
 
 ---
 
@@ -448,6 +519,11 @@ for neighbouring reads.
 - **Nanoer plan:** a sharded LRU first (one lock per shard, so many threads do
   not fight over a single lock), then 2Q or ARC once benchmarks show scan
   pollution.
+- **In M2:** a 16-shard LRU, 256 MiB by default (`-o safe_space=`). Chunks are
+  keyed by record location **and** the segment's sequence number: when a
+  freed segment is reused, the same location holds different data under a
+  new sequence number, so a stale entry can never be returned and the cache
+  needs no invalidation.
 
 ### 8.3 Interaction with the kernel page cache
 
@@ -507,6 +583,40 @@ program ◄─────────── data ◄──────── ke
   allows C++, quick to develop and debug. **Cost:** context switches and data
   copies make it slower than in-kernel filesystems, which is the reason for
   stage 3.
+
+**How `nanoerfs` uses FUSE (M2):**
+
+- libfuse 3.12+ low-level API (`FUSE_USE_VERSION 312`), multi-threaded loop
+  (up to 16 threads), writeback cache on, 1 MiB requests and read-ahead.
+- **`default_permissions`**: the kernel checks permissions from mode, uid and
+  gid, so Nanoer does not reimplement access checks.
+- **Attribute and name cache timeouts of 60 s.** Every change goes through
+  the one mount (the store is locked against other writers), and the kernel
+  updates its own caches for those changes, so they cannot go stale. Going
+  from 1 s to 60 s made untar ~15 % and a warm `grep -r` ~17 % faster.
+- **No `lseek` operation.** With the writeback cache, freshly written data
+  can still be in the kernel's page cache when `SEEK_DATA`/`SEEK_HOLE`
+  arrives, so Nanoer would report a hole where there is data, and tools
+  that skip holes (`cp`, `tar`) would lose it. Without the operation the
+  kernel treats the whole file as data: holes are not reported, which POSIX
+  allows, and data is never skipped. Found by the POSIX suite on a real mount.
+- **Lookup counting.** Every successful lookup, create and link counts as a
+  kernel reference until `forget`. `readdirplus` counts every entry it
+  returns except `.` and `..`, so it checks that an entry fits in the reply
+  buffer *before* looking it up. A deleted file is freed only when it has no
+  links, no kernel references and no open handles.
+- **`readdir` serves a snapshot** taken at `opendir`, so entries added or
+  removed meanwhile can never make a listing skip or repeat a name.
+- **Threads after `fork`.** `nanoerfs` daemonizes (forks) after mounting.
+  Threads do not survive `fork()`, so the compression pool and the commit
+  thread start only afterwards.
+- **`mount.nanoer`** is the same program; `mount -t nanoer IMAGE DIR` and
+  `/etc/fstab` work. fstab-only options (`defaults`, `nofail`, `_netdev`,
+  `x-*`, atime options) are accepted and ignored.
+- **atime** is never updated on reads (decision 3 of the M2 plan).
+- **`st_blocks`** reports *uncompressed* data, as Btrfs does. Reporting the
+  compressed size would make tools such as `cp` and `tar` think files are
+  sparse. Compressed sizes are shown by `nanoer info`.
 
 ### 9.3 Why the kernel driver cannot be C++
 
@@ -661,6 +771,24 @@ table fallback that processes 8 bytes per step.
   near zero until the library itself was compiled with
   `-fsanitize=fuzzer-no-link`. Instrumenting only the fuzzer's entry file
   is not enough.
+- **In M2:** 103 unit tests plus an end-to-end test of the tools, including:
+  - a **model-based test** (4 seeds × 1,500 random operations against a
+    simple reference model, with remounts and simulated power cuts mixed
+    in; a crash must roll the filesystem back to exactly the last sync);
+  - journal tests where unflushed writes are randomly kept, dropped or torn,
+    and the recovered state must equal one that really existed;
+  - tests for running out of space and recovering from it.
+
+  On a **real FUSE mount**: a 15-test POSIX suite (`tests/integration`),
+  `nanoer-fsx` (random reads, writes, truncates, hole punches, mmap reads
+  and writes, checked byte by byte against a shadow copy), and a
+  persistence test (copy a tree, remount, `diff -r`). **pjdfstest** and
+  **xfstests' fsx** run in CI only: neither is packaged for Ubuntu, and
+  GitHub was not reachable from the development environment.
+- **Lesson:** a test filter (`Fs*`) silently did not match the model test's
+  name (`Seeds/FsModel...`), so it was believed to pass before it had ever
+  run. Check that a test actually ran (ctest's count, or `--gtest_list_tests`)
+  before relying on its result.
 - **Benchmarks** compared with ext4 (no compression) and Btrfs + zstd: space
   used, throughput, latency, CPU time.
 
@@ -745,6 +873,53 @@ incompressible chunks stored raw. Release build, Intel Xeon @ 2.80 GHz
   large files) and is not directly comparable. This one, spread over many
   files, is the reference.
 
+### 2026-10-24: M2, the mounted filesystem against ext4
+
+Release build; image file on the same ext4 disk; 4-core VM; single runs,
+so take differences under ~20 % as noise.
+
+**Space.** The same content (`/usr/include`, Python 3.12's standard library,
+Nanoer's git repository and its build output), 95.3 MiB logical, 6,317
+files:
+
+| | Disk used |
+|---|---:|
+| ext4 | 110 MB |
+| Nanoer (actual blocks of the image file) | **32 MB** |
+| Nanoer stored data | 29.0 MiB = **30.5 %** of logical |
+
+That is **71 % less disk** than ext4 for OS-like content, well past the
+37.5 % the 800 → 500 GB goal needs.
+
+**Time** (seconds; "cold" means after a remount, so the kernel's page cache
+is empty):
+
+| Workload | ext4 | Nanoer |
+|---|---:|---:|
+| untar 104 MB of headers + Python | 2.4 | 5.7 |
+| copy 512 MB incompressible | 1.1 | 2.4 |
+| copy a 60 s 720p H.264 video | 0.05 | 0.05 |
+| `git clone` (local) | 0.11 | 0.39 |
+| `cmake` configure | 1.1 | 1.2 |
+| compile Nanoer (4 jobs) | 8.0 | 7.9 |
+| `git status` | 0.01 | 0.03 |
+| `find` all files | 0.02 | 0.13 |
+| `grep -r`, warm | 0.10 | 0.78 |
+| read 512 MB, cold | 0.46 | 0.77 |
+| decode the video, cold | 2.5 | 2.6 |
+| `grep -r`, cold | 0.74 | 1.7 |
+| `tar` the tree, cold | 0.24 | 0.88 |
+| `rm -rf` everything | 2.1 | 1.1 |
+
+**Conclusions:**
+- **CPU-bound work is unaffected** (compiling, video decoding), and the
+  compile *from* a compressed filesystem is as fast as from ext4.
+- **Metadata-heavy work pays the FUSE price:** 2–9× slower for many small
+  files (untar, find, grep). Each file costs several user/kernel round
+  trips. This is M5's tuning target and ultimately the reason for the stage
+  3 kernel driver.
+- Large sequential I/O is about 2× slower; cold reads run at ~660 MB/s.
+
 ### 2026-10-23: media and raw video (Python prototype)
 
 | Input | Result |
@@ -777,7 +952,6 @@ rejected.
 | 2026-10-24 | Own metadata format (CoW B+tree), not an embedded database | must be implementable in the kernel later | SQLite, LMDB, RocksDB |
 | 2026-10-24 | Default chunk ~128 KiB for writable data | measured: larger chunks gain only ~1.5 points; smaller chunks are cheaper to rewrite | 4–50 MiB chunks |
 | 2026-10-24 | BLAKE3 for dedup identity, XXH3 for integrity, CRC-32C for metadata | collision resistance where correctness depends on it, speed elsewhere | SHA-256 (slower), XXH3 for dedup (unsafe) |
-
 | 2026-10-24 | Stage 1 plan approved with the recommended defaults: image file **and** block device; metadata in memory first (M2), on-disk B+tree in M6; dedup in M4; 128 KiB chunks + zstd level 1 for new writes; GitHub Actions CI; Ubuntu packages + vendored BLAKE3 | user approval of `docs/STAGE1_PLAN.md` | see plan §9 |
 | 2026-10-24 | Engine errors are C++ exceptions (`nanoer::Error`), mapped to errno at the FUSE boundary; corruption is `EUCLEAN` | readable layered storage code; matches Btrfs/ext4 reporting | error-code returns everywhere, `std::expected` (C++23) |
 | 2026-10-24 | Superblock written to slot `generation mod 2`; never fall back past an unsupported newest superblock | torn writes never lose the filesystem; no silent data loss on version skew | fixed primary + backup copy |
@@ -789,6 +963,20 @@ rejected.
 | 2026-10-24 | BLAKE3 1.3.1 vendored from Ubuntu's package with SHA-256 pins | GitHub downloads blocked; signed source; reproducible | fetching at build time |
 | 2026-10-24 | Exclusive `flock` on the backing store | two writers would destroy a store | no locking |
 | 2026-10-24 | LZMA only for explicit "max" policies, not as the cold-data default | measured: ~1.7 points smaller than zstd 19 but ~19× slower to read | LZMA for all cold data |
+| 2026-10-24 | M2 plan approved with the recommended answers: reclaim entirely-dead segments in M2; 5 s commit interval; no atime updates on reads; POSIX ACLs stored, not enforced; one metadata lock; pjdfstest and xfstests fsx in CI only; mkfs writes an initial checkpoint; `nanoerfs` / `mount -t nanoer` | user approval of `docs/M2_PLAN.md` | see plan §12 |
+| 2026-10-24 | One log for data, transactions, checkpoints and seals; replay stops at the first damaged record and enters segments only through intact seals | prefix consistency: crash recovery always yields a state that existed, with one flush per commit | separate data and metadata areas; two flushes per commit |
+| 2026-10-24 | Physical metadata operations, one `apply()` for live use and replay | replay cannot diverge from what was live | logging POSIX-level operations and re-running their logic |
+| 2026-10-24 | Every commit is durable; `fsync` commits everything queued | simple, and a stronger guarantee than POSIX | per-file fsync tracking |
+| 2026-10-24 | Resume after mount by sealing the old log at its end, in a new segment | never append after a possibly torn tail | appending in place; a checkpoint at every mount |
+| 2026-10-24 | Sequence numbers above every segment header found, not just the superblock's | a segment started but never linked must not share a number with a new one | trusting `next_segment_seq` |
+| 2026-10-24 | Free dead segments at mount; accept a reused one in replay only if the snapshot listed it without live data | a full filesystem must still mount; reuse stays detectable as corruption otherwise | waiting two checkpoints after every mount |
+| 2026-10-24 | Reserve 3 segments + 1.5× checkpoint size; deletes skip the space check; mount read-only if no segment is free | deleting must always work on a full filesystem; never refuse to mount over space | a fixed 2-segment reserve (tests found it too small) |
+| 2026-10-24 | All-zero chunks are stored as holes | zeros cost nothing to store | storing compressed zeros |
+| 2026-10-24 | `st_blocks` reports uncompressed bytes, as Btrfs does | compressed values make tools treat files as sparse | compressed size in `st_blocks` |
+| 2026-10-24 | No FUSE `lseek`; the kernel then treats files as all data | with the writeback cache Nanoer can miss data still in the page cache, and hole-skipping tools would lose it | answering `SEEK_DATA`/`SEEK_HOLE` from Nanoer's metadata |
+| 2026-10-24 | 60 s attribute and name cache timeouts | single writer through one mount: caches cannot go stale; measured ~15 % faster on small-file work | 1 s (libfuse examples) |
+| 2026-10-24 | `readdir` from a snapshot taken at `opendir` | concurrent changes cannot make a listing skip or repeat names | live iteration with name cookies |
+| 2026-10-24 | BSD semantics on set-group-ID directories (new entries take the group; subdirectories inherit the bit) | what Linux filesystems do; the kernel leaves it to the filesystem under FUSE | ignoring set-group-ID |
 
 ---
 
@@ -833,6 +1021,15 @@ Built 2026-10-23, removed 2026-10-24 (recover it from git history, commit
 - **FUSE:** Filesystem in Userspace.
 - **Ratio:** original size ÷ stored size (e.g. 3 : 1). Here also given as
   stored size as a percentage of the original (e.g. 33 %).
+- **Transaction:** one commit's metadata operations, written as one record
+  and applied all or nothing.
+- **Commit:** writing out dirty data and queued operations, then flushing.
+- **Checkpoint:** a complete metadata snapshot in the log, which the
+  superblock points to; mounting starts from it.
+- **Seal:** the last record of a full segment, naming where the log continues.
+- **Orphan:** a file deleted while still open; freed when the last user lets go.
+- **Prefix consistency:** after a crash, the recovered state is that of some
+  prefix of the log, a state that really existed.
 
 ---
 

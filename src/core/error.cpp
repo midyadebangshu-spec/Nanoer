@@ -1,6 +1,7 @@
 #include "nanoer/error.h"
 
 #include <cerrno>
+#include <cstring>
 
 #include "nanoer/bytes.h"
 
@@ -14,6 +15,7 @@ const char* errc_name(Errc code) {
     case Errc::unsupported: return "unsupported";
     case Errc::no_space: return "no space left";
     case Errc::busy: return "busy";
+    case Errc::posix: return "filesystem error";
   }
   return "unknown error";
 }
@@ -29,8 +31,13 @@ int Error::to_errno() const noexcept {
     case Errc::unsupported: return EOPNOTSUPP;
     case Errc::no_space: return ENOSPC;
     case Errc::busy: return EBUSY;
+    case Errc::posix: return sys_errno_ ? sys_errno_ : EIO;
   }
   return EIO;
+}
+
+void throw_posix(int errno_value, const std::string& message) {
+  throw Error(Errc::posix, message.empty() ? std::strerror(errno_value) : message, errno_value);
 }
 
 std::string to_hex(ByteView data) {

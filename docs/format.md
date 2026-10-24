@@ -6,9 +6,9 @@ recovery tool) must be writable from this document alone, without reading
 any code. When the code and this document disagree, one of them is a bug.
 
 Status: **1.0 draft**. It defines the store geometry, superblocks, segments,
-records and data chunks. Metadata log entries and checkpoints (record types
-2 and 3) are specified in milestone M2. Until Nanoer 1.0 is released, the
-format may still change without a version bump.
+records, data chunks, metadata transactions, checkpoints, segment seals, how
+the log is read back, and how segments are reused. Until Nanoer 1.0 is
+released, the format may still change without a version bump.
 
 ## 1. Conventions
 
@@ -183,8 +183,11 @@ intact, the filesystem is corrupt: never return its data.
 | Type | Name | Defined in |
 |---:|---|---|
 | 1 | data chunk | §6 |
-| 2 | metadata log entry | M2 |
-| 3 | checkpoint | M2 |
+| 2 | metadata transaction | §8 |
+| 3 | checkpoint part | §9 |
+| 4 | segment seal | §10 |
+
+An unknown record type in the log makes the filesystem unreadable.
 
 ## 6. Data chunk record (type 1)
 
@@ -242,8 +245,175 @@ The Linux kernel already contains decoders for all three (`lib/lz4`,
 `lib/zstd`, `lib/xz`); the .xz container was chosen for lzma partly because
 the kernel's xz decoder reads it directly.
 
-## 8. Changes
+## 8. Metadata transactions (type 2)
+
+The filesystem's metadata is changed only by **operations**. A transaction
+record holds the operations of one commit, applied in order, all or nothing
+(the record is either intact or not part of the log at all).
+
+Type-specific header (16 bytes):
+
+| Offset | Size | Field | Meaning |
+|---:|---:|---|---|
+| 32 | 8 | `txid` | transaction id; each is exactly one more than the previous |
+| 40 | 4 | `op_count` | number of operations in the payload |
+| 44 | 4 | reserved | |
+
+The payload is the operations, back to back, in this encoding:
+
+- `varint`: unsigned LEB128, at most 10 bytes, at most 2^64−1.
+- `svarint`: zigzag (`(n << 1) ^ (n >> 63)`), then `varint`.
+- `bytes(max)`: `varint` length (at most `max`), then that many bytes.
+
+Each operation is a one-byte code followed by its fields:
+
+| Code | Operation | Fields | Effect |
+|---:|---|---|---|
+| 1 | PutInode | *attributes* (below) | create the inode, or replace its attributes; its chunks, entries and xattrs are kept |
+| 2 | DeleteInode | `ino` | remove the inode with its chunks and xattrs (never the root) |
+| 3 | SetEntry | `dir`, `name` bytes(255), `ino` | add or replace directory entry `name` |
+| 4 | RemoveEntry | `dir`, `name` bytes(255) | remove an existing entry |
+| 5 | SetChunk | `ino`, `index`, `offset`, `stored_size`, `size` | chunk `index` of a regular file is now the data chunk record at absolute `offset` |
+| 6 | RemoveChunk | `ino`, `index` | chunk becomes a hole (no-op if it already is one) |
+| 7 | TruncateChunks | `ino`, `first_index` | remove every chunk with index ≥ `first_index` |
+| 8 | SetXattr | `ino`, `name` bytes(255), `value` bytes(65536) | add or replace |
+| 9 | RemoveXattr | `ino`, `name` bytes(255) | remove an existing xattr |
+
+All fields are `varint` unless marked. *Attributes*, in order:
+`id`, `mode` (st_mode, type and permission bits), `uid`, `gid`, `nlink`,
+`size`, `atime`, `mtime`, `ctime`, `btime` (these four `svarint`, nanoseconds
+since the Unix epoch), `rdev`, `parent` (directories: the containing
+directory; root: itself; others: 0), `symlink` (bytes(4095): the target of a
+symlink, else empty).
+
+Rules (a violation means the log is damaged):
+
+- Inode 0 does not exist; inode 1 is the root directory.
+- Entry names are 1–255 bytes, contain neither `/` nor NUL, and are not `.`
+  or `..`. Entries live only in directories and point at existing inodes.
+- Chunks belong only to regular files. Chunk *i* covers file bytes
+  `[i × chunk_size, (i+1) × chunk_size)`; a missing chunk reads as zeros, as
+  do the bytes between a chunk's `size` and the end of its range.
+- A chunk's `offset` must lie in a segment that is in use (§10).
+- After an inode is created, the allocation counter is at least its id + 1;
+  inode numbers are never reused while that inode exists.
+
+## 9. Checkpoints (type 3)
+
+A checkpoint is a complete snapshot of the metadata, so mounting does not
+have to replay the whole history. A snapshot can be large, so it is split
+into **parts**, written one after another in log order (possibly across
+segments). The superblock's `checkpoint_offset` points at part 0.
+
+Type-specific header (32 bytes), the same values in every part except
+`part` and the final flag:
+
+| Offset | Size | Field | Meaning |
+|---:|---:|---|---|
+| 32 | 8 | `txid` | the last transaction the snapshot includes |
+| 40 | 4 | `part` | 0, 1, 2, … |
+| 44 | 4 | `flags` | bit 0: this is the final part |
+| 48 | 8 | `total` | length of the whole snapshot stream |
+| 56 | 8 | `xxh3` | XXH3-64 of the whole snapshot stream |
+
+The payloads of the parts, concatenated, form the **snapshot stream**:
+
+```
+"NNRCKPT1"                         8 bytes
+last_txid, next_inode              varint
+segment_count                      varint
+  index, seq, live_bytes           varint, per segment in use
+inode_count                        varint
+  attributes                       as in §8, per inode, in increasing id order
+  chunk_count                      varint
+    index, offset, stored_size, size   varint, per chunk
+  entry_count                      varint
+    name bytes(255), ino           per entry
+  xattr_count                      varint
+    name bytes(255), value bytes(65536)   per xattr
+```
+
+`live_bytes` of a segment is the sum of `stored_size` of the chunks stored
+in it; a reader must check that the recorded value matches the chunks. A
+reader must also check that the root exists and is a directory, that every
+entry resolves, and that no id reaches `next_inode`.
+
+## 10. Segment seals (type 4), reading the log, and reusing segments
+
+### 10.1 Seals
+
+When a segment is finished, a seal record is its last record:
+
+| Offset | Size | Field | Meaning |
+|---:|---:|---|---|
+| 32 | 8 | `next_index` | the segment where the log continues |
+| 40 | 8 | `next_seq` | that segment's sequence number |
+
+A writer keeps 48 bytes (one seal) free at the end of every segment, so a
+seal always fits.
+
+### 10.2 Reading the log (mount)
+
+1. Load the superblock (§3). Read every segment header and note the highest
+   sequence number found: new segments must get higher numbers, even than
+   segments that were started but never linked into the log.
+2. Start at `checkpoint_offset`, in the segment with `checkpoint_seq`.
+3. Read checkpoint parts 0, 1, … until the final one. A missing part, a
+   mismatch between parts, or a wrong `total` or `xxh3` means corruption.
+4. Decode the snapshot. Then read on, record by record:
+   - data chunk: skip (transactions refer to it);
+   - transaction: its `txid` must be one more than the last; apply its
+     operations in order;
+   - checkpoint part: skip (a later checkpoint the superblock never pointed
+     to; the transactions around it give the same state);
+   - seal: if segment `next_index` has an intact header with sequence number
+     `next_seq`, continue at its first record; otherwise the log ends at the
+     seal itself.
+5. The log ends at the first position where no intact record (§5.2) begins.
+6. Every segment the reading entered is in use. If the snapshot listed that
+   segment with another sequence number, it must have had no live data
+   (it was freed and reused since); otherwise the filesystem is corrupt.
+
+The recovered state is always a **prefix** of what was written: reading
+never skips a damaged record to continue after it, and a new segment is
+only entered through an intact seal. Writers append each data chunk before
+the transaction that refers to it, so a transaction in the prefix never
+refers to a missing chunk.
+
+### 10.3 Continuing the log after mount
+
+A writer never appends after the end found in §10.2, because that end may
+be a torn write. It writes a seal **at** the end position, pointing at a
+newly allocated segment, and continues there.
+
+### 10.4 Reusing segments
+
+A segment is **in use** while the metadata lists it. A segment with no live
+data, older than the newest checkpoint, is not needed by that checkpoint,
+but it may still be needed by the previous one, which the other superblock
+slot points to, should the newest superblock write be torn. Therefore:
+
+- When checkpoint *K* is durable and the superblock points to it, segments
+  with no live data and a sequence number below *K*'s are **released**.
+  They become free for reuse only once checkpoint *K+1* is durable.
+- At mount from checkpoint *K*, such segments may be reused at once: the
+  superblock pointing at *K* was read from disk, so it is durable, and it
+  stays intact until two more superblocks are written.
+- Each time a segment is (re)started it gets a new, higher sequence number,
+  so records left from its earlier use can never be mistaken for current
+  ones (§5.2).
+
+## 11. A new filesystem
+
+`mkfs` writes segment 0 (sequence number 1) holding a checkpoint of the
+empty filesystem: the root directory (inode 1, a directory with mode 0755,
+`nlink` 2, `parent` 1), `next_inode` 2, `last_txid` 0, and segment 0 in use.
+Both superblocks point at it, with `next_segment_seq` 2. Every filesystem
+therefore always has a checkpoint.
+
+## 12. Changes
 
 | Version | Change |
 |---|---|
 | 1.0 (draft) | initial: geometry, superblock, segments, records, data chunks |
+| 1.0 (draft, M2) | metadata transactions, checkpoints, segment seals, log replay, segment reuse; mkfs writes an initial checkpoint |

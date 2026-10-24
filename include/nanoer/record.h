@@ -14,8 +14,9 @@ class Store;
 
 enum class RecordType : std::uint8_t {
   data_chunk = 1,
-  metadata_log = 2,  // M2
-  checkpoint = 3,    // M2
+  metadata_log = 2,  // one transaction of metadata operations
+  checkpoint = 3,    // one part of a metadata snapshot
+  segment_seal = 4,  // the segment is finished; the log continues elsewhere
 };
 
 inline constexpr std::uint32_t kRecordMagic = 0x4345524e;  // "NREC" on disk

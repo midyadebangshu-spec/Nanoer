@@ -75,6 +75,24 @@ SegmentWriter::SegmentWriter(Store& store, const Superblock& sb, std::uint64_t i
   next_ = start_ + kSegmentHeaderSize;
 }
 
+SegmentWriter::SegmentWriter(Store& store, std::uint64_t index, std::uint64_t seq,
+                             std::uint64_t start, std::uint64_t end, std::uint64_t next)
+    : store_(store), index_(index), seq_(seq), start_(start), end_(end), next_(next),
+      buffer_start_(next) {
+  buffer_.reserve(kWriteBufferSize + kSegmentHeaderSize);
+}
+
+SegmentWriter SegmentWriter::resume(Store& store, const Superblock& sb, std::uint64_t index,
+                                    std::uint64_t seq, std::uint64_t next) {
+  check_index(sb, index);
+  std::uint64_t start = sb.segment_offset(index);
+  std::uint64_t end = start + sb.segment_size();
+  if (next < start + kSegmentHeaderSize || next > end || next % kRecordAlignment != 0) {
+    throw Error(Errc::invalid_argument, "bad position to resume a segment at");
+  }
+  return SegmentWriter(store, index, seq, start, end, next);
+}
+
 std::optional<std::uint64_t> SegmentWriter::append(ByteView record) {
   if (record.size() < kRecordHeaderSize || record.size() % kRecordAlignment != 0) {
     throw Error(Errc::invalid_argument, "not an encoded record");
@@ -102,9 +120,16 @@ void SegmentWriter::flush() {
 // ---- SegmentScanner --------------------------------------------------------
 
 SegmentScanner::SegmentScanner(Store& store, const Superblock& sb, std::uint64_t index)
+    : SegmentScanner(store, sb, index, sb.segment_offset(index) + kSegmentHeaderSize) {}
+
+SegmentScanner::SegmentScanner(Store& store, const Superblock& sb, std::uint64_t index,
+                               std::uint64_t start)
     : store_(store), header_(read_segment_header(store, sb, index)) {
-  next_ = sb.segment_offset(index) + kSegmentHeaderSize;
+  next_ = start;
   end_ = sb.segment_offset(index) + sb.segment_size();
+  if (start < sb.segment_offset(index) + kSegmentHeaderSize || start > end_) {
+    throw Error(Errc::invalid_argument, "scan start outside the segment");
+  }
 }
 
 std::optional<Record> SegmentScanner::next() {

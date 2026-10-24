@@ -16,9 +16,14 @@ enum class Errc {
   unsupported,       // valid data using a feature this build does not know
   no_space,          // the store is full
   busy,              // the store is in use by another process
+  posix,             // an ordinary filesystem error; sys_errno() says which (ENOENT, ...)
 };
 
 const char* errc_name(Errc code);
+
+class Error;
+// Throws Error(posix) carrying `errno_value`.
+[[noreturn]] void throw_posix(int errno_value, const std::string& message = {});
 
 class Error : public std::runtime_error {
  public:

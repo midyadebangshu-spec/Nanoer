@@ -37,6 +37,11 @@ class SegmentWriter {
  public:
   SegmentWriter(Store& store, const Superblock& sb, std::uint64_t index, std::uint64_t seq);
 
+  // Continues an existing segment at absolute offset `next` (which must be
+  // where its log ends), without writing a header.
+  static SegmentWriter resume(Store& store, const Superblock& sb, std::uint64_t index,
+                              std::uint64_t seq, std::uint64_t next);
+
   // Appends an encoded record and returns its absolute offset, or nullopt if
   // it does not fit in what is left of the segment.
   std::optional<std::uint64_t> append(ByteView encoded_record);
@@ -54,6 +59,9 @@ class SegmentWriter {
   std::uint64_t remaining() const { return end_ - next_; }
 
  private:
+  SegmentWriter(Store& store, std::uint64_t index, std::uint64_t seq, std::uint64_t start,
+                std::uint64_t end, std::uint64_t next);
+
   static constexpr std::size_t kWriteBufferSize = 1u << 20;
 
   Store& store_;
@@ -70,6 +78,8 @@ class SegmentWriter {
 class SegmentScanner {
  public:
   SegmentScanner(Store& store, const Superblock& sb, std::uint64_t index);
+  // Starts at absolute offset `start` instead of the first record.
+  SegmentScanner(Store& store, const Superblock& sb, std::uint64_t index, std::uint64_t start);
 
   // False if the segment has no valid header: it is free (never written, or
   // left by an earlier filesystem).

@@ -141,6 +141,7 @@ TEST(LoadSuperblock, PicksNewestAndAlternatesSlots) {
 TEST(LoadSuperblock, SurvivesTornSuperblockWrite) {
   FaultStore store(kStoreSize);
   Superblock sb = make_filesystem(store, {.segment_shift = 20});
+  const std::uint64_t original_seq = sb.next_segment_seq;
   // Write generation 3 without a flush, then lose power mid-write.
   sb.next_segment_seq = 9;
   ++sb.generation;
@@ -151,7 +152,7 @@ TEST(LoadSuperblock, SurvivesTornSuperblockWrite) {
     // Either the new superblock made it whole, or the previous one is used.
     EXPECT_TRUE(loaded.sb.generation == 3 || loaded.sb.generation == 2);
     if (loaded.sb.generation == 2) {
-      EXPECT_EQ(loaded.sb.next_segment_seq, 1u);
+      EXPECT_EQ(loaded.sb.next_segment_seq, original_seq);
     }
   }
 }

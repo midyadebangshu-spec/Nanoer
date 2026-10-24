@@ -10,7 +10,7 @@ permissions:
 env:
   PACKAGES: >-
     cmake ninja-build pkg-config clang libclang-rt-18-dev
-    libzstd-dev liblz4-dev liblzma-dev libxxhash-dev libgtest-dev libfuse3-dev
+    libzstd-dev liblz4-dev liblzma-dev libxxhash-dev libgtest-dev libfuse3-dev fuse3
 
 jobs:
   test:
@@ -38,7 +38,8 @@ jobs:
       - name: Build
         run: cmake --build --preset ${{ matrix.preset }}
       - name: Test
-        run: ctest --preset ${{ matrix.preset }}
+        # Mount-based tests run in the integration job, as root.
+        run: ctest --preset ${{ matrix.preset }} -LE integration
 
   fuzz:
     name: fuzz (smoke, 2 min per target)
@@ -56,3 +57,32 @@ jobs:
             ./build/fuzz/fuzz/fuzz_$target -max_total_time=120 -rss_limit_mb=2048 \
               corpus/$target fuzz/seeds/$target
           done
+
+  integration:
+    name: integration (real FUSE mount, pjdfstest, xfstests fsx)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y $PACKAGES autoconf automake libtool bc \
+            xfslibs-dev uuid-dev libtool-bin e2fsprogs libattr1-dev libacl1-dev libaio-dev \
+            libgdbm-dev gawk liburing-dev libcap-dev
+          sudo modprobe fuse || true
+      - name: Build
+        run: cmake --preset release -DNANOER_WERROR=ON && cmake --build --preset release
+      - name: Nanoer integration tests (POSIX suite, nanoer-fsx, persistence)
+        run: sudo ctest --preset release -L integration --output-on-failure
+      - name: pjdfstest (POSIX conformance)
+        run: |
+          git clone --depth 1 https://github.com/pjd/pjdfstest /tmp/pjdfstest
+          (cd /tmp/pjdfstest && autoreconf -ifs && ./configure && make -j4)
+          sudo tests/integration/run_mounted.sh build/release/src command \
+            sh -c 'cd "$NANOER_TEST_DIR" && prove -r /tmp/pjdfstest/tests'
+      - name: xfstests fsx (data integrity)
+        run: |
+          git clone --depth 1 https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git /tmp/xfstests
+          make -C /tmp/xfstests -j4
+          sudo tests/integration/run_mounted.sh build/release/src command \
+            sh -c '/tmp/xfstests/ltp/fsx -N 100000 -S 0 "$NANOER_TEST_DIR/fsx.file"'

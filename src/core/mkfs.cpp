@@ -2,6 +2,8 @@
 
 #include "nanoer/error.h"
 #include "nanoer/io.h"
+#include "nanoer/journal.h"
+#include "nanoer/metadata.h"
 
 namespace nanoer {
 
@@ -50,6 +52,18 @@ Superblock make_filesystem(Store& store, const FormatOptions& options) {
   // instant even on a large disk.
   Bytes zeros(kDataStart, 0);
   store.write(0, zeros);
+
+  // The first checkpoint: every filesystem always has one, so mounting
+  // always has a starting point.
+  Metadata meta = Metadata::empty(sb.data_start, sb.segment_shift, options.root_uid,
+                                  options.root_gid, static_cast<std::int64_t>(sb.created_ns));
+  Journal journal(store, sb, meta, sb.next_segment_seq);
+  journal.start();
+  LogPosition checkpoint = journal.append_checkpoint(meta);
+  journal.flush();
+  sb.checkpoint_offset = checkpoint.offset;
+  sb.checkpoint_seq = checkpoint.seq;
+  sb.next_segment_seq = journal.next_seq();
 
   // Fill both superblock slots (generations 1 and 2), so the store never
   // has an empty slot that could be mistaken for damage.

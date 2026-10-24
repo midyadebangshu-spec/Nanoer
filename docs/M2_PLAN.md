@@ -1,8 +1,11 @@
 # M2 plan: a working, mountable filesystem
 
-**Status: PROPOSED, waiting for approval.** Part of stage 1
-([`STAGE1_PLAN.md`](STAGE1_PLAN.md)). No M2 code is written until this plan
-is approved.
+**Status: APPROVED and COMPLETE (2026-10-24)**, with the recommended answers
+to every question in §12. Part of stage 1 ([`STAGE1_PLAN.md`](STAGE1_PLAN.md)).
+Results, measurements and the limits found are in `KNOWLEDGE.md` (§7.10,
+§9.2, §14). Two changes made during the work, both recorded there: FUSE
+`lseek` is not offered (it could make tools skip data), and the attribute
+cache timeout is 60 s rather than 1 s.
 
 ## 1. Goal
 

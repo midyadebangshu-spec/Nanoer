@@ -2,10 +2,15 @@ find_package(GTest 1.10 REQUIRED)
 include(GoogleTest)
 
 add_executable(nanoer_unit_tests
+  unit/cache_pool_test.cpp
   unit/checksum_test.cpp
+  unit/fs_model_test.cpp
+  unit/fs_test.cpp
   unit/codec_test.cpp
   unit/format_test.cpp
   unit/io_test.cpp
+  unit/journal_test.cpp
+  unit/metadata_test.cpp
   unit/mkfs_test.cpp
   unit/record_test.cpp
   unit/segment_test.cpp
@@ -19,3 +24,18 @@ add_test(NAME tools_smoke
     -DMKFS=$<TARGET_FILE:mkfs.nanoer> -DNANOER=$<TARGET_FILE:nanoer>
     -DWORKDIR=${CMAKE_CURRENT_BINARY_DIR}/tools_smoke
     -P ${CMAKE_CURRENT_SOURCE_DIR}/tools_smoke.cmake)
+
+# Integration tests on a real FUSE mount (skipped where FUSE is unavailable).
+if(NANOER_BUILD_FUSE)
+  add_executable(nanoer_posix_tests integration/posix_test.cpp)
+  target_link_libraries(nanoer_posix_tests PRIVATE nanoer_warnings GTest::gtest_main)
+
+  set(RUN_MOUNTED ${CMAKE_CURRENT_SOURCE_DIR}/integration/run_mounted.sh)
+  set(TOOLS_DIR $<TARGET_FILE_DIR:nanoerfs>)
+  add_test(NAME integration_posix COMMAND ${RUN_MOUNTED} ${TOOLS_DIR} posix $<TARGET_FILE:nanoer_posix_tests>)
+  add_test(NAME integration_fsx COMMAND ${RUN_MOUNTED} ${TOOLS_DIR} fsx)
+  add_test(NAME integration_persist COMMAND ${RUN_MOUNTED} ${TOOLS_DIR} persist ${PROJECT_SOURCE_DIR})
+  set_tests_properties(integration_posix integration_fsx integration_persist PROPERTIES
+    SKIP_RETURN_CODE 77 LABELS integration RUN_SERIAL TRUE TIMEOUT 1200)
+  set_tests_properties(integration_fsx PROPERTIES ENVIRONMENT "FSX_OPS=10000")
+endif()

@@ -15,6 +15,7 @@
 #include "nanoer/codec.h"
 #include "nanoer/error.h"
 #include "nanoer/format.h"
+#include "nanoer/fs.h"
 #include "nanoer/io.h"
 #include "nanoer/segment.h"
 
@@ -97,6 +98,31 @@ int cmd_info(const std::vector<std::string_view>& args) {
             << "  updated:         " << format_time_ns(sb.updated_ns) << "\n"
             << "\nCRC-32C hardware acceleration: " << (crc32c_hardware_accelerated() ? "yes" : "no")
             << "\n";
+
+  // The contents, from a read-only mount (replays the log, writes nothing).
+  Filesystem::Options options;
+  options.read_only = true;
+  options.start_threads = false;
+  options.safe_space = 0;
+  std::unique_ptr<Filesystem> fs = Filesystem::mount(*store, options);
+  FsInfo i = fs->info();
+  double ratio = i.logical_bytes ? 100.0 * static_cast<double>(i.stored_bytes) /
+                                       static_cast<double>(i.logical_bytes)
+                                 : 0.0;
+  char stored[64];
+  std::snprintf(stored, sizeof stored, "%s (%.1f%% of logical)", format_size(i.stored_bytes).c_str(),
+                ratio);
+  std::cout << "\nContents:\n"
+            << "  files:           " << i.files << "\n"
+            << "  directories:     " << i.directories << "\n"
+            << "  other:           " << i.other_inodes << " (symlinks, devices, FIFOs, sockets)\n"
+            << "  logical size:    " << format_size(i.logical_bytes) << "\n"
+            << "  stored data:     " << stored << "\n"
+            << "  segments:        " << i.segments_in_use << " in use, " << i.segments_free
+            << " free\n"
+            << "  checkpoint:      " << format_size(i.checkpoint_bytes) << ", transaction "
+            << (i.last_txid - i.replayed_transactions) << "\n"
+            << "  log after it:    " << i.replayed_transactions << " transactions\n";
   return 0;
 }
 

@@ -31,10 +31,14 @@ that a system needing 800 GB without Nanoer needs about 500 GB with it.
   decision log.
 - Licence: Apache-2.0. A future kernel module will be Dual MIT/GPL.
 
-Milestone M1 (foundation) is complete; M2 (the working filesystem) is next.
+Milestones M1 (foundation) and M2 (working filesystem) are complete; M3
+(crash safety, fsck) is next, after its plan is approved.
 
-- `include/nanoer/`: public headers. `src/core/`: the engine. `src/tools/`:
-  `mkfs.nanoer`, `nanoer`. `tests/unit/`: GoogleTest. `fuzz/`: libFuzzer.
+- `include/nanoer/`: public headers. `src/core/`: the engine (`fs.cpp` is the
+  POSIX layer, `journal.cpp` the log, `metadata.cpp` the operations).
+  `src/fuse/`: `nanoerfs` (also `mount.nanoer`). `src/tools/`: `mkfs.nanoer`,
+  `nanoer`, `nanoer-fsx`. `tests/unit/`: GoogleTest. `tests/integration/`:
+  tests on a real FUSE mount. `fuzz/`: libFuzzer.
 - `docs/format.md` defines the on-disk format. Any change to the format must
   update it in the same commit.
 - `third_party/blake3`: vendored, pinned by `SHA256SUMS`; never edit it.
@@ -46,6 +50,10 @@ cmake --preset debug && cmake --build --preset debug && ctest --preset debug
 cmake --preset asan && cmake --build --preset asan && ctest --preset asan   # sanitizers
 cmake --preset fuzz && cmake --build --preset fuzz                          # Clang only
 ./build/fuzz/fuzz/fuzz_parse -max_total_time=60 fuzz/seeds/parse
+ctest --preset release -L integration      # real FUSE mounts (needs /dev/fuse; root for all tests)
 ```
+
+Check that a test filter actually matches before trusting a pass:
+parameterized tests are named like `Seeds/FsModel.Random.../0`.
 
 Build with `-DNANOER_WERROR=ON` before committing; CI does.

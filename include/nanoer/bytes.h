@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace nanoer {
@@ -16,7 +17,7 @@ using Bytes = std::vector<std::uint8_t>;
 using ByteView = std::span<const std::uint8_t>;
 using MutableByteView = std::span<std::uint8_t>;
 
-inline ByteView as_bytes(const std::string& s) {
+inline ByteView as_bytes(std::string_view s) {
   return {reinterpret_cast<const std::uint8_t*>(s.data()), s.size()};
 }
 
