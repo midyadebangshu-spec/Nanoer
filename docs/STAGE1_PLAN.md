@@ -2,7 +2,8 @@
 
 **Status: APPROVED 2026-10-24** with the recommended answers to every
 question in §9. **M1 and M2 complete** (2026-10-24); see
-[`M2_PLAN.md`](M2_PLAN.md). M3 starts after its plan is approved. Background and reasoning for each technology are in
+[`M2_PLAN.md`](M2_PLAN.md). The M3 plan is [`M3_PLAN.md`](M3_PLAN.md),
+waiting for approval. Background and reasoning for each technology are in
 [`KNOWLEDGE.md`](../KNOWLEDGE.md).
 
 ## 1. Goal
