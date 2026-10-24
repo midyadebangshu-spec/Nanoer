@@ -11,16 +11,20 @@ space**).
 
 ## Status
 
-**Stage 1, milestones M1 and M2 complete: Nanoer mounts.** `nanoerfs` is a
-read-write compressed filesystem for Linux (through FUSE): files,
-directories, hard and symbolic links, permissions, extended attributes,
-`mmap`, `fsync`, sparse files. Everything survives unmounting and power cuts.
+**Stage 1, milestones M1–M3 complete: Nanoer mounts, survives power cuts,
+and has an `fsck`.** `nanoerfs` is a read-write compressed filesystem for
+Linux (through FUSE): files, directories, hard and symbolic links,
+permissions, extended attributes, `mmap`, `fsync`, sparse files. A power
+cut after any single write recovers a state that really existed, with
+everything `fsync`ed (tested at every write point and with `kill -9` on a
+real mount). Damage is detected and reported, never silently dropped.
 See [`docs/STAGE1_PLAN.md`](docs/STAGE1_PLAN.md) for what comes next.
 
-**Not ready for important data yet.** Exhaustive power-cut testing and
-`fsck` come in M3. Space from rewritten data is reclaimed only once a whole
-segment is dead until M4 adds garbage collection, so rewrite-heavy use
-(databases, VM images) can fill the store early.
+**Not ready for important data yet.** Nanoer keeps one copy of
+everything, so damaged data is detected but cannot be restored; keep
+backups. Space from rewritten data is reclaimed only once a whole segment
+is dead until M4 adds garbage collection, so rewrite-heavy use (databases,
+VM images) can fill the store early.
 
 | Stage | Scope |
 |---|---|
@@ -61,12 +65,15 @@ cp -a ~/projects /mnt/data/
 fusermount3 -u /mnt/data              # or: umount /mnt/data
 nanoer info home.img                  # contents, logical vs stored size
 nanoer bench /usr                     # measure every codec on your own files
+nanoer fsck home.img                  # check (unmounted); --repair, --deep
 ```
 
 `nanoerfs` options: `-o safe_space=SIZE` (decompressed-chunk cache, default
 256M), `-o commit=SECONDS` (default 5), `-o ro`, `-o allow_other`, `-f`
 (foreground). `mount.nanoer` is the same program, for `mount -t nanoer` and
-`/etc/fstab`.
+`/etc/fstab`. `fsck.nanoer` is `nanoer fsck`, for `fsck -t nanoer` and
+boot-time checks; exit codes follow e2fsck (0 clean, 1 repaired, 4 errors
+left, 8 could not run).
 
 Compared with ext4 on the same disk, compiling and video playback run at the
 same speed; work with many small files (untar, `find`, `grep -r`) is 2–9×

@@ -3,7 +3,10 @@ include(GoogleTest)
 
 add_executable(nanoer_unit_tests
   unit/cache_pool_test.cpp
+  unit/check_test.cpp
   unit/checksum_test.cpp
+  unit/crash_test.cpp
+  unit/damage_test.cpp
   unit/fs_model_test.cpp
   unit/fs_test.cpp
   unit/codec_test.cpp
@@ -22,6 +25,7 @@ gtest_discover_tests(nanoer_unit_tests DISCOVERY_TIMEOUT 60)
 add_test(NAME tools_smoke
   COMMAND ${CMAKE_COMMAND}
     -DMKFS=$<TARGET_FILE:mkfs.nanoer> -DNANOER=$<TARGET_FILE:nanoer>
+    -DFSCK=$<TARGET_FILE_DIR:nanoer>/fsck.nanoer
     -DWORKDIR=${CMAKE_CURRENT_BINARY_DIR}/tools_smoke
     -P ${CMAKE_CURRENT_SOURCE_DIR}/tools_smoke.cmake)
 
@@ -37,7 +41,8 @@ if(NANOER_BUILD_FUSE)
   # A tree nothing else writes to while the test runs (not the source tree,
   # where builds may be running).
   add_test(NAME integration_persist COMMAND ${RUN_MOUNTED} ${TOOLS_DIR} persist /usr/include)
-  set_tests_properties(integration_posix integration_fsx integration_persist PROPERTIES
+  add_test(NAME integration_kill COMMAND ${RUN_MOUNTED} ${TOOLS_DIR} kill)
+  set_tests_properties(integration_posix integration_fsx integration_persist integration_kill PROPERTIES
     SKIP_RETURN_CODE 77 LABELS integration RUN_SERIAL TRUE TIMEOUT 1200)
   set_tests_properties(integration_fsx PROPERTIES ENVIRONMENT "FSX_OPS=10000")
 endif()

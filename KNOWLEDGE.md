@@ -498,6 +498,98 @@ writes. One `fdatasync` at the end makes the whole commit durable.
   untar, builds) are unaffected; rewrite-heavy ones (databases, VM images)
   need M4.
 
+### 7.11 Crash safety, damage and `fsck` (M3)
+
+**Damage or crash?** Prefix consistency (§7.9) has a blind spot: replay
+stops at the first record that is not intact, whether a crash tore it or
+bit rot damaged it in the middle of a long log. In the second case every
+later transaction would be silently dropped, and the next mount would
+write over them. M3 tells the two apart with one observation: **a crash
+can only cut the log short where writes had not been flushed, and nothing
+written after an unflushed write can claim that a later transaction was
+flushed.** So every transaction records a *durable claim*, the newest
+transaction a completed flush had made durable when it was written (stored
+as a 32-bit distance back, `durable_back`). After replay stops, Nanoer
+scans the rest of the segment at every 8-byte boundary (and follows any
+intact seals it finds, even into segments whose header is damaged) for
+intact records of the current sequence number. If any claims a
+transaction beyond the last one replayed, the log is **damaged**: mount
+goes read-only and asks for `fsck` (decision 1). A real torn tail never
+triggers it, because what follows a torn write was not flushed either.
+Checkpoint parts claim their own `txid`. A transaction that is intact but
+contradicts the metadata (say, it removes an entry that does not exist) is
+damage too: replay stops before it.
+
+*Known limit:* damage to the last transaction alone, with nothing intact
+after it, looks exactly like a crash during that commit, so it is lost
+without a report. Every later commit closes the window for the earlier
+ones (they claim them).
+
+**Checkpoint fallback.** If the newest checkpoint cannot be read, mount
+uses the one the other superblock slot points to and replays the log from
+there; the transactions after it lead to the same state. This works only
+while the older checkpoint's segments are not reused, which the
+two-checkpoint rule (§7.10) protects, with one exception found by the
+image fuzzer: freeing dead segments *at mount* reuses segments the older
+checkpoint needs. Mount now does that only when it is short of free
+segments. If no superblock leads to a readable checkpoint, `fsck --repair`
+scans every segment for checkpoint part 0 records, newest first, and uses
+the first one that replays cleanly. The same scan rebuilds both
+superblocks when both are lost (decision 3): the segment size is found by
+voting over the segment headers that would be valid at each size, the UUID
+by vote, and the chunk size from the data chunks' offsets.
+
+**Errors flag.** A superblock `state` bit (formerly reserved, so older
+readers ignore it) records that damage was seen: a chunk failing its
+checksum, damage at mount, a checkpoint fallback. It is set by the next
+checkpoint and cleared only by `fsck` once everything is found and
+repaired (decision 4). Reads of damaged chunks still return `EUCLEAN` and
+are logged with the inode and byte range.
+
+**`nanoer fsck`** (also `fsck.nanoer`, for `fsck -t nanoer` and boot-time
+checks) runs in phases: superblocks; segments and the log (with damage
+detection); the directory tree (reachability from the root, cycles, `..`,
+names, link counts, orphans); space (every chunk points at an intact data
+chunk record in a segment in use, owned by that inode at that offset, of
+the recorded size, referenced once, within the file; live bytes per
+segment); and with `--deep`, every chunk decompressed and verified.
+**Repairs work like a mount:** the fixes are physical operations applied
+to the metadata in memory, written as one transaction, then a new
+checkpoint, then the superblocks. Nothing is changed in place, so a crash
+during a repair leaves either the old or the repaired filesystem.
+Unreachable files and directories are reconnected under `/lost+found` as
+`#<inode>`, keeping each lost subtree whole; damaged chunks become holes
+and are listed by file and byte range. `fsck` never guesses at data. Exit
+codes follow e2fsck: 0 clean, 1 repaired, 4 errors left, 8 could not run.
+
+**Write ordering.** Every place where order matters, and what enforces it:
+
+1. A data chunk is appended before the transaction that refers to it, in
+   the same flush. Replay stops at a missing chunk, so it never reaches
+   the transaction (prefix consistency, §7.9).
+2. One flush per commit; the commit is durable when it returns.
+3. A checkpoint's parts are flushed before the superblock that points to
+   them is written, and the superblock is flushed before anything relies
+   on it.
+4. The superblock goes to slot `generation mod 2`, so the previous one
+   survives a torn write; released segments are reused only after the
+   *next* checkpoint is durable (§7.10), so both slots' checkpoints stay
+   readable.
+5. A seal may reach the disk before the header of the segment it points
+   to. Replay then ends at the seal (a "dangling" seal), and damage
+   detection still scans the target segment.
+6. After mount, the log continues after a seal written *at* the end
+   found, never after a possibly torn tail.
+7. A repair writes its transaction, then flushes, then the checkpoint,
+   then the superblocks, as a mount would.
+8. A failed write or flush makes the filesystem refuse further changes;
+   a mount that fails part way writes nothing (it used to write a
+   checkpoint while being torn down).
+
+**How it is tested** (§12): every crash point of a workload, I/O errors at
+every point, crafted inconsistencies for each `fsck` repair, random damage,
+an image fuzzer, and `kill -9` on a real mount.
+
 ---
 
 ## 8. Caching: the safe space and read-ahead
@@ -804,6 +896,50 @@ table fallback that processes 8 bytes per step.
   superblock that "failed". The check is now "the canonical encoding is
   stable", and a unit test pins the reserved-bytes rule. CI now keeps
   crashing inputs as artifacts.
+- **In M3** (crash safety and `fsck`):
+  - **Crash-point exploration**, in the style of CrashMonkey and ALICE: a
+    recording store logs every write and flush, per 4 KiB block. A
+    300-step workload (mostly incompressible writes, so segments fill
+    fast, two delete-everything phases, so segments are reused; sync every
+    4 steps) runs once, and a crash image is built after each write in
+    several variants (unflushed writes all lost, all kept, each dropped
+    alone, the last one torn at every sector, random subsets). Each image
+    must pass `fsck` with no errors and mount writable, without damage or
+    fallback, in the state of the last sync or the one after it. CI
+    checks every 11th crash point; `NANOER_EXHAUSTIVE=1` (nightly) checks
+    every one. Crashes during mount itself and during repairs are covered
+    the same way.
+  - **I/O errors:** a write or flush fails at every position of the same
+    workload; afterwards the filesystem must refuse changes, and the image
+    must mount consistent, in the state before or after the failed commit
+    (the failure may hit the checkpoint *after* a durable commit).
+  - **`fsck`:** a test per inconsistency (crafted transactions written
+    into the log), each checking that `fsck` finds it, `--repair` fixes
+    it, and the result is clean and still mounts and works.
+  - **Damage:** mid-log damage detected (read-only mount), checkpoint
+    fallback, damaged file data gives `EUCLEAN`, random damage never
+    crashes.
+  - **`fuzz_image`**, a libFuzzer target that damages a small valid image
+    at fuzzer-chosen bytes, then mounts it and reads everything, runs
+    `fsck --repair --deep`, checks that a repair that claims success
+    leaves a clean filesystem, and mounts and reads again.
+  - **`kill -9` on a real mount** (`run_mounted.sh kill`): a writer
+    creates and deletes files, and logs each one to another filesystem
+    only after `fsync` returned; fsx, an untar and a build run alongside.
+    `nanoerfs` is killed at a random moment; after a lazy unmount, `fsck
+    --deep` must find it clean, every logged file must be intact, and the
+    remounted filesystem must be writable.
+- **Lesson:** a test binary that silently ran 0 tests (a stale build after
+  a syntax slip) "passed". Zero tests is a failure, not a pass.
+- **Lesson:** the crash workload at first never reused a segment, so the
+  most delicate code (reuse) was never crash-tested. The workload now
+  asserts that reuse happened.
+- **Lesson:** the image fuzzer found, within minutes, a case no hand-written
+  test had: on a small store, freeing segments at mount had destroyed the
+  older checkpoint, so a damaged newest superblock made the filesystem
+  unrecoverable. Fixed twice over: mount frees early only when short of
+  space, and `fsck --repair` can find the newest readable checkpoint by
+  scanning.
 - **Benchmarks** compared with ext4 (no compression) and Btrfs + zstd: space
   used, throughput, latency, CPU time.
 
@@ -935,6 +1071,22 @@ is empty):
   3 kernel driver.
 - Large sequential I/O is about 2× slower; cold reads run at ~660 MB/s.
 
+### 2026-10-24: M3, crash points, damage and kill -9
+
+Release build, 4-core VM.
+
+| Test | Result |
+|---|---|
+| Every crash point of the crash workload (1,584 block writes and flushes, 76 syncs, 6 segment starts in 4 segments), every variant | **46,618 crash images, all recovered a real state**, all `fsck`-clean, no false damage reports; 13 min |
+| The same, every 11th crash point (CI per push) | 2,044 images |
+| Crashes during mount; a disk error at every write and flush | all consistent |
+| `fuzz_image`, after the checkpoint-rescue fix | 10,610 damaged images in 8 min, no failure (≈22 images/s: each is mounted, read, repaired, checked deeply, mounted again) |
+| `kill -9` of `nanoerfs` with an fsync writer, fsx, an untar and a build running, 8 rounds | every round `fsck --deep` clean, all 2,000–2,200 durable files intact, writable after remount |
+| `fsck --deep` of an M2 test image | clean, 6,105 chunks verified |
+
+Crash exploration is dominated by system time (building and mounting
+images in memory), so it parallelises poorly; nightly CI runs it whole.
+
 ### 2026-10-23: media and raw video (Python prototype)
 
 | Input | Result |
@@ -992,6 +1144,15 @@ rejected.
 | 2026-10-24 | 60 s attribute and name cache timeouts | single writer through one mount: caches cannot go stale; measured ~15 % faster on small-file work | 1 s (libfuse examples) |
 | 2026-10-24 | `readdir` from a snapshot taken at `opendir` | concurrent changes cannot make a listing skip or repeat names | live iteration with name cookies |
 | 2026-10-24 | BSD semantics on set-group-ID directories (new entries take the group; subdirectories inherit the bit) | what Linux filesystems do; the kernel leaves it to the filesystem under FUSE | ignoring set-group-ID |
+| 2026-10-24 | M3 plan approved with the recommended answers: mid-log damage mounts read-only and asks for `fsck`; repair keeps the intact prefix and reports what was lost; superblock rescue included; errors flag in the superblock; a sample per push plus a nightly exhaustive run; `fsck.nanoer`; real-device power-cut testing postponed to stage 2 | user approval of `docs/M3_PLAN.md` | see plan §10 |
+| 2026-10-24 | Tell damage from a crash by a durable claim in every transaction (`durable_back`), scanning past the end of the log | a crash cannot leave records after it that claim later durability; damage can; costs 4 bytes per transaction | trusting the first bad record as the end (silent loss); a second copy of the log; heuristics such as "any intact record after the end" (a torn tail followed by stale or unflushed records would be a false alarm) |
+| 2026-10-24 | A contradictory transaction is damage: replay stops before it | applying part of it, or skipping it, would invent a state that never existed | refusing to mount |
+| 2026-10-24 | Checkpoint fallback to the other superblock slot; `fsck` scans for checkpoints as the last resort | the older checkpoint plus the log gives the same state; scanning finds checkpoints when no superblock leads to one | refusing to mount |
+| 2026-10-24 | Free segments at mount only when short of free segments | early reuse destroys the older checkpoint that fallback needs (found by the image fuzzer) | always freeing at mount (M2) |
+| 2026-10-24 | Errors flag in a formerly reserved superblock field, set by the next checkpoint | older readers ignore it; no extra write at the moment of an error | a feature bit (would make old readers refuse or go read-only) |
+| 2026-10-24 | `fsck` repairs as a transaction plus a new checkpoint, never in place | a crash during repair leaves the old or the repaired filesystem; same code path as mount | editing records in place, as e2fsck does |
+| 2026-10-24 | Lost subtrees go to `/lost+found` whole, as `#<inode>` | keeps the files' structure; names cannot be recovered from a damaged log | reconnecting every lost inode separately (flattens directories) |
+| 2026-10-24 | The `kill -9` test is a mode of `run_mounted.sh`; I/O-error tests live in `crash_test.cpp` | they share the mount and crash-image helpers | separate `kill_test.sh` and `io_error_test.cpp` (as the plan's file list said) |
 
 ---
 

@@ -1,0 +1,71 @@
+name: Nightly
+
+# The long versions of what CI samples on every push: every crash point,
+# long fuzzing runs, and many kill -9 rounds on a real mount.
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PACKAGES: >-
+    cmake ninja-build pkg-config clang libclang-rt-18-dev
+    libzstd-dev liblz4-dev liblzma-dev libxxhash-dev libgtest-dev libfuse3-dev fuse3
+
+jobs:
+  crash:
+    name: crash points (exhaustive)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y $PACKAGES
+      - name: Build
+        run: cmake --preset release -DNANOER_WERROR=ON && cmake --build --preset release
+      - name: Every crash point, every variant
+        run: NANOER_EXHAUSTIVE=1 ./build/release/tests/nanoer_unit_tests --gtest_filter='Crash.*:Damage.*'
+
+  fuzz:
+    name: fuzz (${{ matrix.target }}, 1 h)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [decompress, roundtrip, parse, image]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y $PACKAGES
+      - name: Build fuzzers
+        run: cmake --preset fuzz -DNANOER_WERROR=ON && cmake --build --preset fuzz
+      - name: Fuzz
+        run: |
+          mkdir -p crashes corpus
+          ./build/fuzz/fuzz/fuzz_${{ matrix.target }} -max_total_time=3600 -timeout=60 \
+            -rss_limit_mb=4096 -artifact_prefix=crashes/ corpus fuzz/seeds/${{ matrix.target }}
+      - name: Keep crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes-${{ matrix.target }}
+          path: crashes/
+
+  kill:
+    name: kill -9 on a real mount (100 rounds)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y $PACKAGES
+          sudo modprobe fuse || true
+      - name: Build
+        run: cmake --preset release -DNANOER_WERROR=ON && cmake --build --preset release
+      - name: Kill rounds
+        run: sudo KILL_ROUNDS=100 tests/integration/run_mounted.sh build/release/src kill

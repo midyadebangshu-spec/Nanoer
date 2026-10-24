@@ -69,7 +69,8 @@ Two copies (slots) of 4096 bytes each, at offsets 0 and 4096.
 | 136 | 1 | `default_codec` | codec id for new data (§7) |
 | 137 | 1 | `default_level` | **signed** compression level for new data |
 | 138 | 1 | `chunk_shift` | chunk size = 2^shift, 12..24 (4 KiB..16 MiB) |
-| 139 | 5 | reserved | |
+| 139 | 1 | reserved | |
+| 140 | 4 | `state` | state flags, below |
 | 144 | 64 | `label` | UTF-8, NUL-padded, at most 63 bytes |
 | 208 | 3884 | reserved | |
 | 4092 | 4 | `crc` | CRC-32C of bytes 0..4091 |
@@ -108,6 +109,13 @@ new superblock refers to must be durable before the superblock is written.
 
 `mkfs` writes generation 1 (slot 1) and then generation 2 (slot 0), so both
 slots are valid from the start.
+
+**State flags.** Bit 0 (`errors`): damage has been seen, in metadata or
+data; set by the first checkpoint after the damage is noticed, cleared
+only by `fsck` once it has found or repaired everything. A mount reports
+it; a boot-time `fsck -a` then knows the filesystem needs a full check.
+Other bits are reserved and written as zero. An unknown bit set is not an
+error (old readers ignore the field), but writers preserve it.
 
 **Features.** No feature bits are defined in version 1.0.
 
@@ -257,7 +265,11 @@ Type-specific header (16 bytes):
 |---:|---:|---|---|
 | 32 | 8 | `txid` | transaction id; each is exactly one more than the previous |
 | 40 | 4 | `op_count` | number of operations in the payload |
-| 44 | 4 | reserved | |
+| 44 | 4 | `durable_back` | `txid − durable_back` is the newest transaction that was durable when this one was written; 0 = unknown |
+
+`durable_back` is what lets a reader tell damage from a crash (§10.2). A
+writer sets it from the transactions its last completed flush made
+durable; it writes 0 when that distance does not fit in 32 bits.
 
 The payload is the operations, back to back, in this encoding:
 
@@ -370,7 +382,22 @@ seal always fits.
      `next_seq`, continue at its first record; otherwise the log ends at the
      seal itself.
 5. The log ends at the first position where no intact record (§5.2) begins.
-6. Every segment the reading entered is in use. If the snapshot listed that
+6. **Damage or crash?** A crash can only cut the log short where writes
+   were not yet flushed, and nothing written after an unflushed write can
+   claim that a later transaction was flushed. So scan on past the end: in
+   the rest of that segment, at every 8-byte boundary, for intact records
+   of the current sequence number, following any intact seals found there
+   into later segments (and into the segment a seal at the end points to,
+   even if its header is damaged). Each transaction found *claims*
+   `txid − durable_back` (when `durable_back` ≠ 0), each checkpoint part
+   claims its `txid`. If any claim exceeds the last transaction applied,
+   the log is **damaged**, not torn: the recovered state is missing
+   committed transactions. A reader must not then write to the
+   filesystem: it mounts read-only and asks for `fsck`.
+7. A transaction that is intact but contradicts the metadata (an
+   operation that breaks a rule of §8) is damage too; replay stops before
+   it, and step 6 applies with the log ending there.
+8. Every segment the reading entered is in use. If the snapshot listed that
    segment with another sequence number, it must have had no live data
    (it was freed and reused since); otherwise the filesystem is corrupt.
 
@@ -379,6 +406,20 @@ never skips a damaged record to continue after it, and a new segment is
 only entered through an intact seal. Writers append each data chunk before
 the transaction that refers to it, so a transaction in the prefix never
 refers to a missing chunk.
+
+**Limit.** Damage to the last transaction alone, with nothing intact after
+it, looks exactly like a crash during that commit: no later record claims
+it. It is lost without a report. A writer narrows this window by
+committing again soon (every later transaction claims the earlier ones).
+
+**Checkpoint fallback.** If the checkpoint the newest superblock points to
+cannot be read (step 3), a reader uses the other slot, if it is valid,
+older and of the same filesystem, and reads its checkpoint and the log
+after it instead. The transactions after the older checkpoint lead to the
+same state as the damaged one, provided the segments they are in were not
+reused (§10.4). If neither checkpoint can be read, `fsck --repair`
+searches every segment for checkpoint part 0 records, newest `txid` first,
+and uses the first one that reads and replays cleanly.
 
 ### 10.3 Continuing the log after mount
 
@@ -398,7 +439,10 @@ slot points to, should the newest superblock write be torn. Therefore:
   They become free for reuse only once checkpoint *K+1* is durable.
 - At mount from checkpoint *K*, such segments may be reused at once: the
   superblock pointing at *K* was read from disk, so it is durable, and it
-  stays intact until two more superblocks are written.
+  stays intact until two more superblocks are written. This gives up the
+  checkpoint fallback of §10.2 for *K* (the older checkpoint's log may be
+  overwritten), so a writer does it only when it is short of free
+  segments.
 - Each time a segment is (re)started it gets a new, higher sequence number,
   so records left from its earlier use can never be mistaken for current
   ones (§5.2).
@@ -417,3 +461,4 @@ therefore always has a checkpoint.
 |---|---|
 | 1.0 (draft) | initial: geometry, superblock, segments, records, data chunks |
 | 1.0 (draft, M2) | metadata transactions, checkpoints, segment seals, log replay, segment reuse; mkfs writes an initial checkpoint |
+| 1.0 (draft, M3) | transaction `durable_back` (was reserved, so older images read as "unknown"); superblock `state` flags (was reserved); damage detection, contradictory transactions, checkpoint fallback and rescue (§10.2) |

@@ -4,6 +4,7 @@
 
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <string>
 
 #include "nanoer/bytes.h"
@@ -37,6 +38,11 @@ inline constexpr std::uint64_t kKnownCompatFeatures = 0;
 inline constexpr std::uint64_t kKnownRoCompatFeatures = 0;
 inline constexpr std::uint64_t kKnownIncompatFeatures = 0;
 
+// Superblock state flags (not features: any version may ignore them).
+namespace state_flags {
+inline constexpr std::uint32_t errors = 0x01;  // damage was seen; run nanoer fsck
+}
+
 using Uuid = std::array<std::uint8_t, 16>;
 
 Uuid random_uuid();
@@ -64,6 +70,7 @@ struct Superblock {
   CodecId default_codec = CodecId::zstd;
   std::int8_t default_level = 1;
   std::uint8_t chunk_shift = kDefaultChunkShift;
+  std::uint32_t state = 0;  // state_flags
   std::string label;
 
   std::uint64_t segment_size() const { return std::uint64_t{1} << segment_shift; }
@@ -92,6 +99,9 @@ struct LoadedSuperblock {
   Superblock sb;
   int slot;        // 0 or 1
   bool read_only;  // has ro_compat features this build does not know
+  // The other slot, if it is valid and older: the previous checkpoint, to
+  // fall back on if the newest one is damaged.
+  std::optional<Superblock> older;
 };
 
 // Reads both superblock slots and returns the newest valid one. Throws

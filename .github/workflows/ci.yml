@@ -53,7 +53,7 @@ jobs:
       - name: Run fuzzers
         run: |
           mkdir -p crashes
-          for target in decompress roundtrip parse; do
+          for target in decompress roundtrip parse image; do
             mkdir -p corpus/$target
             ./build/fuzz/fuzz/fuzz_$target -max_total_time=120 -rss_limit_mb=2048 \
               -artifact_prefix=crashes/ corpus/$target fuzz/seeds/$target
@@ -79,7 +79,7 @@ jobs:
           sudo modprobe fuse || true
       - name: Build
         run: cmake --preset release -DNANOER_WERROR=ON && cmake --build --preset release
-      - name: Nanoer integration tests (POSIX suite, nanoer-fsx, persistence)
+      - name: Nanoer integration tests (POSIX suite, nanoer-fsx, persistence, kill -9)
         run: sudo ctest --preset release -L integration --output-on-failure
       - name: pjdfstest (POSIX conformance)
         run: |

@@ -1,5 +1,6 @@
 add_library(nanoer_core STATIC
   core/cache.cpp
+  core/check.cpp
   core/checksum.cpp
   core/codec.cpp
   core/encoding.cpp
@@ -44,3 +45,8 @@ if(NANOER_BUILD_FUSE)
     file(CREATE_LINK ../bin/nanoerfs \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/sbin/mount.nanoer\" SYMBOLIC)")
 endif()
 target_compile_definitions(nanoer PRIVATE NANOER_VERSION="${PROJECT_VERSION}")
+# fsck(8) runs fsck.TYPE for `fsck -t TYPE` and boot-time checks.
+add_custom_command(TARGET nanoer POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E create_symlink nanoer fsck.nanoer
+  WORKING_DIRECTORY $<TARGET_FILE_DIR:nanoer>)
+install(CODE "file(CREATE_LINK nanoer \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/sbin/fsck.nanoer\" SYMBOLIC)")

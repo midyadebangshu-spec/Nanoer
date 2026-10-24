@@ -31,14 +31,17 @@ that a system needing 800 GB without Nanoer needs about 500 GB with it.
   decision log.
 - Licence: Apache-2.0. A future kernel module will be Dual MIT/GPL.
 
-Milestones M1 (foundation) and M2 (working filesystem) are complete; M3
-(crash safety, fsck) is next, after its plan is approved.
+Milestones M1 (foundation), M2 (working filesystem) and M3 (crash safety,
+`fsck`) are complete; M4 (garbage collection, dedup) is next, after its plan
+is approved.
 
 - `include/nanoer/`: public headers. `src/core/`: the engine (`fs.cpp` is the
   POSIX layer, `journal.cpp` the log, `metadata.cpp` the operations).
   `src/fuse/`: `nanoerfs` (also `mount.nanoer`). `src/tools/`: `mkfs.nanoer`,
-  `nanoer`, `nanoer-fsx`. `tests/unit/`: GoogleTest. `tests/integration/`:
-  tests on a real FUSE mount. `fuzz/`: libFuzzer.
+  `nanoer` (also `fsck.nanoer`), `nanoer-fsx`. `src/core/check.cpp`: fsck.
+  `tests/unit/`: GoogleTest (`crash_test.cpp` explores every crash point).
+  `tests/integration/`: tests on a real FUSE mount, including `kill -9`.
+  `fuzz/`: libFuzzer. `.github/workflows/nightly.yml`: the exhaustive runs.
 - `docs/format.md` defines the on-disk format. Any change to the format must
   update it in the same commit.
 - `third_party/blake3`: vendored, pinned by `SHA256SUMS`; never edit it.
@@ -49,8 +52,10 @@ Milestones M1 (foundation) and M2 (working filesystem) are complete; M3
 cmake --preset debug && cmake --build --preset debug && ctest --preset debug
 cmake --preset asan && cmake --build --preset asan && ctest --preset asan   # sanitizers
 cmake --preset fuzz && cmake --build --preset fuzz                          # Clang only
-./build/fuzz/fuzz/fuzz_parse -max_total_time=60 fuzz/seeds/parse
+# The first directory is where libFuzzer writes new inputs: never the seeds.
+mkdir -p build/corpus/parse && ./build/fuzz/fuzz/fuzz_parse -max_total_time=60 build/corpus/parse fuzz/seeds/parse
 ctest --preset release -L integration      # real FUSE mounts (needs /dev/fuse; root for all tests)
+NANOER_EXHAUSTIVE=1 ./build/release/tests/nanoer_unit_tests --gtest_filter='Crash.*'  # every crash point (~15 min)
 ```
 
 Check that a test filter actually matches before trusting a pass:

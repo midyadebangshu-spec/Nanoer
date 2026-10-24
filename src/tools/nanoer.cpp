@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "common.h"
+#include "nanoer/check.h"
 #include "nanoer/checksum.h"
 #include "nanoer/codec.h"
 #include "nanoer/error.h"
@@ -36,7 +37,14 @@ void usage(std::ostream& out) {
          "      -m, --max-size SIZE     read at most this much data (default 64M)\n"
          "      -p, --per-file SIZE     read at most this much from each file, so the sample\n"
          "                              spans many files (default 4M)\n"
-         "  version                   print the version\n";
+         "  fsck [options] TARGET     check the filesystem (it must not be mounted)\n"
+         "      --repair, -y, -a, -p    repair what is safe to repair\n"
+         "      --deep                  also read and verify every data chunk\n"
+         "      -n                      check only (the default)\n"
+         "  version                   print the version\n"
+         "\n"
+         "fsck exit codes: 0 clean, 1 errors fixed, 4 errors left, 8 could not run.\n"
+         "Also installed as fsck.nanoer, for fsck -t nanoer and boot-time checks.\n";
 }
 
 std::string features(std::uint64_t f) {
@@ -90,6 +98,8 @@ int cmd_info(const std::vector<std::string_view>& args) {
             << "  features:        compat " << features(sb.features_compat) << ", ro_compat "
             << features(sb.features_ro_compat) << ", incompat " << features(sb.features_incompat)
             << (loaded.read_only ? " (read-only for this version)" : "") << "\n"
+            << "  state:           "
+            << (sb.state & state_flags::errors ? "damage was found; run nanoer fsck" : "clean") << "\n"
             << "  checkpoint:      "
             << (sb.checkpoint_offset ? "at byte " + std::to_string(sb.checkpoint_offset) : "none")
             << "\n"
@@ -123,7 +133,75 @@ int cmd_info(const std::vector<std::string_view>& args) {
             << "  checkpoint:      " << format_size(i.checkpoint_bytes) << ", transaction "
             << (i.last_txid - i.replayed_transactions) << "\n"
             << "  log after it:    " << i.replayed_transactions << " transactions\n";
+  if (i.log_damaged) std::cout << "  log:             DAMAGED; later changes cannot be read (run nanoer fsck)\n";
+  if (i.checkpoint_fallback) std::cout << "  checkpoint:      the latest is damaged; read the previous one\n";
   return 0;
+}
+
+// ---- fsck ------------------------------------------------------------------
+
+int cmd_fsck(const std::vector<std::string_view>& args) {
+  FsckOptions options;
+  std::string target;
+  for (std::size_t i = 0; i < args.size(); ++i) {
+    std::string_view a = args[i];
+    if (a == "-h" || a == "--help") {
+      usage(std::cout);
+      return 0;
+    } else if (a == "--repair" || a == "-y" || a == "-a" || a == "-p") {
+      options.repair = true;
+    } else if (a == "--deep") {
+      options.deep = true;
+    } else if (a == "-n") {
+      options.repair = false;
+    } else if (a == "-f" || a == "-V" || a == "-t" || a == "-T" || a == "-M") {
+      // fsck(8) options with nothing to do here (Nanoer always checks fully).
+    } else if (a == "-C") {
+      if (i + 1 < args.size() && !args[i + 1].empty() && args[i + 1][0] != '-') ++i;  // progress fd
+    } else if (a.starts_with("-C")) {
+    } else if (!a.empty() && a[0] == '-') {
+      return fail(kProgram, "unknown fsck option " + std::string(a)) * 8;
+    } else {
+      target = std::string(a);
+    }
+  }
+  if (target.empty()) return fail(kProgram, "fsck needs a TARGET") * 8;
+
+  FsckReport report;
+  try {
+    // A store that is mounted is locked: fsck refuses to touch it.
+    auto store = FileStore::open(target, options.repair ? FileStore::Mode::read_write
+                                                        : FileStore::Mode::read_only);
+    report = fsck(*store, options);
+    if (options.repair && !report.fixed.empty()) {
+      // Check the result again: repairs must leave a clean filesystem.
+      FsckReport after = fsck(*store, {.repair = false, .deep = options.deep});
+      for (std::string& e : after.errors) report.errors.push_back("after repair: " + e);
+    }
+  } catch (const Error& e) {
+    std::cerr << "nanoer fsck: " << e.what() << "\n";
+    return 8;
+  }
+
+  auto section = [](const char* title, const std::vector<std::string>& lines) {
+    if (lines.empty()) return;
+    std::cout << title << ":\n";
+    for (const std::string& l : lines) std::cout << "  " << l << "\n";
+  };
+  section("Errors", report.errors);
+  section("Fixed", report.fixed);
+  section("Lost", report.lost);
+  section("Notes", report.notes);
+  std::cout << target << ": " << report.files << " files, " << report.directories
+            << " directories, " << report.chunks << " chunks";
+  if (options.deep) std::cout << " (" << report.chunks_verified << " verified)";
+  std::cout << ": "
+            << (report.exit_code() == 0   ? "clean"
+                : report.exit_code() == 1 ? "repaired"
+                                          : "errors remain")
+            << "\n";
+  if (report.exit_code() == 4 && !options.repair) std::cout << "Run with --repair to fix them.\n";
+  return report.exit_code();
 }
 
 // ---- bench -----------------------------------------------------------------
@@ -241,6 +319,8 @@ int cmd_bench(const std::vector<std::string_view>& args) {
 
 int main(int argc, char** argv) {
   std::vector<std::string_view> args(argv + 1, argv + argc);
+  // As fsck.nanoer (for fsck -t nanoer): the arguments are fsck's.
+  if (std::string_view(argv[0]).ends_with("fsck.nanoer")) return cmd_fsck(args);
   if (args.empty() || args[0] == "-h" || args[0] == "--help" || args[0] == "help") {
     usage(args.empty() ? std::cerr : std::cout);
     return args.empty() ? 1 : 0;
@@ -250,6 +330,7 @@ int main(int argc, char** argv) {
   try {
     if (command == "info") return cmd_info(args);
     if (command == "bench") return cmd_bench(args);
+    if (command == "fsck") return cmd_fsck(args);
     if (command == "version") {
       std::cout << "nanoer " NANOER_VERSION " (format " << kVersionMajor << "." << kVersionMinor << ")\n";
       return 0;

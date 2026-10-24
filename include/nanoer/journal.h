@@ -16,6 +16,7 @@
 
 #include "nanoer/bytes.h"
 #include "nanoer/codec.h"
+#include "nanoer/error.h"
 #include "nanoer/format.h"
 #include "nanoer/metadata.h"
 #include "nanoer/record.h"
@@ -33,6 +34,25 @@ inline constexpr std::size_t kCheckpointExtraSize = 32;
 namespace checkpoint_flags {
 inline constexpr std::uint32_t final_part = 0x01;
 }
+
+// The newest checkpoint cannot be read. Mounting may fall back to the
+// previous one (the other superblock slot).
+class CheckpointError : public Error {
+ public:
+  explicit CheckpointError(const std::string& message) : Error(Errc::corrupt, message) {}
+};
+
+// A transaction in the log contradicts the metadata (it cannot be applied).
+// Replaying again with stop_before_txid = txid() gives the state before it.
+class ReplayError : public Error {
+ public:
+  ReplayError(std::uint64_t txid, const std::string& message)
+      : Error(Errc::corrupt, message), txid_(txid) {}
+  std::uint64_t txid() const { return txid_; }
+
+ private:
+  std::uint64_t txid_;
+};
 
 // A position in the log.
 struct LogPosition {
@@ -62,6 +82,11 @@ class Journal {
 
   void write_buffered();  // hand appended records to the store
   void flush();           // and make them durable
+
+  // The newest transaction known to be durable (written before the last
+  // flush). Every transaction record carries it, so that replay can tell
+  // damage from a torn write (docs/format.md §10.2).
+  std::uint64_t durable_txid() const { return durable_txid_; }
 
   // Call once a checkpoint starting at `start` is durable and the superblock
   // points to it. Segments released at the previous checkpoint become free;
@@ -103,8 +128,17 @@ class Journal {
   std::uint64_t next_seq_;
   std::uint64_t reserve_ = 0;
   std::uint64_t bytes_since_checkpoint_ = 0;
+  std::uint64_t appended_txid_ = 0;  // newest transaction appended
+  std::uint64_t durable_txid_ = 0;   // newest transaction made durable by a flush
   std::set<std::uint64_t> pending_free_;
   std::optional<SegmentWriter> writer_;
+};
+
+// Evidence that the log was damaged, not merely cut short by a crash.
+struct LogDamage {
+  bool found = false;
+  std::uint64_t offset = 0;        // where the intact log stops
+  std::uint64_t durable_claim = 0;  // newest transaction later records say was durable
 };
 
 struct ReplayResult {
@@ -115,11 +149,17 @@ struct ReplayResult {
   std::uint64_t transactions = 0;  // replayed after the checkpoint
   std::uint64_t log_bytes = 0;     // of records after the checkpoint
   std::uint64_t checkpoint_bytes = 0;
+  // Set when intact records after the end show that durable transactions
+  // were lost: the log was damaged, and the state is only a prefix.
+  LogDamage damage;
 };
 
 // Reads the latest checkpoint and replays the log after it. Throws
-// Error(corrupt) if the checkpoint is missing or damaged, or the log
-// contradicts itself.
-ReplayResult replay(Store& store, const Superblock& sb);
+// CheckpointError if the checkpoint is missing or damaged, and Error(corrupt)
+// if the log contradicts itself. Damage that cuts the log short is reported
+// in ReplayResult::damage rather than thrown.
+// `stop_before_txid` ends the replay just before that transaction (fsck).
+ReplayResult replay(Store& store, const Superblock& sb,
+                    std::uint64_t stop_before_txid = UINT64_MAX);
 
 }  // namespace nanoer

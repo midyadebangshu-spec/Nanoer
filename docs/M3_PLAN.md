@@ -1,8 +1,24 @@
 # M3 plan: crash safety, proven, and `nanoer fsck`
 
-**Status: PROPOSED, waiting for approval.** Part of stage 1
-([`STAGE1_PLAN.md`](STAGE1_PLAN.md)). No M3 code is written until this plan
-is approved.
+**Status: COMPLETE (2026-10-24).** Approved 2026-10-24 with the
+recommended answer to every question in §10. Part of stage 1
+([`STAGE1_PLAN.md`](STAGE1_PLAN.md)). Results are in
+[`KNOWLEDGE.md`](../KNOWLEDGE.md) §7.11, §12 and §14.
+
+**Changes from this plan while building it:**
+
+- Damage is told from a crash by a *durable claim* in every transaction
+  (`durable_back`, `docs/format.md` §8 and §10.2), not merely by finding
+  intact records after the end: those can legitimately follow a torn
+  tail. The known limit: damage to the last transaction alone looks like
+  a crash.
+- The image fuzzer showed that freeing segments at mount (M2) can destroy
+  the older checkpoint that fallback relies on; mount now does so only
+  when short of free segments, and `fsck --repair` can find the newest
+  readable checkpoint by scanning the segments.
+- File layout: the I/O-error tests are in `crash_test.cpp`, and the
+  `kill -9` test is the `kill` mode of `tests/integration/run_mounted.sh`
+  (with `kill_writer.py`).
 
 ## 1. Goal
 
@@ -143,9 +159,9 @@ src/core/journal.cpp                          damage detection, checkpoint fallb
 src/core/format.cpp, include/nanoer/format.h  superblock errors flag
 src/core/fs.cpp                               read-only on damage, error flag, error reporting
 src/tools/nanoer.cpp                          `nanoer fsck`; fsck.nanoer link
-tests/unit/crash_test.cpp, io_error_test.cpp, check_test.cpp, damage_test.cpp
+tests/unit/crash_test.cpp, check_test.cpp, damage_test.cpp
 fuzz/fuzz_image.cpp
-tests/integration/kill_test.sh
+tests/integration/run_mounted.sh (kill mode), kill_writer.py
 .github/workflows/nightly.yml                 exhaustive crash runs, long fuzzing
 docs/format.md                                errors flag; recovery rules
 KNOWLEDGE.md                                  write-ordering list, decisions, results

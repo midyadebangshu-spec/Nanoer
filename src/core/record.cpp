@@ -67,8 +67,8 @@ Bytes encode_record(RecordType type, std::uint8_t flags, std::uint64_t seq, Byte
   return b;
 }
 
-std::optional<Record> try_read_record(Store& store, std::uint64_t offset, std::uint64_t limit,
-                                      std::uint64_t seq) {
+std::optional<Record> try_read_record_header(Store& store, std::uint64_t offset,
+                                             std::uint64_t limit, std::uint64_t seq) {
   if (offset % kRecordAlignment != 0 || offset > limit || limit - offset < kRecordHeaderSize) {
     return std::nullopt;
   }
@@ -104,8 +104,15 @@ std::optional<Record> try_read_record(Store& store, std::uint64_t offset, std::u
   r.offset = offset;
   r.header = h;
   r.extra.assign(header.begin() + kRecordHeaderSize, header.end());
-  r.payload = store.read(offset + h.header_len, h.payload_len);
-  if (crc32c(r.payload) != h.payload_crc) return std::nullopt;
+  return r;
+}
+
+std::optional<Record> try_read_record(Store& store, std::uint64_t offset, std::uint64_t limit,
+                                      std::uint64_t seq) {
+  std::optional<Record> r = try_read_record_header(store, offset, limit, seq);
+  if (!r) return std::nullopt;
+  r->payload = store.read(offset + r->header.header_len, r->header.payload_len);
+  if (crc32c(r->payload) != r->header.payload_crc) return std::nullopt;
   return r;
 }
 

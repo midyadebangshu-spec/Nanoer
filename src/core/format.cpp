@@ -39,6 +39,7 @@ constexpr std::size_t checkpoint_seq = 128;
 constexpr std::size_t default_codec = 136;
 constexpr std::size_t default_level = 137;
 constexpr std::size_t chunk_shift = 138;
+constexpr std::size_t state = 140;
 constexpr std::size_t label = 144;
 constexpr std::size_t label_size = 64;
 constexpr std::size_t crc = kBlockSize - 4;
@@ -141,6 +142,7 @@ Bytes encode_superblock(const Superblock& sb) {
   b[off::default_codec] = static_cast<std::uint8_t>(sb.default_codec);
   b[off::default_level] = static_cast<std::uint8_t>(sb.default_level);
   b[off::chunk_shift] = sb.chunk_shift;
+  store_le(b.data() + off::state, sb.state);
   std::memcpy(b.data() + off::label, sb.label.data(), sb.label.size());
   store_le(b.data() + off::crc, crc32c(ByteView(b.data(), off::crc)));
   return b;
@@ -177,6 +179,7 @@ DecodedSuperblock decode_superblock(ByteView b) {
   sb.default_codec = static_cast<CodecId>(b[off::default_codec]);
   sb.default_level = static_cast<std::int8_t>(b[off::default_level]);
   sb.chunk_shift = b[off::chunk_shift];
+  sb.state = load_le<std::uint32_t>(b.data() + off::state);
 
   const auto* label = reinterpret_cast<const char*>(b.data() + off::label);
   std::size_t label_len = strnlen(label, off::label_size);
@@ -230,7 +233,13 @@ LoadedSuperblock load_superblock(Store& store) {
     throw Error(Errc::corrupt, "the store is smaller than the filesystem on it (truncated?)");
   }
   bool read_only = (chosen.sb.features_ro_compat & ~kKnownRoCompatFeatures) != 0;
-  return {chosen.sb, newest, read_only};
+  LoadedSuperblock loaded{chosen.sb, newest, read_only, std::nullopt};
+  const DecodedSuperblock& other = slots[1 - newest];
+  if (other.state == DecodedSuperblock::State::valid && other.sb.generation < chosen.sb.generation &&
+      other.sb.uuid == chosen.sb.uuid && other.sb.store_size <= store.size()) {
+    loaded.older = other.sb;
+  }
+  return loaded;
 }
 
 void write_superblock(Store& store, Superblock& sb) {

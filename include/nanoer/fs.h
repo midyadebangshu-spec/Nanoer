@@ -7,6 +7,7 @@
 // the behaviour and KNOWLEDGE.md for the reasoning.
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <memory>
@@ -98,6 +99,11 @@ struct FsInfo {
   std::uint64_t cache_hits = 0;
   std::uint64_t cache_misses = 0;
   bool read_only = false;
+  bool errors_flag = false;          // the superblock says damage was seen before
+  bool errors_seen = false;          // damage seen since mounting
+  std::uint64_t read_errors = 0;     // reads that met damaged data
+  bool log_damaged = false;          // replay found damage (mounted read-only)
+  bool checkpoint_fallback = false;  // the newest checkpoint was damaged; mounted from the previous
 };
 
 class Filesystem {
@@ -216,6 +222,10 @@ class Filesystem {
   std::uint64_t pending_bytes_ = 0;         // their (approximate) encoded size
   std::unordered_set<InodeId> dirty_inodes_;  // attributes to write at the next commit
   bool failed_ = false;  // a write to the store failed; refuse further changes
+  std::atomic<bool> errors_seen_{false};  // damage seen: set the superblock's errors flag
+  std::atomic<std::uint64_t> read_errors_{0};
+  LogDamage damage_;
+  bool checkpoint_fallback_ = false;
   bool in_checkpoint_ = false;
   std::int64_t last_commit_ns_ = 0;
   std::int64_t last_checkpoint_ns_ = 0;

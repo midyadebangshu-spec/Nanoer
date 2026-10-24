@@ -64,17 +64,64 @@ Filesystem::Filesystem(Store& store, const Superblock& sb, ReplayResult replayed
 std::unique_ptr<Filesystem> Filesystem::mount(Store& store, const Options& options) {
   LoadedSuperblock loaded = load_superblock(store);
   bool read_only = options.read_only || loaded.read_only;
-  ReplayResult replayed = replay(store, loaded.sb);
-  LogPosition end = replayed.end;
-  LogPosition checkpoint = replayed.checkpoint;
-  std::uint64_t next_seq = std::max(loaded.sb.next_segment_seq, replayed.max_seq + 1);
-  std::unique_ptr<Filesystem> fs(
-      new Filesystem(store, loaded.sb, std::move(replayed), options, read_only));
+  Superblock sb = loaded.sb;
+  bool fell_back = false;
+  std::optional<ReplayResult> replayed;
+  bool contradiction = false;
+  // A transaction that cannot be applied is damage too: use the state
+  // before it, read-only.
+  auto careful = [&](const Superblock& from) {
+    try {
+      return replay(store, from);
+    } catch (const ReplayError& e) {
+      std::fprintf(stderr, "nanoer: the log contradicts itself (%s)\n", e.what());
+      contradiction = true;
+      return replay(store, from, e.txid());
+    }
+  };
+  try {
+    replayed = careful(sb);
+  } catch (const CheckpointError& e) {
+    // The previous checkpoint and the log after it are still on disk (they
+    // are kept until the next checkpoint), so replay from there.
+    if (!loaded.older) throw;
+    std::fprintf(stderr, "nanoer: the latest checkpoint is damaged (%s); using the previous one\n",
+                 e.what());
+    sb = *loaded.older;
+    replayed = careful(sb);
+    fell_back = true;
+  }
+  LogDamage damage = replayed->damage;
+  if (contradiction) damage = {true, replayed->end.offset, replayed->meta.last_txid + 1};
+  if (sb.state & state_flags::errors) {
+    std::fprintf(stderr, "nanoer: damage was found on this filesystem before; run nanoer fsck\n");
+  }
+  if (damage.found) {
+    std::fprintf(stderr,
+                 "nanoer: the log is damaged at byte %llu: changes after transaction %llu (up to at "
+                 "least %llu) cannot be read. Mounting read-only; run nanoer fsck.\n",
+                 static_cast<unsigned long long>(damage.offset),
+                 static_cast<unsigned long long>(replayed->meta.last_txid),
+                 static_cast<unsigned long long>(damage.durable_claim));
+    read_only = true;
+  }
+  LogPosition end = replayed->end;
+  LogPosition checkpoint = replayed->checkpoint;
+  std::uint64_t next_seq = std::max(sb.next_segment_seq, replayed->max_seq + 1);
+  std::unique_ptr<Filesystem> fs(new Filesystem(store, sb, std::move(*replayed), options, read_only));
+  fs->damage_ = damage;
+  fs->checkpoint_fallback_ = fell_back;
+  if (fell_back || damage.found) fs->errors_seen_ = true;
 
   if (!fs->read_only_) {
     std::unique_lock lock(fs->mutex_);
     fs->journal_ = std::make_unique<Journal>(store, fs->sb_, fs->meta_, next_seq);
-    fs->journal_->release_after_mount(checkpoint, end.index);
+    // Segments the mounted checkpoint no longer needs are kept until the
+    // next checkpoint, so the previous checkpoint stays usable if this one
+    // is damaged later. Only a filesystem too full to write frees them now.
+    if (fs->journal_->free_segments() <= kMinReserveSegments) {
+      fs->journal_->release_after_mount(checkpoint, end.index);
+    }
     if (fs->journal_->free_segments() == 0) {
       // Continuing the log needs one free segment. Rather than refuse to
       // mount a completely full filesystem, offer its data read-only.
@@ -83,6 +130,14 @@ std::unique_ptr<Filesystem> Filesystem::mount(Store& store, const Options& optio
       fs->read_only_ = true;
     }
   }
+  // A mount that fails part-way must not try to finish an unmount (that
+  // would write a checkpoint on top of whatever went wrong).
+  struct AbandonOnError {
+    Filesystem* fs;
+    ~AbandonOnError() {
+      if (fs) fs->unmounted_ = true;
+    }
+  } guard{fs.get()};
   if (!fs->read_only_) {
     std::unique_lock lock(fs->mutex_);
     fs->journal_->resume(end);
@@ -96,6 +151,7 @@ std::unique_ptr<Filesystem> Filesystem::mount(Store& store, const Options& optio
     fs->commit();
   }
   if (options.start_threads) fs->start();
+  guard.fs = nullptr;
   return fs;
 }
 
@@ -131,6 +187,9 @@ void Filesystem::background() {
       if (now() - last_commit_ns_ >= std::int64_t{options_.commit_interval_s} * 1'000'000'000) {
         commit();
       }
+      // Damage was seen: record it in the superblock soon, so the next
+      // mount and fsck know.
+      if (errors_seen_ && !(sb_.state & state_flags::errors)) checkpoint();
       maybe_checkpoint();
     } catch (const std::exception& e) {
       log_error("background commit failed", e);
@@ -454,6 +513,7 @@ void Filesystem::checkpoint() {
     sb_.checkpoint_offset = at.offset;
     sb_.checkpoint_seq = at.seq;
     sb_.next_segment_seq = journal_->next_seq();
+    if (errors_seen_) sb_.state |= state_flags::errors;
     write_superblock(store_, sb_);
     journal_->checkpoint_done(at);
     // Keep room for the next checkpoint (it grows with the metadata).
@@ -802,7 +862,19 @@ std::size_t Filesystem::read(InodeId ino, std::uint64_t offset, MutableByteView 
     }
     if (!source) {
       if (auto c = file.chunks.find(index); c != file.chunks.end()) {
-        stored = read_chunk(c->second);
+        try {
+          stored = read_chunk(c->second);
+        } catch (const Error& e) {
+          if (e.code() != Errc::corrupt) throw;
+          // Report exactly what is lost; never return damaged data.
+          ++read_errors_;
+          errors_seen_ = true;
+          std::fprintf(stderr, "nanoer: damaged data in inode %llu, bytes %llu-%llu: %s\n",
+                       static_cast<unsigned long long>(ino),
+                       static_cast<unsigned long long>(index * cs),
+                       static_cast<unsigned long long>(index * cs + c->second.size - 1), e.what());
+          throw;
+        }
         source = stored.get();
       }
     }
@@ -1009,6 +1081,11 @@ FsInfo Filesystem::info() {
   info.cache_hits = cache_.hits();
   info.cache_misses = cache_.misses();
   info.read_only = read_only_;
+  info.errors_flag = (sb_.state & state_flags::errors) != 0;
+  info.errors_seen = errors_seen_;
+  info.read_errors = read_errors_;
+  info.log_damaged = damage_.found;
+  info.checkpoint_fallback = checkpoint_fallback_;
   return info;
 }
 

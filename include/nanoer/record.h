@@ -62,6 +62,11 @@ Bytes encode_record(RecordType type, std::uint8_t flags, std::uint64_t seq, Byte
 std::optional<Record> try_read_record(Store& store, std::uint64_t offset, std::uint64_t limit,
                                       std::uint64_t seq);
 
+// Like try_read_record, but checks only the header (its CRC covers the
+// type-specific fields); the payload is neither read nor verified.
+std::optional<Record> try_read_record_header(Store& store, std::uint64_t offset,
+                                             std::uint64_t limit, std::uint64_t seq);
+
 // Like try_read_record, for a location the metadata points to: a missing or
 // damaged record there is corruption, so it throws Error(corrupt).
 Record read_record(Store& store, std::uint64_t offset, std::uint64_t limit, std::uint64_t seq);

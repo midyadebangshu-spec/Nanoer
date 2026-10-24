@@ -4,7 +4,7 @@ if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   message(FATAL_ERROR "Fuzzers need Clang (use the fuzz preset)")
 endif()
 
-foreach(target fuzz_decompress fuzz_roundtrip fuzz_parse)
+foreach(target fuzz_decompress fuzz_roundtrip fuzz_parse fuzz_image)
   add_executable(${target} ${target}.cpp)
   target_compile_options(${target} PRIVATE -fsanitize=fuzzer)
   target_link_options(${target} PRIVATE -fsanitize=fuzzer)

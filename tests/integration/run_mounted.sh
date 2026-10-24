@@ -3,10 +3,14 @@
 #
 #   run_mounted.sh BIN_DIR MODE [ARGS...]
 #
-# BIN_DIR holds mkfs.nanoer, nanoerfs and nanoer-fsx. MODE is one of
+# BIN_DIR holds mkfs.nanoer, nanoerfs, nanoer and nanoer-fsx. MODE is one of
 #   posix TEST_BINARY   run the POSIX suite on the mount
 #   fsx                 run nanoer-fsx, then check the file survives a remount
 #   persist             copy a directory tree in, remount, compare
+#   kill                kill -9 nanoerfs while a writer fsyncs (and fsx, an
+#                       untar and a build run), KILL_ROUNDS times; after
+#                       each, fsck must find it clean and every fsynced file
+#                       must be intact
 #   command CMD...      run any command with NANOER_TEST_DIR set
 # Exits 77 (skipped) when FUSE is not usable here.
 set -euo pipefail
@@ -86,6 +90,52 @@ case "$MODE" in
     mount_fs
     diff -r --no-dereference "$SRC" "$MNT/tree"
     echo "tree identical after remount"
+    ;;
+  kill)
+    WRITER=$(dirname "$0")/kill_writer.py
+    LOG=$WORK/durable.log
+    : >"$LOG"
+    build() {  # many small compiles and an archive, as a build does
+      mkdir -p "$1"
+      for i in $(seq 1000); do
+        printf 'int f%d(int x) { return x * %d; }\n' "$i" "$i" >"$1/f$i.c"
+        cc -c -o "$1/f$i.o" "$1/f$i.c" && ar rcs "$1/lib.a" "$1/f$i.o"
+      done
+    }
+    for round in $(seq "${KILL_ROUNDS:-5}"); do
+      python3 "$WRITER" write "$MNT" "$LOG" "$round" &
+      writer=$!
+      # Load nobody checks, except fsck: more kinds of operation in flight.
+      load=()
+      # (In a subshell: its mmap dies with SIGBUS when the mount goes away,
+      # and the shell would report that.)
+      ("$BIN/nanoer-fsx" -N 100000000 -S "$round" "$MNT/load-$round.fsx"; true) >/dev/null 2>&1 &
+      load+=($!)
+      (mkdir -p "$MNT/load-$round" && tar -C /usr -cf - include | tar -C "$MNT/load-$round" -xf -) \
+        >/dev/null 2>&1 &
+      load+=($!)
+      build "$MNT/load-$round/build" >/dev/null 2>&1 &
+      load+=($!)
+      # A random moment: between commits, mid-write, mid-checkpoint.
+      sleep "$(awk -v r="$RANDOM" 'BEGIN { printf "%.2f", 1 + r % 300 / 100 }')"
+      kill -9 "$PID"
+      wait "$PID" 2>/dev/null || true
+      PID=
+      fusermount3 -u -z "$MNT" 2>/dev/null || umount -l "$MNT" 2>/dev/null || true
+      wait "$writer" || true
+      kill "${load[@]}" 2>/dev/null || true
+      wait "${load[@]}" 2>/dev/null || true
+      if ! "$BIN/nanoer" fsck --deep "$IMG"; then
+        echo "round $round: fsck found errors after kill -9"
+        exit 1
+      fi
+      mount_fs
+      python3 "$WRITER" check "$MNT" "$LOG"
+      # The filesystem must be writable again, not read-only.
+      echo "round $round" >"$MNT/after-$round"
+      rm -rf "$MNT"/load-*
+      echo "round $round: recovered, $(grep -c '^file' "$LOG") files written so far"
+    done
     ;;
   command)
     NANOER_TEST_DIR=$MNT "$@"

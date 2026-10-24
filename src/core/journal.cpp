@@ -1,6 +1,7 @@
 #include "nanoer/journal.h"
 
 #include <algorithm>
+#include <set>
 
 #include "nanoer/checksum.h"
 #include "nanoer/encoding.h"
@@ -34,6 +35,8 @@ void Journal::resume(const LogPosition& end) {
   writer_.emplace(SegmentWriter::resume(store_, sb_, end.index, end.seq, end.offset));
   roll_over(true);
   flush();
+  // Everything replayed is on disk and now part of the sealed log.
+  appended_txid_ = durable_txid_ = meta_.last_txid;
 }
 
 std::uint64_t Journal::free_segments() const {
@@ -115,6 +118,10 @@ LogPosition Journal::append_transaction(std::uint64_t txid, const std::vector<Op
   std::uint8_t extra[kTransactionExtraSize] = {};
   store_le(extra, txid);
   store_le(extra + 8, static_cast<std::uint32_t>(ops.size()));
+  // How far back the newest durable transaction is (0: unknown).
+  std::uint64_t back = txid > durable_txid_ ? txid - durable_txid_ : 0;
+  store_le(extra + 12, static_cast<std::uint32_t>(back <= UINT32_MAX ? back : 0));
+  appended_txid_ = txid;
   // Transactions may use the reserve: they are small, and refusing one after
   // its changes are already live in memory would be worse.
   return append_record(RecordType::metadata_log, 0, ByteView(extra), out.buffer(), true);
@@ -153,7 +160,10 @@ LogPosition Journal::append_checkpoint(const Metadata& meta) {
 
 void Journal::write_buffered() { writer_->write_buffered(); }
 
-void Journal::flush() { writer_->flush(); }
+void Journal::flush() {
+  writer_->flush();
+  durable_txid_ = appended_txid_;
+}
 
 void Journal::checkpoint_done(const LogPosition& start) {
   pending_free_.clear();
@@ -191,7 +201,7 @@ class LogReader {
       : store_(store), sb_(sb), pos_(start) {
     scanner_.emplace(store, sb, start.index, start.offset);
     if (!scanner_->valid() || scanner_->header().seq != start.seq) {
-      corrupt("the segment holding the checkpoint is missing");
+      throw CheckpointError("log: the segment holding the checkpoint is missing");
     }
     visited_.push_back({start.index, start.seq});
   }
@@ -217,6 +227,7 @@ class LogReader {
         // The seal reached the disk but the next segment's header did not:
         // the log ends here, at the seal.
         pos_.offset = r->offset;
+        if (index < sb_.segment_count) dangling_seal_ = LogPosition{index, seq, 0};
         return std::nullopt;
       }
       scanner_.emplace(store_, sb_, index);
@@ -226,6 +237,9 @@ class LogReader {
   }
 
   const LogPosition& position() const { return pos_; }
+  // When the log ended at a seal whose target segment is not intact: where
+  // the seal pointed.
+  const std::optional<LogPosition>& dangling_seal() const { return dangling_seal_; }
   const std::vector<std::pair<std::uint64_t, std::uint64_t>>& visited() const { return visited_; }
   std::uint64_t bytes() const { return bytes_; }
 
@@ -236,7 +250,55 @@ class LogReader {
   std::optional<SegmentScanner> scanner_;
   std::vector<std::pair<std::uint64_t, std::uint64_t>> visited_;
   std::uint64_t bytes_ = 0;
+  std::optional<LogPosition> dangling_seal_;
 };
+
+// The newest transaction that `record` says was durable when it was written.
+std::uint64_t durable_claim(const Record& r) {
+  if (r.header.type == RecordType::metadata_log && r.extra.size() == kTransactionExtraSize) {
+    std::uint64_t txid = load_le<std::uint64_t>(r.extra.data());
+    std::uint32_t back = load_le<std::uint32_t>(r.extra.data() + 12);
+    return back && back <= txid ? txid - back : 0;
+  }
+  if (r.header.type == RecordType::checkpoint && r.extra.size() == kCheckpointExtraSize) {
+    // Checkpoints are written only after the transactions they include are durable.
+    return load_le<std::uint64_t>(r.extra.data());
+  }
+  return 0;
+}
+
+// Looks for intact records of segment (`index`, `seq`) from `from` on, at
+// every 8-byte boundary, and returns the newest durable transaction any of
+// them claims. Follows seals into later segments, scanning those too, even
+// if their headers are damaged. `skip_first`: the record at `from` is known
+// to be broken.
+std::uint64_t claims_after(Store& store, const Superblock& sb, std::uint64_t index,
+                           std::uint64_t seq, std::uint64_t from, bool skip_first,
+                           std::set<std::uint64_t>& seen) {
+  if (index >= sb.segment_count || !seen.insert(index).second) return 0;
+  std::uint64_t end = sb.segment_offset(index) + sb.segment_size();
+  if (from >= end) return 0;
+  Bytes buf = store.read(from, static_cast<std::size_t>(end - from));
+  MemStore rest(buf);  // records are parsed from this copy, at offsets relative to `from`
+  std::uint64_t claim = 0;
+  for (std::uint64_t pos = skip_first ? kRecordAlignment : 0; pos + kRecordHeaderSize <= buf.size();
+       pos += kRecordAlignment) {
+    if (load_le<std::uint32_t>(buf.data() + pos) != kRecordMagic) continue;  // cheap filter
+    std::optional<Record> r = try_read_record(rest, pos, buf.size(), seq);
+    if (!r) continue;
+    claim = std::max(claim, durable_claim(*r));
+    if (r->header.type == RecordType::segment_seal && r->extra.size() == kSealExtraSize) {
+      std::uint64_t next = load_le<std::uint64_t>(r->extra.data());
+      std::uint64_t next_seq = load_le<std::uint64_t>(r->extra.data() + 8);
+      claim = std::max(claim, claims_after(store, sb, next, next_seq,
+                                           sb.segment_offset(std::min(next, sb.segment_count - 1)) +
+                                               kSegmentHeaderSize,
+                                           false, seen));
+    }
+    pos += r->stored_size() - kRecordAlignment;
+  }
+  return claim;
+}
 
 void add_visited(Metadata& meta, const LogReader& reader) {
   for (const auto& [index, seq] : reader.visited()) {
@@ -254,7 +316,7 @@ void add_visited(Metadata& meta, const LogReader& reader) {
 
 }  // namespace
 
-ReplayResult replay(Store& store, const Superblock& sb) {
+ReplayResult replay(Store& store, const Superblock& sb, std::uint64_t stop_before_txid) {
   if (sb.checkpoint_offset == 0) {
     corrupt("no checkpoint (the filesystem was made by an older mkfs.nanoer)");
   }
@@ -275,31 +337,39 @@ ReplayResult replay(Store& store, const Superblock& sb) {
   for (std::uint32_t part = 0;; ++part) {
     std::optional<Record> r = reader.next();
     if (!r || r->header.type != RecordType::checkpoint || r->extra.size() != kCheckpointExtraSize) {
-      corrupt("checkpoint is incomplete");
+      throw CheckpointError("log: checkpoint is incomplete");
     }
     const std::uint8_t* e = r->extra.data();
-    if (load_le<std::uint32_t>(e + 8) != part) corrupt("checkpoint parts out of order");
+    if (load_le<std::uint32_t>(e + 8) != part) throw CheckpointError("log: checkpoint parts out of order");
     if (part == 0) {
       txid = load_le<std::uint64_t>(e);
       total = load_le<std::uint64_t>(e + 16);
       hash = load_le<std::uint64_t>(e + 24);
     } else if (load_le<std::uint64_t>(e) != txid || load_le<std::uint64_t>(e + 16) != total ||
                load_le<std::uint64_t>(e + 24) != hash) {
-      corrupt("checkpoint parts do not belong together");
+      throw CheckpointError("log: checkpoint parts do not belong together");
     }
     stream.insert(stream.end(), r->payload.begin(), r->payload.end());
-    if (stream.size() > total) corrupt("checkpoint longer than recorded");
+    if (stream.size() > total) throw CheckpointError("log: checkpoint longer than recorded");
     if (load_le<std::uint32_t>(e + 12) & checkpoint_flags::final_part) break;
   }
-  if (stream.size() != total || xxh3_64(stream) != hash) corrupt("checkpoint checksum mismatch");
+  if (stream.size() != total || xxh3_64(stream) != hash) {
+    throw CheckpointError("log: checkpoint checksum mismatch");
+  }
 
-  ReplayResult result{Metadata::decode_checkpoint(stream, sb.data_start, sb.segment_shift),
-                      start, {}, max_seq, 0, 0, stream.size()};
+  std::optional<Metadata> snapshot;
+  try {
+    snapshot = Metadata::decode_checkpoint(stream, sb.data_start, sb.segment_shift);
+  } catch (const Error& e) {
+    throw CheckpointError(std::string("log: checkpoint cannot be decoded: ") + e.what());
+  }
+  ReplayResult result{std::move(*snapshot), start, {}, max_seq, 0, 0, stream.size(), {}};
   Metadata& meta = result.meta;
-  if (meta.last_txid != txid) corrupt("checkpoint transaction id mismatch");
+  if (meta.last_txid != txid) throw CheckpointError("log: checkpoint transaction id mismatch");
   std::uint64_t checkpoint_log_bytes = reader.bytes();
 
   // The transactions after it.
+  std::optional<LogPosition> stopped;
   while (std::optional<Record> r = reader.next()) {
     switch (r->header.type) {
       case RecordType::data_chunk:
@@ -311,10 +381,18 @@ ReplayResult replay(Store& store, const Superblock& sb) {
         std::uint64_t id = load_le<std::uint64_t>(r->extra.data());
         std::uint32_t count = load_le<std::uint32_t>(r->extra.data() + 8);
         if (id != meta.last_txid + 1) corrupt("transaction ids are not consecutive");
+        if (id >= stop_before_txid) {
+          stopped = LogPosition{reader.position().index, reader.position().seq, r->offset};
+          break;
+        }
         add_visited(meta, reader);  // before applying: chunks may live in new segments
-        Decoder in(r->payload);
-        for (std::uint32_t i = 0; i < count; ++i) meta.apply(decode_op(in));
-        if (!in.done()) corrupt("trailing bytes in a transaction");
+        try {
+          Decoder in(r->payload);
+          for (std::uint32_t i = 0; i < count; ++i) meta.apply(decode_op(in));
+          if (!in.done()) corrupt("trailing bytes in a transaction");
+        } catch (const Error& e) {
+          throw ReplayError(id, "transaction " + std::to_string(id) + ": " + e.what());
+        }
         meta.last_txid = id;
         ++result.transactions;
         break;
@@ -322,10 +400,25 @@ ReplayResult replay(Store& store, const Superblock& sb) {
       default:
         corrupt("unknown record type " + std::to_string(static_cast<int>(r->header.type)));
     }
+    if (stopped) break;
   }
   add_visited(meta, reader);
-  result.end = reader.position();
+  result.end = stopped ? *stopped : reader.position();
   result.log_bytes = reader.bytes() - checkpoint_log_bytes;
+
+  // A crash can only cut the log short where writes had not been flushed,
+  // and nothing after an unflushed write can claim a later transaction was
+  // durable. So an intact record after the end that does claim that means
+  // the log was damaged where replay stopped.
+  std::set<std::uint64_t> seen;
+  std::uint64_t claim = claims_after(store, sb, result.end.index, result.end.seq, result.end.offset,
+                                     true, seen);
+  if (const auto& seal = reader.dangling_seal()) {
+    claim = std::max(claim, claims_after(store, sb, seal->index, seal->seq,
+                                         sb.segment_offset(seal->index) + kSegmentHeaderSize, false,
+                                         seen));
+  }
+  if (claim > meta.last_txid) result.damage = {true, result.end.offset, claim};
   return result;
 }
 
