@@ -2,6 +2,7 @@
 // and to a deliberately simple in-memory model of what POSIX says should
 // happen. The two are compared regularly, and after every remount and
 // simulated power cut (where the model rolls back to the last sync).
+#include <algorithm>
 #include <map>
 #include <random>
 #include <set>

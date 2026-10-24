@@ -789,6 +789,14 @@ table fallback that processes 8 bytes per step.
   name (`Seeds/FsModel...`), so it was believed to pass before it had ever
   run. Check that a test actually ran (ctest's count, or `--gtest_list_tests`)
   before relying on its result.
+- **Lesson:** headers include each other differently between standard
+  library versions. Code that used `std::min({...})` without `<algorithm>`
+  built against libstdc++ 13 but not against the CI runners' libstdc++ 14.
+  Include what you use; the development environment now also has
+  libstdc++ 14 installed, so Clang builds there match CI.
+- **Lesson:** a test that copies a tree and compares it must use a tree
+  nothing else is writing to. Copying the source tree failed spuriously
+  while a build was running inside it.
 - **Benchmarks** compared with ext4 (no compression) and Btrfs + zstd: space
   used, throughput, latency, CPU time.
 

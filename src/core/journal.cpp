@@ -1,5 +1,7 @@
 #include "nanoer/journal.h"
 
+#include <algorithm>
+
 #include "nanoer/checksum.h"
 #include "nanoer/encoding.h"
 #include "nanoer/error.h"

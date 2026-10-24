@@ -1,5 +1,6 @@
 #include "nanoer/journal.h"
 
+#include <algorithm>
 #include <memory>
 #include <random>
 #include <set>

@@ -1,5 +1,6 @@
 #include "nanoer/checksum.h"
 
+#include <algorithm>
 #include <random>
 #include <string>
 
