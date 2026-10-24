@@ -1087,6 +1087,50 @@ Release build, 4-core VM.
 Crash exploration is dominated by system time (building and mounting
 images in memory), so it parallelises poorly; nightly CI runs it whole.
 
+### 2026-10-24: what M4's techniques could save on `/usr` (before M4)
+
+All regular files under `/usr` on the development VM (Ubuntu 24.04 with
+build tools): 77,273 files, 4,549 MiB. A standalone program modelled
+Nanoer's storage: each file cut into file-aligned 128 KiB chunks, all-zero
+chunks as holes, zstd level 1, stored raw when not smaller, 64 bytes of
+record header (with BLAKE3), 8-byte alignment.
+
+| | Stored | Of logical |
+|---|---:|---:|
+| ext4 (4 KiB blocks) | 4,738 MiB | |
+| Nanoer as in M3 | 1,760 MiB | 38.7 % |
+| + dedup of identical chunks (BLAKE3) | 1,719 MiB | 37.8 % (−2.3 %) |
+
+107,636 chunks (78 holes), 91,028 unique; 124 MiB of logical data is in
+whole-file duplicates.
+
+Small files, stored one by one versus concatenated in walk order into
+packs of 32/64/128 KiB, each pack compressed as one chunk:
+
+| Files up to | Count | Logical | One by one | Packed 32 K | 64 K | 128 K |
+|---:|---:|---:|---:|---:|---:|---:|
+| 2 KiB | 36,454 | 26.4 MiB | 17.2 MiB | 7.6 | 7.3 | 7.1 |
+| 4 KiB | 47,470 | 57.4 MiB | 30.9 MiB | 16.7 | 15.8 | 15.3 |
+| 16 KiB | 64,442 | 198.4 MiB | 82.9 MiB | 62.2 | 58.1 | 55.6 |
+| 32 KiB | 70,188 | 322.9 MiB | 126.5 MiB | 105.9 | 98.1 | 93.6 |
+
+Per core, on 128 KiB chunks of random data: a zstd level 1 attempt
+3,636 MiB/s, an LZ4 attempt 4,651 MiB/s, a byte-entropy estimate on a
+1/16 sample 6,860 MiB/s, BLAKE3 3,821 MiB/s.
+
+**Conclusions** (used in `docs/M4_PLAN.md`):
+- Dedup saves little on an OS tree; it is for copied data (backups, VM
+  images, game assets, project copies). BLAKE3 costs less CPU than
+  compression, so the real cost of dedup is the index's RAM.
+- Packing small files saves 30 % of their storage up to 16 KiB; 64 KiB
+  packs get almost all of 128 KiB packs' gain.
+- Inlining files up to 2 KiB in metadata would take 26.4 MiB, more than
+  the 7.3 MiB they take packed.
+- A pre-check for incompressible data cannot save much: zstd already
+  gives up on random data at 3.6 GB/s per core.
+- `/usr` is already at 38.7 %, well under the 62.5 % that 800 → 500 GB
+  needs.
+
 ### 2026-10-23: media and raw video (Python prototype)
 
 | Input | Result |
