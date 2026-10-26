@@ -2,8 +2,8 @@
 
 **Status: APPROVED 2026-10-24** with the recommended answers to every
 question in §9. **M1, M2 and M3 complete** (2026-10-24); see
-[`M2_PLAN.md`](M2_PLAN.md) and [`M3_PLAN.md`](M3_PLAN.md). The M4 plan is
-[`M4_PLAN.md`](M4_PLAN.md), waiting for approval. Background and reasoning for each technology are in
+[`M2_PLAN.md`](M2_PLAN.md) and [`M3_PLAN.md`](M3_PLAN.md); **M4 complete**
+(2026-10-26), see [`M4_PLAN.md`](M4_PLAN.md). Background and reasoning for each technology are in
 [`KNOWLEDGE.md`](../KNOWLEDGE.md).
 
 ## 1. Goal
@@ -173,7 +173,7 @@ plan come back to you first.
 | **M1** ✅ | Foundation | CMake build, CI, codecs, checksums, I/O backend, superblock, segments, records, `docs/format.md`, `mkfs.nanoer` | unit tests, codec round-trip fuzzing, sanitizers in CI |
 | **M2** ✅ | Working filesystem | metadata (in memory + log + checkpoint), read/write paths, safe-space cache, FUSE adapter: files, directories, symlinks, hard links, permissions, xattrs, rename, truncate, sparse files, mmap, fsync | pjdfstest, fsx, model-based tests, manual mount |
 | **M3** ✅ | Crash safety | strict write ordering, recovery/replay, `nanoer fsck` | power-cut simulation at every write point; corrupted-image fuzzing |
-| **M4** | Space efficiency | GC/compaction, dedup with refcounts, inline and packed small files, incompressibility detection, `nanoer stats` | GC/dedup unit + crash tests; ratio measured on a copy of `/usr` |
+| **M4** ✅ | Space efficiency | GC/compaction, dedup with refcounts, packed small files (inlining measured worse and dropped; incompressibility detection measured not worth it), `nanoer stats` | GC/dedup unit + crash tests; ratio measured on a copy of `/usr` |
 | **M5** | Smart features | hot/cold tiering in GC, per-folder policies, read-ahead, 2Q/ARC if benchmarks need it | tiering tests; sequential-read benchmarks |
 | **M6** | Scale + benchmarks | on-disk CoW B+tree metadata, format migration, full benchmark report against ext4 and Btrfs + zstd | crash + fsx tests again; RAM use at large file counts; benchmark report |
 

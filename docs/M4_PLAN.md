@@ -1,8 +1,28 @@
 # M4 plan: space efficiency (garbage collection, dedup, small files, stats)
 
-**Status: PROPOSED, waiting for approval.** Part of stage 1
-([`STAGE1_PLAN.md`](STAGE1_PLAN.md)). No M4 code is written until this plan
-is approved.
+**Status: COMPLETE (2026-10-26).** Approved 2026-10-26 with the
+recommended answer to every question in §12. Part of stage 1
+([`STAGE1_PLAN.md`](STAGE1_PLAN.md)). How it was built and what it measured:
+[`KNOWLEDGE.md`](../KNOWLEDGE.md) §6, §7.8, §7.12 and §14.
+
+**Changes from this plan while building it:**
+
+- GC's copies are appended under the lock (the log has one writer); only
+  reading and checking the victims' records is done without it (§3).
+- What GC needs to work on a full filesystem, found by the rewrite test:
+  two reserve segments only GC may use, steps no bigger than the room for
+  their copies, and checkpoints only when they free space (§3).
+- The plan's 21 bytes per unique chunk for the dedup index is its best
+  case: kept between 37.5 % and 75 % full, it takes 21–43 (§4.2).
+- The header's owner check skips data with an identity too, not only
+  shared data and packs: an identity means it may be shared (§7).
+- Packs are ordered by directory and name only for files whose directory
+  changed in the commit (new files), otherwise by inode number: a full
+  directory scan at every commit would cost too much (§5).
+- GC repacks only packs in segments it visits: victim choice cannot see
+  dead space inside packs (a known limit, §5).
+- `nanoer stats --codecs` (stored data by codec) works only on an
+  unmounted filesystem: it reads every record header (§6).
 
 ## 1. Goal
 

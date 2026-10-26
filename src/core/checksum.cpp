@@ -118,6 +118,19 @@ bool crc32c_hardware_accelerated() { return kHardware; }
 std::uint64_t xxh3_64(ByteView data) { return XXH3_64bits(data.data(), data.size()); }
 
 Blake3Hash blake3(ByteView data) {
+  // The BLAKE3 library detects the CPU's features on first use, through a
+  // plain global: hash once under a thread-safe static first, so threads
+  // that hash at the same time only ever read it.
+  static const bool cpu_features_known = [] {
+    static std::uint8_t sample[16 << 10];
+    blake3_hasher h;
+    blake3_hasher_init(&h);
+    blake3_hasher_update(&h, sample, sizeof sample);
+    std::uint8_t out[32];
+    blake3_hasher_finalize(&h, out, sizeof out);
+    return true;
+  }();
+  (void)cpu_features_known;
   blake3_hasher hasher;
   blake3_hasher_init(&hasher);
   blake3_hasher_update(&hasher, data.data(), data.size());

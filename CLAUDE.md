@@ -31,14 +31,18 @@ that a system needing 800 GB without Nanoer needs about 500 GB with it.
   decision log.
 - Licence: Apache-2.0. A future kernel module will be Dual MIT/GPL.
 
-Milestones M1 (foundation), M2 (working filesystem) and M3 (crash safety,
-`fsck`) are complete; M4 (garbage collection, dedup) is next, after its plan
-is approved.
+Milestones M1 (foundation), M2 (working filesystem), M3 (crash safety,
+`fsck`) and M4 (garbage collection, dedup, small-file packing, `nanoer
+stats`) are complete; M5 (tiering, policies, read-ahead) is next, after its
+plan is approved.
 
 - `include/nanoer/`: public headers. `src/core/`: the engine (`fs.cpp` is the
   POSIX layer, `journal.cpp` the log, `metadata.cpp` the operations).
   `src/fuse/`: `nanoerfs` (also `mount.nanoer`). `src/tools/`: `mkfs.nanoer`,
   `nanoer` (also `fsck.nanoer`), `nanoer-fsx`. `src/core/check.cpp`: fsck.
+  `src/core/gc.cpp`: garbage collection. `src/core/dedup.cpp`: the dedup
+  index. `src/core/stats.cpp`: `nanoer stats`. Packing is in `fs.cpp`'s
+  commit.
   `tests/unit/`: GoogleTest (`crash_test.cpp` explores every crash point).
   `tests/integration/`: tests on a real FUSE mount, including `kill -9`.
   `fuzz/`: libFuzzer. `.github/workflows/nightly.yml`: the exhaustive runs.

@@ -24,7 +24,10 @@ struct DedupTarget {
 class DedupIndex {
  public:
   // Points `key` at `target`, replacing what it pointed at (the newest
-  // record with a content wins: after GC moves a record, its copy).
+  // record with a content wins: after GC moves a record, its copy). A
+  // target the index cannot hold (an offset from 256 TiB, a piece from
+  // 64 KiB on: possible only in other writers' or damaged images) is left
+  // out: a missed duplicate at worst.
   void put(std::uint64_t key, const DedupTarget& target);
   std::optional<DedupTarget> find(std::uint64_t key) const;
   // Removes `key`, if it still points at `target`.
@@ -43,6 +46,7 @@ class DedupIndex {
     std::uint64_t key = 0;  // 0: empty (no dedup key is 0)
     std::uint64_t value = 0;
   };
+  static bool fits(const DedupTarget& t);
   static std::uint64_t pack(const DedupTarget& t);
   static DedupTarget unpack(std::uint64_t v);
   std::size_t home(std::uint64_t key) const;

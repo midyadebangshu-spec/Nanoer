@@ -69,3 +69,8 @@ jobs:
         run: cmake --preset release -DNANOER_WERROR=ON && cmake --build --preset release
       - name: Kill rounds
         run: sudo KILL_ROUNDS=100 tests/integration/run_mounted.sh build/release/src kill
+      - name: Kill rounds on a small store (garbage collection all the time)
+        run: >-
+          sudo KILL_ROUNDS=50 KILL_LOAD=fsx KILL_LIVE_LIMIT_MB=40
+          NANOER_MKFS_OPTS="--size 160M --segment-size 1M"
+          tests/integration/run_mounted.sh build/release/src kill

@@ -6,10 +6,12 @@ namespace nanoer {
 
 // A target in one word: the record offset (8-byte aligned, below 2^48:
 // 256 TiB), the packed flag in bit 0, the piece offset in the top 16 bits.
+bool DedupIndex::fits(const DedupTarget& t) {
+  return t.offset % 8 == 0 && !(t.offset >> 48) && !(t.piece >> 16) && (t.packed || !t.piece);
+}
+
 std::uint64_t DedupIndex::pack(const DedupTarget& t) {
-  if (t.offset % 8 != 0 || t.offset >> 48 || t.piece >> 16 || (!t.packed && t.piece)) {
-    throw Error(Errc::invalid_argument, "dedup target out of range");
-  }
+  if (!fits(t)) throw Error(Errc::invalid_argument, "dedup target out of range");
   return t.offset | (t.packed ? 1 : 0) | (std::uint64_t{t.piece} << 48);
 }
 
@@ -34,7 +36,7 @@ void DedupIndex::grow() {
 }
 
 void DedupIndex::put(std::uint64_t key, const DedupTarget& target) {
-  if (key == 0) return;
+  if (key == 0 || !fits(target)) return;
   std::uint64_t value = pack(target);
   if ((size_ + 1) * 4 > slots_.size() * 3) grow();
   for (std::size_t i = home(key);; i = (i + 1) & (slots_.size() - 1)) {
@@ -59,7 +61,7 @@ std::optional<DedupTarget> DedupIndex::find(std::uint64_t key) const {
 }
 
 void DedupIndex::erase(std::uint64_t key, const DedupTarget& target) {
-  if (key == 0 || slots_.empty()) return;
+  if (key == 0 || slots_.empty() || !fits(target)) return;
   const std::size_t mask = slots_.size() - 1;
   std::size_t i = home(key);
   while (slots_[i].key != key) {

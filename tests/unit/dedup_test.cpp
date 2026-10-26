@@ -90,6 +90,15 @@ TEST(DedupIndex, MatchesAMapThroughInsertsAndErasures) {
   EXPECT_LE(index.memory_bytes(), 16 * 2 * std::max<std::size_t>(1024, model.size() * 4 / 3) + 16);
 }
 
+TEST(DedupIndex, TargetsItCannotHoldAreLeftOut) {
+  DedupIndex index;
+  index.put(5, {1ull << 50, false, 0});  // beyond 256 TiB
+  index.put(6, {64, true, 70000});       // a piece past 64 KiB
+  EXPECT_EQ(index.size(), 0u);
+  EXPECT_FALSE(index.find(5));
+  index.erase(6, {64, true, 70000});  // and erasing one is harmless
+}
+
 TEST(Dedup, IdenticalFilesAreStoredOnce) {
   auto store = make_store();
   Bytes data = noise(1, 20 * kChunk + 1000);  // the last chunk is partial

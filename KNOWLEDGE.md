@@ -1060,6 +1060,52 @@ table fallback that processes 8 bytes per step.
   unrecoverable. Fixed twice over: mount frees early only when short of
   space, and `fsck --repair` can find the newest readable checkpoint by
   scanning.
+- **In M4** (GC, dedup, packing, stats):
+  - **GC:** victim choice; moving data and freeing segments, also on
+    filesystems made as M3 made them; random rewrites of 10× a small
+    store's size at ≈80 % full without `ENOSPC`; a chunk rewritten, and a
+    segment freed and reused, while GC holds its copies; damaged data left
+    in place; background GC when idle.
+  - **Dedup:** the index against a map through 60,000 random operations;
+    identical files within and across commits; changing, truncating and
+    deleting one copy; the same-commit release case (in both orders); a
+    wrong index entry; dedup off; GC moving shared records.
+  - **Packing:** what is packed and in what order; changing packed files
+    until every pack is released; identical small files sharing a piece;
+    GC repacking.
+  - **Stats:** every figure checked on a known filesystem, and the
+    breakdown adds up exactly.
+  - **Everywhere:** the crash-point exploration got a variant with copies
+    (dedup) and GC; the model test got copies and GC; fsx and `kill -9` run
+    on small stores too (40 MiB and 160 MiB with 1 MiB segments), where GC
+    never stops; `fuzz_image`'s base image has shared records and a pack;
+    `fuzz_parse` decodes checkpoints and operations.
+- **Lesson:** a test that passes without the fix proves nothing. The first
+  version of the same-commit dedup test did, because chunks are committed
+  in hash-map order and it made only the harmless order; breaking the fix
+  on purpose showed it, and the test now makes both orders.
+- **Lesson:** the rewrite test failed three times before GC worked on a
+  full filesystem, each time on a different design gap (no room for GC's
+  copies; steps too big to finish; checkpoints using up the room). A
+  workload that fills the store is worth more than many that do not.
+- **Lesson:** test data needs care. An all-zero "small file" is stored as
+  a hole, text with a short period deduplicates between chunks, and a
+  compressible filler does not fill a segment: each made a test measure
+  something other than intended until its numbers were checked.
+- **Lesson:** building the committed tree with Clang before pushing
+  caught a missing `<algorithm>` (libstdc++ 14 includes less), the same
+  slip that broke CI in M2.
+- **Lesson:** a ThreadSanitizer run that silently did not start (its half
+  of a background job never ran) let a data race through to CI: the
+  vendored BLAKE3 detects CPU features through a plain global on first
+  use, and dedup made several threads hash at once. Fixed by hashing once
+  under a thread-safe static before any concurrent use (the library
+  itself is not edited); removing the fix brings the TSan report back. A
+  check that produced no output has not passed.
+- **Lesson:** CI's parse fuzzer found that a damaged checkpoint with an
+  offset beyond 256 TiB made the dedup index throw `invalid_argument`
+  (only `corrupt` is acceptable from a damaged image). The index is a
+  hint, so such a target is now simply not indexed; the input is a seed.
 - **Benchmarks** compared with ext4 (no compression) and Btrfs + zstd: space
   used, throughput, latency, CPU time.
 
@@ -1207,6 +1253,64 @@ Release build, 4-core VM.
 Crash exploration is dominated by system time (building and mounting
 images in memory), so it parallelises poorly; nightly CI runs it whole.
 
+### 2026-10-26: M4 against M3 on real mounts
+
+Release builds of both (M3: commit `a44188c`), image files on the same
+disk, 4-core VM, the same commands in the same order, page cache warm.
+
+**A copy of `/usr`** (77,273 files, 4.4 GiB):
+
+| | M3 | M4 |
+|---|---:|---:|
+| stored data | 1.7 GiB = 38.7 % of logical | 1.7 GiB = **37.4 %** |
+| image file, allocated | 1,840,116 KiB | **1,785,668 KiB (−3.0 %)** |
+| `cp -a` time | 124.6 s | 116.6 s |
+| `nanoerfs` memory after the copy | 304 MiB | 347 MiB |
+
+`nanoer stats` on M4's copy: holes and zeros 24.4 MiB, dedup 125.7 MiB
+(2.8 % of logical, 2,082 records shared), compression 2.6 GiB, 64,352
+small files in 2,900 packs, 44,278 records; dedup index 90,629 contents in
+2.0 MiB; metadata about 35.6 MiB. The pre-plan model (§14 below)
+predicted 38.7 % for M3, exactly, and about 37.3 % for M4. Most of the
+memory both use is the safe-space cache (256 MiB).
+
+**A duplicate-heavy set**, 218 MiB: `/usr/include` twice, the Python 3.11
+and 3.12 standard libraries, and this repository cloned three times:
+
+| | M3 | M4 |
+|---|---:|---:|
+| stored data | 69.2 MiB = 31.7 % | **47.9 MiB = 22.0 % (−31 %)** |
+| image file, allocated | 75,188 KiB | 53,708 KiB |
+
+**Speed** (the M2 workloads, seconds, median of three runs each; this VM
+is noisy: one M3 compile took 37.9 s, another 15.9 s):
+
+| Workload | M3 | M4 |
+|---|---:|---:|
+| untar 104 MB of headers + Python | 6.84 | 7.44 |
+| copy 512 MB incompressible | 2.13 | 3.34 |
+| copy a 60 s 720p video | 0.23 | 0.19 |
+| `git clone` (local) | 0.62 | 0.75 |
+| `cmake` configure | 1.11 | 1.18 |
+| compile Nanoer (4 jobs) | 19.10 | 21.12 |
+| `git status` | 0.06 | 0.06 |
+| `find` all files | 0.20 | 0.18 |
+| `grep -r`, warm | 0.93 | 0.97 |
+| read 512 MB, cold | 0.58 | 0.62 |
+| decode the video, cold | 2.37 | 2.55 |
+| `grep -r`, cold | 1.75 | 1.65 |
+| `tar` the tree, cold | 1.16 | 1.23 |
+| `rm -rf` everything | 1.54 | 1.57 |
+
+**Conclusions:**
+- On an OS tree M4 saves 3 % (as measured before planning); on data with
+  copies, 31 %. The ratio lever left for stage 1 is M5's recompression of
+  cold data.
+- Speed is unchanged within the noise, except **untar, ≈9 % slower in
+  every round**: each commit now hashes, looks up and packs. The 512 MB
+  copy varied from 2.3 to 5.9 s on M4 and from 2.1 to 6.9 s on M3: no
+  conclusion either way.
+
 ### 2026-10-26: garbage collection under random rewrites
 
 `Gc.RewritesNeverFillTheStore`: a 16 MiB store (15 segments of 1 MiB,
@@ -1348,6 +1452,8 @@ rejected.
 | 2026-10-26 | `nanoer stats` from the metadata (one header read per pack); a mount serves it as the virtual `user.nanoer.stats` on its root; `user.nanoer.*` reserved (setting one: `EPERM`) | no extra channel to the daemon, readable by any user, cheap enough to ask often | an ioctl or control file (FUSE ioctls are awkward, and need tools of their own) |
 | 2026-10-26 | The by-codec breakdown only offline (`nanoer stats --codecs IMAGE`) | it reads every record header: too slow to answer through an extended attribute on a big filesystem | per-chunk codec in the metadata (bytes per chunk, for a figure rarely needed) |
 | 2026-10-26 | `nanoer bench` also estimates dedup (BLAKE3 of file-aligned chunks) and packing (files ≤ 16 KiB in 64 KiB packs, zstd 1) | anyone can see what M4 saves on their own files before using it | a separate tool |
+| 2026-10-26 | BLAKE3's CPU detection done once under a thread-safe static in our wrapper | the vendored library initialises a plain global lazily (a data race when threads hash at once); never edit `third_party` | locking every hash; patching the library |
+| 2026-10-26 | Targets the dedup index cannot hold are left out, not refused | the index is a hint; a damaged or foreign image must not fail on it | rejecting such references as corrupt (they may be valid) |
 | 2026-10-26 | `no_dedup` as a compat feature bit | a preference that an older reader may ignore safely (it does not dedup anyway) | an incompat bit; a separate settings area |
 
 ---
