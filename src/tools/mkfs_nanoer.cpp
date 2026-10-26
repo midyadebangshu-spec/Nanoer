@@ -34,6 +34,8 @@ void usage(std::ostream& out) {
          "      --codec NAME         codec for new data: none, lz4, zstd, lzma (default zstd)\n"
          "  -l, --level N            compression level for new data (default 1)\n"
          "  -L, --label TEXT         filesystem label, up to 63 bytes\n"
+         "      --no-dedup           do not store identical data once (saves the dedup index's\n"
+         "                           memory, about 21 bytes per chunk)\n"
          "  -f, --force              overwrite existing data or an existing filesystem\n"
          "  -h, --help               show this help\n";
 }
@@ -116,6 +118,8 @@ int main(int argc, char** argv) {
       auto v = value();
       if (!v) return fail(kProgram, "--label needs a value");
       options.label = std::string(*v);
+    } else if (a == "--no-dedup") {
+      options.dedup = false;
     } else if (a == "-f" || a == "--force") {
       force = true;
     } else if (!a.empty() && a[0] == '-') {

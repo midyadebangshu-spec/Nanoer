@@ -39,7 +39,11 @@ namespace incompat_features {
 // small files (a pack): SetChunkRef operations, version 2 checkpoints.
 inline constexpr std::uint64_t shared_records = 0x1;
 }  // namespace incompat_features
-inline constexpr std::uint64_t kKnownCompatFeatures = 0;
+namespace compat_features {
+// A preference: do not deduplicate new data (mkfs.nanoer --no-dedup).
+inline constexpr std::uint64_t no_dedup = 0x1;
+}  // namespace compat_features
+inline constexpr std::uint64_t kKnownCompatFeatures = compat_features::no_dedup;
 inline constexpr std::uint64_t kKnownRoCompatFeatures = 0;
 inline constexpr std::uint64_t kKnownIncompatFeatures = incompat_features::shared_records;
 

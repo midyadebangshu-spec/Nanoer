@@ -121,6 +121,7 @@ error (old readers ignore the field), but writers preserve it.
 
 | Kind | Bit | Name | Meaning |
 |---|---:|---|---|
+| compat | 0 | `no_dedup` | a preference: writers do not deduplicate new data (`mkfs.nanoer --no-dedup`) |
 | incompat | 0 | `shared_records` | a data chunk record may have several references (dedup) or hold several small files (a pack); the log may contain SetChunkRef (§8) and checkpoints use version 2 (§9) |
 
 `mkfs` sets `shared_records` on every new filesystem. Without it a
@@ -330,6 +331,8 @@ than one reference:
 - a SetChunk, or a SetChunkRef without `share` or `packed`, refers to a
   record nothing else refers to yet: its space is claimed;
 - a SetChunkRef with `share` adds a reference to a record that has one;
+  a writer adds one only to a record whose `blake3` equals the BLAKE3 of
+  the chunk's data (dedup), and never to a record without `has_blake3`;
 - the first piece of a pack claims the pack's space, later pieces add a
   reference;
 - removing or replacing a chunk drops one reference; the last one
@@ -508,4 +511,4 @@ therefore always has a checkpoint.
 | 1.0 (draft) | initial: geometry, superblock, segments, records, data chunks |
 | 1.0 (draft, M2) | metadata transactions, checkpoints, segment seals, log replay, segment reuse; mkfs writes an initial checkpoint |
 | 1.0 (draft, M3) | transaction `durable_back` (was reserved, so older images read as "unknown"); superblock `state` flags (was reserved); damage detection, contradictory transactions, checkpoint fallback and rescue (§10.2) |
-| 1.0 (draft, M4) | `shared_records` feature: SetChunkRef, shared records and packs, reference counting, checkpoint version 2; data chunk `pack` flag |
+| 1.0 (draft, M4) | `shared_records` feature: SetChunkRef, shared records and packs, reference counting, checkpoint version 2; data chunk `pack` flag; `no_dedup` compat preference; dedup shares only records whose `blake3` matches |

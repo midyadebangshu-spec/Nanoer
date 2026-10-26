@@ -6,6 +6,7 @@ add_executable(nanoer_unit_tests
   unit/check_test.cpp
   unit/checksum_test.cpp
   unit/crash_test.cpp
+  unit/dedup_test.cpp
   unit/damage_test.cpp
   unit/fs_model_test.cpp
   unit/gc_test.cpp

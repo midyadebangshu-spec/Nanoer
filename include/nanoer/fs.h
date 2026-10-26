@@ -95,6 +95,11 @@ struct FsInfo {
   std::uint64_t segments_free = 0;
   std::uint64_t segment_bytes = 0;  // data a segment holds
   GcStats gc;                       // since mounting
+  bool dedup = false;               // new data is deduplicated
+  std::uint64_t dedup_entries = 0;  // contents in the dedup index
+  std::uint64_t dedup_index_bytes = 0;
+  std::uint64_t dedup_hits = 0;     // chunks stored as a reference, since mounting
+  std::uint64_t dedup_bytes = 0;    // their uncompressed size
   std::uint64_t last_txid = 0;
   std::uint64_t replayed_transactions = 0;  // at mount
   std::uint64_t log_bytes_since_checkpoint = 0;
@@ -120,6 +125,7 @@ class Filesystem {
     unsigned checkpoint_interval_s = 300;    // ... or this long, if anything was written
     unsigned threads = 0;                    // compression threads; 0: one per CPU
     unsigned gc_idle_s = 10;                 // background GC after this long without changes
+    bool dedup = true;  // store identical chunks once (needs shared records, and no no_dedup preference)
     bool read_only = false;
     bool count_lookups = true;  // FUSE lookup counting (in-process users turn it off)
     bool start_threads = true;  // false: call start() later (after daemonizing)
@@ -211,6 +217,8 @@ class Filesystem {
   std::uint64_t available_bytes() const;
   void maybe_commit();
   void commit();
+  // A live record with exactly this content, confirmed by its full BLAKE3.
+  std::optional<ChunkRef> find_duplicate(const Blake3Hash& id, std::uint32_t size);
   void maybe_checkpoint();
   void checkpoint();
   void stop_background();
@@ -248,6 +256,7 @@ class Filesystem {
   Superblock sb_;
   Options options_;
   bool read_only_;
+  bool dedup_;
   std::uint64_t replayed_transactions_;
   std::uint64_t checkpoint_bytes_;
 
@@ -275,6 +284,8 @@ class Filesystem {
   bool in_gc_ = false;
   GcStats gc_stats_;
   std::uint64_t gc_emptied_ = 0;  // segments GC emptied since the last checkpoints
+  std::uint64_t dedup_hits_ = 0;
+  std::uint64_t dedup_bytes_ = 0;
   std::set<std::pair<std::uint64_t, std::uint64_t>> gc_skip_;  // segments with damaged data
 
   std::mutex counts_mutex_;  // FUSE lookup and open counts

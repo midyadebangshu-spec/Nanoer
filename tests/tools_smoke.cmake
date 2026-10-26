@@ -71,6 +71,14 @@ endif()
 run(FALSE "${NANOER}" gc --max-full 200 "${IMG}")
 run_rc(0 "${NANOER}" fsck --deep "${IMG}")
 
+# --no-dedup is recorded as a preference.
+run(TRUE "${MKFS}" --size 512M --no-dedup "${WORKDIR}/nodedup.img")
+run(TRUE "${NANOER}" info "${WORKDIR}/nodedup.img")
+string(FIND "${OUTPUT}" "compat no-dedup" pos)
+if(pos EQUAL -1)
+  message(FATAL_ERROR "nanoer info does not show the no-dedup preference:\n${OUTPUT}")
+endif()
+
 # Refuses to overwrite a filesystem without --force, and to clobber an existing file.
 run(FALSE "${MKFS}" "${IMG}")
 run(FALSE "${MKFS}" --size 512M "${IMG}")

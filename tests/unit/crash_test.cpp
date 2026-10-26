@@ -173,9 +173,9 @@ std::string dump(Filesystem& fs) {
 
 // A mix of everything a filesystem does, with a sync after every few steps.
 // Large enough to fill segments many times over in a small store, so seals,
-// checkpoints and segment reuse all happen. With `gc`, garbage collection
-// runs after some syncs (it changes nothing visible). Throws on the first
-// error.
+// checkpoints and segment reuse all happen. With `gc`, files are also
+// copied (so deduplicated), and garbage collection runs after some syncs
+// (it changes nothing visible). Throws on the first error.
 void workload(Filesystem& fs, const std::function<void()>& synced, bool gc = false) {
   std::mt19937_64 rng(42);
   auto pick = [&](std::uint64_t n) { return rng() % n; };
@@ -184,7 +184,7 @@ void workload(Filesystem& fs, const std::function<void()>& synced, bool gc = fal
   for (int step = 0; step < 300; ++step) {
     InodeId parent = pick(3) == 0 ? dir : kRootInode;
     std::string name = names[pick(names.size())];
-    int op = static_cast<int>(pick(10));
+    int op = static_cast<int>(pick(gc ? 11 : 10));
     try {
       if (op < 4) {
         InodeId f;
@@ -213,8 +213,22 @@ void workload(Filesystem& fs, const std::function<void()>& synced, bool gc = fal
         fs.link(fs.lookup(parent, name).ino, parent == dir ? kRootInode : dir, name + "2");
       } else if (op == 8) {
         fs.setxattr(fs.lookup(parent, name).ino, "user.k", as_bytes(std::to_string(step)), 0);
-      } else {
+      } else if (op == 9) {
         fs.symlink(parent, name + "l", "target" + std::to_string(step), {});
+      } else {
+        InodeId from = fs.lookup(parent, name).ino;
+        if (!S_ISREG(fs.getattr(from).mode)) continue;
+        Bytes data(fs.getattr(from).size);
+        fs.read(from, 0, data);
+        std::string to = names[pick(names.size())] + "c";
+        InodeId copy;
+        try {
+          copy = fs.lookup(parent, to).ino;
+        } catch (const Error&) {
+          copy = fs.mknod(parent, to, S_IFREG | 0644, 0, {}).ino;
+        }
+        fs.setattr(copy, {.size = 0});
+        fs.write(copy, 0, data);
       }
     } catch (const Error& e) {
       if (e.code() != Errc::posix || e.sys_errno() == EIO) throw;
@@ -262,7 +276,8 @@ Recording record_workload(bool gc = false) {
   FsInfo info = fs->info();
   if (gc) {
     std::cout << "[ crash ] GC copied " << info.gc.records_copied << " records, emptied "
-              << info.gc.segments_emptied << " segments\n";
+              << info.gc.segments_emptied << " segments; " << info.dedup_hits << " chunks deduplicated\n";
+    EXPECT_GT(info.dedup_hits, 20u) << "the workload must make dedup share data";
     EXPECT_GT(info.gc.records_copied, 100u) << "the workload must make GC move data";
     EXPECT_GE(info.gc.segments_emptied, 1u);
   }

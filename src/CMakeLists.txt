@@ -3,6 +3,7 @@ add_library(nanoer_core STATIC
   core/check.cpp
   core/checksum.cpp
   core/codec.cpp
+  core/dedup.cpp
   core/encoding.cpp
   core/error.cpp
   core/format.cpp

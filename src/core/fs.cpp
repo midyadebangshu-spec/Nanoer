@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 
 #include <fcntl.h>
 #include <linux/falloc.h>
@@ -58,6 +59,7 @@ Filesystem::Filesystem(Store& store, const Superblock& sb, ReplayResult replayed
       sb_(sb),
       options_(options),
       read_only_(read_only),
+      dedup_(options.dedup && has_shared_records(sb) && !(sb.features_compat & compat_features::no_dedup)),
       replayed_transactions_(replayed.transactions),
       checkpoint_bytes_(replayed.checkpoint_bytes),
       meta_(std::move(replayed.meta)),
@@ -474,6 +476,10 @@ void Filesystem::commit() {
       Bytes* data;
       bool hole;
       EncodedChunk encoded;
+      Blake3Hash id{};
+      std::optional<ChunkRef> duplicate;  // of live data
+      std::optional<std::size_t> same_as;  // an earlier job in this commit
+      ChunkRef ref;
     };
     const std::uint64_t cs = sb_.chunk_size();
     std::vector<Job> jobs;
@@ -489,26 +495,68 @@ void Filesystem::commit() {
         jobs.push_back({ino, index, &data, all_zero(data), {}});
       }
     }
-    auto encode = [&](std::size_t i) {
-      Job& job = jobs[i];
-      if (!job.hole) job.encoded = encode_chunk(*job.data, sb_.default_codec, sb_.default_level);
+    auto in_parallel = [&](const std::function<void(std::size_t)>& f) {
+      if (pool_) {
+        pool_->parallel_for(jobs.size(), f);
+      } else {
+        for (std::size_t i = 0; i < jobs.size(); ++i) f(i);
+      }
     };
-    if (pool_) {
-      pool_->parallel_for(jobs.size(), encode);
-    } else {
-      for (std::size_t i = 0; i < jobs.size(); ++i) encode(i);
+    // Dedup: identify every chunk first (BLAKE3 is faster than compressing);
+    // a chunk whose content is already stored, or stored earlier in this
+    // commit, is only referenced.
+    if (dedup_) {
+      in_parallel([&](std::size_t i) {
+        if (!jobs[i].hole) jobs[i].id = blake3(*jobs[i].data);
+      });
+      std::unordered_map<std::uint64_t, std::size_t> first;
+      for (std::size_t i = 0; i < jobs.size(); ++i) {
+        Job& job = jobs[i];
+        if (job.hole) continue;
+        std::uint64_t key = hash_key(job.id.data());
+        if (auto it = first.find(key); it != first.end() && jobs[it->second].id == job.id) {
+          job.same_as = it->second;
+          continue;
+        }
+        job.duplicate = find_duplicate(job.id, static_cast<std::uint32_t>(job.data->size()));
+        if (!job.duplicate) first.emplace(key, i);
+      }
     }
+    in_parallel([&](std::size_t i) {
+      Job& job = jobs[i];
+      if (!job.hole && !job.duplicate && !job.same_as) {
+        job.encoded = encode_chunk(*job.data, sb_.default_codec, sb_.default_level);
+      }
+    });
 
     std::vector<Op> ops = std::move(pending_ops_);
     pending_ops_.clear();
     for (Job& job : jobs) {
       Op op;
+      // An earlier chunk of this commit may have dropped the last reference
+      // to the record a duplicate was found in (it is no longer indexed):
+      // then this chunk is stored after all.
+      if (job.duplicate) {
+        std::optional<DedupTarget> t = meta_.dedup.find(job.duplicate->hash);
+        if (!t || t->offset != job.duplicate->offset) {
+          job.duplicate.reset();
+          job.encoded = encode_chunk(*job.data, sb_.default_codec, sb_.default_level);
+        }
+      }
       if (job.hole) {
         if (!meta_.find(job.ino)->chunks.contains(job.index)) continue;
         op = op::RemoveChunk{job.ino, job.index};  // all zeros: store nothing
+      } else if (job.duplicate || job.same_as) {
+        job.ref = job.duplicate ? *job.duplicate : jobs[*job.same_as].ref;
+        op = op::SetChunkRef{job.ino, job.index, job.ref, !job.ref.packed};
+        ++dedup_hits_;
+        dedup_bytes_ += job.ref.size;
+      } else if (dedup_) {
+        job.ref = journal_->append_chunk(job.encoded, job.ino, job.index * cs, job.id);
+        op = op::SetChunkRef{job.ino, job.index, job.ref, false};
       } else {
-        ChunkRef ref = journal_->append_chunk(job.encoded, job.ino, job.index * cs);
-        op = op::SetChunk{job.ino, job.index, ref};
+        job.ref = journal_->append_chunk(job.encoded, job.ino, job.index * cs);
+        op = op::SetChunk{job.ino, job.index, job.ref};
       }
       meta_.apply(op);
       ops.push_back(std::move(op));
@@ -533,6 +581,28 @@ void Filesystem::commit() {
   pending_bytes_ = 0;
   last_commit_ns_ = now();
   maybe_checkpoint();
+}
+
+std::optional<ChunkRef> Filesystem::find_duplicate(const Blake3Hash& id, std::uint32_t size) {
+  std::uint64_t key = hash_key(id.data());
+  std::optional<DedupTarget> t = meta_.dedup.find(key);
+  if (!t || t->packed) return std::nullopt;
+  std::uint64_t segment = meta_.segment_of(t->offset);
+  auto usage = meta_.segments.find(segment);
+  if (usage == meta_.segments.end()) return std::nullopt;
+  // The key is only a hint: the record's full BLAKE3 decides.
+  std::optional<Record> r = try_read_record_header(
+      store_, t->offset, sb_.segment_offset(segment) + sb_.segment_size(), usage->second.seq);
+  if (!r || r->header.type != RecordType::data_chunk) return std::nullopt;
+  try {
+    DataChunkInfo info = parse_data_chunk(*r);
+    if (info.pack || !info.blake3 || *info.blake3 != id || info.uncompressed_size != size) return std::nullopt;
+  } catch (const Error&) {
+    return std::nullopt;
+  }
+  ChunkRef ref{t->offset, static_cast<std::uint32_t>(r->stored_size()), size};
+  ref.hash = key;
+  return ref;
 }
 
 void Filesystem::maybe_checkpoint() {
@@ -1129,6 +1199,11 @@ FsInfo Filesystem::info() {
   info.checkpoint_fallback = checkpoint_fallback_;
   info.segment_bytes = sb_.segment_size() - kSegmentHeaderSize - kSealRecordSize;
   info.gc = gc_stats_;
+  info.dedup = dedup_ && !read_only_;
+  info.dedup_entries = meta_.dedup.size();
+  info.dedup_index_bytes = meta_.dedup.memory_bytes();
+  info.dedup_hits = dedup_hits_;
+  info.dedup_bytes = dedup_bytes_;
   return info;
 }
 

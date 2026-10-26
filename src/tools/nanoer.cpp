@@ -107,7 +107,8 @@ int cmd_info(const std::vector<std::string_view>& args) {
             << "  chunk size:      " << format_size(sb.chunk_size()) << "\n"
             << "  new data:        " << codec_name(sb.default_codec) << " level "
             << int{sb.default_level} << "\n"
-            << "  features:        compat " << features(sb.features_compat) << ", ro_compat "
+            << "  features:        compat " << features(sb.features_compat, compat_features::no_dedup, "no-dedup")
+            << ", ro_compat "
             << features(sb.features_ro_compat) << ", incompat " << features(sb.features_incompat, incompat_features::shared_records, "shared-records")
             << (loaded.read_only ? " (read-only for this version)" : "") << "\n"
             << "  state:           "

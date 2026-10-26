@@ -307,6 +307,37 @@ chunking for the writable filesystem (writes arrive at arbitrary offsets,
 which makes CDC awkward). FastCDC when building read-only images and during
 cold-data recompaction.
 
+**As built (M4):**
+
+- **At commit,** every dirty chunk's BLAKE3 is computed in parallel
+  *before* compressing, as BLAKE3 (3.8 GB/s per core) is faster than
+  compression. A chunk whose content is indexed, confirmed against the
+  full BLAKE3 in that record's header, or that appeared earlier in the
+  same commit, becomes one more reference ("share", `docs/format.md` §8).
+  Only the rest is compressed and written, with the BLAKE3 in its header.
+- **The index** maps the first 8 bytes of the BLAKE3 to the record:
+  open addressing with linear probing and backward-shift deletion,
+  16 bytes an entry, kept between 37.5 % and 75 % full, so 21–43 bytes per
+  unique chunk. A target fits one word: offsets are 8-aligned (the flag in
+  bit 0) and below 2^48; packs are at most 64 KiB (the piece offset in the
+  top 16 bits). The index is part of the in-memory metadata, kept by
+  `apply()`: replay and checkpoint loading rebuild it with no extra reads.
+  The newest record with a content wins, so GC's copy takes over; an entry
+  goes when its record is released (a pack piece: with any reference to
+  it, as pieces are not counted one by one). It is derived state, so it is
+  not compared when two metadata states are compared.
+- **A subtle case, found in review and then proved by a test:**
+  duplicates are looked up before the commit's operations are applied, so
+  a chunk could be matched to a record that an earlier operation of the
+  same commit releases (one file's chunk rewritten while another file takes
+  its old content). Each match is confirmed again when it is applied: the
+  record must still be indexed, otherwise the chunk is stored after all.
+  Chunks are committed in hash-map order, and the first version of the
+  test made only the harmless order: it passed even without the fix. It
+  now makes both orders, and fails without the fix.
+- **Off switches:** `mkfs.nanoer --no-dedup` (a compat preference bit) and
+  `-o nodedup`. Filesystems without shared records (M3) never dedup.
+
 ---
 
 ## 7. Storage engine design
@@ -1279,6 +1310,9 @@ rejected.
 | 2026-10-26 | GC reads without the lock and checks the victim's sequence number before applying | foreground work does not wait for GC's reads; a reused segment cannot slip through | holding the lock for the whole step |
 | 2026-10-26 | 2 reserve segments only GC may use; GC steps bounded by the room for copies; checkpoints only when they free space | measured: with 1 segment, or unbounded steps, or unconditional checkpoints, a full filesystem still returned `ENOSPC` | letting GC use the whole reserve (the checkpoints that free its victims need it) |
 | 2026-10-26 | Background GC thresholds: idle 10 s and 25 % dead, or under 15 % free | collects when nobody is waiting, or before space gets tight | GC only on demand (every full filesystem would stall on its next write) |
+| 2026-10-26 | Dedup index: open addressing, 16-byte entries packing offset, pack flag and piece offset | ≈21–43 bytes per unique chunk, against ≈50+ for `std::unordered_map` | a node-based map; full 32-byte hashes |
+| 2026-10-26 | Hash before compressing; confirm every hit against the full BLAKE3 in the record, and again when applying it | no CPU spent compressing duplicates; a key collision or a record released earlier in the commit can never share wrong data | trusting the 8-byte key; byte-by-byte comparison (needs the old data read and decompressed) |
+| 2026-10-26 | `no_dedup` as a compat feature bit | a preference that an older reader may ignore safely (it does not dedup anyway) | an incompat bit; a separate settings area |
 
 ---
 

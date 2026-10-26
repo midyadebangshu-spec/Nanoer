@@ -297,9 +297,14 @@ std::uint32_t Metadata::references(const ChunkRef& ref) const {
   return it == shared.end() ? 1 : it->second;
 }
 
+namespace {
+DedupTarget target_of(const ChunkRef& ref) { return {ref.offset, ref.packed, ref.piece}; }
+}  // namespace
+
 // A record's space is claimed by its first reference and released by its
 // last. Only packs and records referenced more than once are counted.
 void Metadata::add_ref(const ChunkRef& ref, bool share) {
+  if (ref.hash) dedup.put(ref.hash, target_of(ref));
   if ((ref.packed || share || ref.hash) && !shared_records_) {
     corrupt("shared records on a filesystem without that feature");
   }
@@ -320,9 +325,14 @@ void Metadata::add_ref(const ChunkRef& ref, bool share) {
 }
 
 void Metadata::drop_ref(const ChunkRef& ref) {
+  // Pieces are not counted one by one: a piece leaves the index with any
+  // reference to it (a missed duplicate at worst); other data with its
+  // record.
+  if (ref.hash && ref.packed) dedup.erase(ref.hash, target_of(ref));
   auto it = shared.find(ref.offset);
   if (it == shared.end()) {
     if (ref.packed) corrupt("a pack piece of an unknown pack");
+    if (ref.hash) dedup.erase(ref.hash, target_of(ref));
     release(ref);
     return;
   }
@@ -512,6 +522,7 @@ Metadata Metadata::decode_checkpoint(ByteView data, std::uint64_t data_start,
       bool share = false;
       ChunkRef ref = v2 ? decode_ref_ex(in, share) : decode_ref(in);
       if (!ref.packed && ref.piece) corrupt("a piece offset outside a pack");
+      if (ref.hash) m.dedup.put(ref.hash, target_of(ref));
       if (ref.packed || share) {
         auto it = counted.try_emplace(ref.offset, Counted{ref, 0}).first;
         if (it->second.ref.stored_size != ref.stored_size || it->second.ref.packed != ref.packed) {

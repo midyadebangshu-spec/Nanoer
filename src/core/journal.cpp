@@ -108,13 +108,17 @@ LogPosition Journal::append_record(RecordType type, std::uint8_t flags, ByteView
   return {writer_->index(), writer_->seq(), at};
 }
 
-ChunkRef Journal::append_chunk(const EncodedChunk& chunk, InodeId ino, std::uint64_t file_offset) {
-  std::uint64_t size = record_size(kDataChunkHeaderSize - kRecordHeaderSize, chunk.payload.size());
+ChunkRef Journal::append_chunk(const EncodedChunk& chunk, InodeId ino, std::uint64_t file_offset,
+                               const std::optional<Blake3Hash>& blake3) {
+  std::size_t header = blake3 ? kDataChunkHeaderSizeWithId : kDataChunkHeaderSize;
+  std::uint64_t size = record_size(header - kRecordHeaderSize, chunk.payload.size());
   ensure_room(size, reserve_);
-  Bytes record = encode_data_chunk_record(writer_->seq(), chunk, ino, file_offset);
+  Bytes record = encode_data_chunk_record(writer_->seq(), chunk, ino, file_offset, blake3);
   std::uint64_t at = *writer_->append(record);
   bytes_since_checkpoint_ += size;
-  return {at, static_cast<std::uint32_t>(size), chunk.uncompressed_size};
+  ChunkRef ref{at, static_cast<std::uint32_t>(size), chunk.uncompressed_size};
+  if (blake3) ref.hash = hash_key(blake3->data());
+  return ref;
 }
 
 std::uint64_t Journal::append_copy(const Record& r, bool urgent) {

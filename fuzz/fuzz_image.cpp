@@ -53,6 +53,11 @@ const Base& base() {
       }
       fs->symlink(d, "link", "../f0", {});
       fs->link(fs->lookup(kRootInode, "f0").ino, d, "hard");
+      // A copy: its chunks are shared with f5's (dedup).
+      InodeId f5 = fs->lookup(d, "f5").ino;
+      Bytes copy(fs->getattr(f5).size);
+      fs->read(f5, 0, copy);
+      fs->write(fs->mknod(kRootInode, "copy", S_IFREG | 0644, 0, {}).ino, 0, copy);
     }  // unmount: checkpoint
     {
       // A little log after the checkpoint, as after a crash.

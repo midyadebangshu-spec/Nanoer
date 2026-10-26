@@ -33,10 +33,11 @@ Bytes data_for(int i, std::size_t n = 40000) {
   return d;
 }
 
-// /a (file), /d (directory) with /d/x and /d/sub/y.
-std::unique_ptr<MemStore> sample() {
+// /a (file), /d (directory) with /d/x and /d/sub/y. Without dedup, data
+// has no identity and belongs to one file.
+std::unique_ptr<MemStore> sample(bool dedup = true) {
   auto store = std::make_unique<MemStore>(32 << 20);
-  make_filesystem(*store, {.segment_shift = 20, .chunk_shift = 14});
+  make_filesystem(*store, {.segment_shift = 20, .chunk_shift = 14, .dedup = dedup});
   auto fs = Filesystem::mount(*store, options());
   InodeId a = fs->mknod(kRootInode, "a", S_IFREG | 0644, 0, {}).ino;
   fs->write(a, 0, data_for(1));
@@ -175,7 +176,7 @@ TEST(Fsck, ChunkPastTheEndOfAFile) {
 }
 
 TEST(Fsck, ChunkBorrowedFromAnotherFile) {
-  auto store = sample();
+  auto store = sample(false);
   inject(*store, [](const Metadata& m) {
     const Inode& a = *m.find(find(m, kRootInode, "a"));
     InodeId x = find(m, find(m, kRootInode, "d"), "x");
@@ -187,13 +188,37 @@ TEST(Fsck, ChunkBorrowedFromAnotherFile) {
 TEST(Fsck, SharingDataWithoutAnIdentity) {
   // Only data with a BLAKE3 identity may be shared (dedup); other data
   // belongs to the file it was written for.
-  auto store = sample();
+  auto store = sample(false);
   inject(*store, [](const Metadata& m) {
     const Inode& a = *m.find(find(m, kRootInode, "a"));
     InodeId x = find(m, find(m, kRootInode, "d"), "x");
     return std::vector<Op>{op::SetChunkRef{x, 0, a.chunks.at(0), true}};
   });
   expect_found_and_repaired(*store, "belongs to another file");
+}
+
+TEST(Fsck, SharedDataIsClean) {
+  // Data with an identity, shared by two files, as dedup does it.
+  auto store = sample();
+  inject(*store, [](const Metadata& m) {
+    const Inode& a = *m.find(find(m, kRootInode, "a"));
+    InodeId x = find(m, find(m, kRootInode, "d"), "x");
+    EXPECT_NE(a.chunks.at(0).hash, 0u);
+    return std::vector<Op>{op::SetChunkRef{x, 0, a.chunks.at(0), true}};
+  });
+  FsckReport report = check(*store, true);
+  EXPECT_EQ(report.exit_code(), 0) << all(report.errors);
+}
+
+TEST(Fsck, WrongDedupKey) {
+  auto store = sample();
+  inject(*store, [](const Metadata& m) {
+    InodeId x = find(m, find(m, kRootInode, "d"), "x");
+    ChunkRef ref = m.find(x)->chunks.at(1);
+    ref.hash ^= 0x100;  // the record's own BLAKE3 says otherwise
+    return std::vector<Op>{op::SetChunkRef{x, 1, ref, true}};
+  });
+  expect_found_and_repaired(*store, "identity does not match");
 }
 
 TEST(Fsck, FilesystemWithoutSharedRecords) {

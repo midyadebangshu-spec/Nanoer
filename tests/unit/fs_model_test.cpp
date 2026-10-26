@@ -75,7 +75,8 @@ class ModelTest {
     for (int step = 0; step < steps; ++step) {
       int choice = pick(100);
       if (choice < 14) create(S_IFREG);
-      else if (choice < 34) write();
+      else if (choice < 30) write();
+      else if (choice < 34) copy();
       else if (choice < 40) truncate();
       else if (choice < 46) create(S_IFDIR);
       else if (choice < 54) unlink();
@@ -172,6 +173,23 @@ class ModelTest {
     Bytes& d = model_.nodes[f].data;
     if (d.size() < off + data.size()) d.resize(off + data.size(), 0);
     std::copy(data.begin(), data.end(), d.begin() + static_cast<std::ptrdiff_t>(off));
+  }
+
+  // A whole file copied over another: chunk-aligned duplicates, so dedup.
+  void copy() {
+    InodeId from = pick_file(), to = pick_file();
+    if (!from || !to || from == to) return;
+    Bytes data = model_.nodes[from].data;
+    if (int err = expect_error([&] { fs_->setattr(to, {.size = 0}); })) {
+      ASSERT_EQ(err, ENOSPC);
+      return;
+    }
+    model_.nodes[to].data.clear();
+    if (int err = expect_error([&] { fs_->write(to, 0, data); })) {
+      ASSERT_EQ(err, ENOSPC);
+      return;
+    }
+    model_.nodes[to].data = data;
   }
 
   void truncate() {

@@ -482,6 +482,7 @@ void usage(std::ostream& out) {
          "  -o safe_space=SIZE   decompressed-chunk cache (default 256M)\n"
          "  -o commit=SECONDS    commit interval (default 5)\n"
          "  -o ro                read-only\n"
+         "  -o nodedup           do not deduplicate new data\n"
          "  -o allow_other       let other users access the mount\n"
          "  -o OPTION            other FUSE or mount options\n"
          "  -f                   stay in the foreground\n"
@@ -540,6 +541,8 @@ int main(int argc, char** argv) {
         auto v = parse_size(opt.substr(7));
         if (!v) return false;
         options.commit_interval_s = static_cast<unsigned>(*v);
+      } else if (opt == "nodedup") {
+        options.dedup = false;
       } else if (opt == "ro") {
         options.read_only = true;
         fuse_options.emplace_back("ro");

@@ -74,7 +74,10 @@ class Journal {
   // fresh segment, so nothing is ever appended after a possibly torn tail.
   void resume(const LogPosition& end);
 
-  ChunkRef append_chunk(const EncodedChunk& chunk, InodeId ino, std::uint64_t file_offset);
+  // With `blake3`, the record carries the data's identity and the returned
+  // reference its dedup key.
+  ChunkRef append_chunk(const EncodedChunk& chunk, InodeId ino, std::uint64_t file_offset,
+                        const std::optional<Blake3Hash>& blake3 = std::nullopt);
   // GC: appends a copy of an intact data chunk record (same header fields
   // and payload, the current segment's sequence number). Returns where.
   // `urgent`: may use one of the reserve segments. Throws Error(no_space)

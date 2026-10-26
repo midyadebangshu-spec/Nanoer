@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "nanoer/bytes.h"
+#include "nanoer/dedup.h"
 
 namespace nanoer {
 
@@ -156,6 +157,9 @@ class Metadata {
   // offset -> number of references. Any other referenced record has one.
   // A record's space is counted once, however many references it has.
   std::unordered_map<std::uint64_t, std::uint32_t> shared;
+  // Live data by content (dedup key -> record), kept by apply() and rebuilt
+  // when a checkpoint is loaded.
+  DedupIndex dedup;
   InodeId next_inode = kRootInode + 1;
   std::uint64_t last_txid = 0;  // the last transaction applied
 
