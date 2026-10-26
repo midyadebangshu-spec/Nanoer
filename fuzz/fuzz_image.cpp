@@ -53,6 +53,12 @@ const Base& base() {
       }
       fs->symlink(d, "link", "../f0", {});
       fs->link(fs->lookup(kRootInode, "f0").ino, d, "hard");
+      // Small files written together: a pack.
+      InodeId small = fs->mkdir(kRootInode, "small", 0755, {}).ino;
+      for (int i = 0; i < 6; ++i) {
+        Bytes data(150 + static_cast<std::size_t>(i) * 300, static_cast<std::uint8_t>('a' + i));
+        fs->write(fs->mknod(small, "s" + std::to_string(i), S_IFREG | 0644, 0, {}).ino, 0, data);
+      }
       // A copy: its chunks are shared with f5's (dedup).
       InodeId f5 = fs->lookup(d, "f5").ino;
       Bytes copy(fs->getattr(f5).size);

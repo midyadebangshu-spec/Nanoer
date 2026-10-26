@@ -334,7 +334,8 @@ than one reference:
   a writer adds one only to a record whose `blake3` equals the BLAKE3 of
   the chunk's data (dedup), and never to a record without `has_blake3`;
 - the first piece of a pack claims the pack's space, later pieces add a
-  reference;
+  reference; pieces of one pack never overlap, and a piece may be
+  referred to by several chunks (dedup of small files);
 - removing or replacing a chunk drops one reference; the last one
   releases the space.
 

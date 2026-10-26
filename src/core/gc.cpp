@@ -86,6 +86,8 @@ Filesystem::GcPlan Filesystem::gc_plan(const GcPolicy& policy, bool urgent) cons
     planned += v.live_bytes;
   }
   if (plan.victims.empty()) return plan;
+  plan.codec = sb_.default_codec;
+  plan.level = sb_.default_level;
   std::map<std::uint64_t, std::uint64_t> seq_of;
   for (const GcVictim& v : plan.victims) seq_of.emplace(v.index, v.seq);
 
@@ -110,11 +112,12 @@ Filesystem::GcPlan Filesystem::gc_plan(const GcPolicy& policy, bool urgent) cons
   return plan;
 }
 
-std::vector<std::optional<Record>> Filesystem::gc_read(const GcPlan& plan) {
-  std::vector<std::optional<Record>> out;
+std::vector<Filesystem::GcRead> Filesystem::gc_read(const GcPlan& plan) {
+  std::vector<GcRead> out;
   out.reserve(plan.items.size());
   for (const GcItem& item : plan.items) {
-    std::optional<Record> r;
+    GcRead read;
+    std::optional<Record>& r = read.record;
     try {
       r = try_read_record(store_, item.offset, item.limit, item.seq);
       // The record must be what the references say it is (its CRCs were
@@ -127,16 +130,34 @@ std::vector<std::optional<Record>> Filesystem::gc_read(const GcPlan& plan) {
                                    : info.uncompressed_size == u.ref.size;
           if (!fits || info.pack != u.ref.packed) r.reset();
         }
+        // A pack mostly dead (its files changed or deleted): keep only the
+        // live pieces, packed again.
+        if (r && info.pack) {
+          std::map<std::uint32_t, std::uint32_t> live;  // piece -> size
+          for (const GcItem::User& u : item.users) live.emplace(u.ref.piece, u.ref.size);
+          std::uint64_t live_bytes = 0;
+          for (const auto& [piece, size] : live) live_bytes += size;
+          if (live_bytes * 2 < info.uncompressed_size) {
+            Bytes old = decode_data_chunk(*r);
+            Bytes fresh;
+            for (const auto& [piece, size] : live) {
+              read.pieces.emplace(piece, static_cast<std::uint32_t>(fresh.size()));
+              fresh.insert(fresh.end(), old.begin() + piece, old.begin() + piece + size);
+            }
+            read.repacked = encode_chunk(fresh, plan.codec, plan.level);
+          }
+        }
       }
     } catch (const Error&) {
       r.reset();  // unreadable: decided under the lock (the segment may have been reused)
+      read.repacked.reset();
     }
-    out.push_back(std::move(r));
+    out.push_back(std::move(read));
   }
   return out;
 }
 
-bool Filesystem::gc_apply(const GcPlan& plan, std::vector<std::optional<Record>>& records, bool urgent) {
+bool Filesystem::gc_apply(const GcPlan& plan, std::vector<GcRead>& reads, bool urgent) {
   if (read_only_ || failed_ || !journal_) return false;
   // A victim freed and reused while its records were read: they are stale.
   for (const GcVictim& v : plan.victims) {
@@ -161,7 +182,7 @@ bool Filesystem::gc_apply(const GcPlan& plan, std::vector<std::optional<Record>>
       if (c != file->chunks.end() && c->second == u.ref) users.push_back(u);
     }
     if (users.empty()) continue;
-    if (!records[i]) {
+    if (!reads[i].record) {
       // Damaged data stays where it is (reads report it); the segment is
       // not collected again this mount.
       ++gc_stats_.damaged;
@@ -173,16 +194,24 @@ bool Filesystem::gc_apply(const GcPlan& plan, std::vector<std::optional<Record>>
                    static_cast<unsigned long long>(users.front().ino));
       continue;
     }
-    std::uint64_t at;
+    ChunkRef copy;
     try {
-      at = journal_->append_copy(*records[i], urgent);
+      if (reads[i].repacked) {
+        copy = journal_->append_repacked(*reads[i].repacked, urgent);
+        ++gc_stats_.packs_repacked;
+      } else {
+        copy.offset = journal_->append_copy(*reads[i].record, urgent);
+        copy.stored_size = item.stored_size;
+      }
     } catch (const Error& e) {
       if (e.code() == Errc::no_space) break;  // nothing was written
       throw;
     }
     for (std::size_t k = 0; k < users.size(); ++k) {
       ChunkRef ref = users[k].ref;
-      ref.offset = at;
+      ref.offset = copy.offset;
+      ref.stored_size = copy.stored_size;
+      if (reads[i].repacked) ref.piece = reads[i].pieces.at(ref.piece);
       if (!ref.packed && !ref.hash) {
         record(op::SetChunk{users[k].ino, users[k].index, ref});
       } else {
@@ -191,7 +220,7 @@ bool Filesystem::gc_apply(const GcPlan& plan, std::vector<std::optional<Record>>
       }
     }
     ++gc_stats_.records_copied;
-    gc_stats_.bytes_copied += item.stored_size;
+    gc_stats_.bytes_copied += copy.stored_size;
     moved = true;
   }
   if (moved) commit();
@@ -209,8 +238,8 @@ bool Filesystem::gc_apply(const GcPlan& plan, std::vector<std::optional<Record>>
 bool Filesystem::gc_step_locked(const GcPolicy& policy, bool urgent) {
   GcPlan plan = gc_plan(policy, urgent);
   if (plan.items.empty()) return false;
-  std::vector<std::optional<Record>> records = gc_read(plan);
-  return gc_apply(plan, records, urgent);
+  std::vector<GcRead> reads = gc_read(plan);
+  return gc_apply(plan, reads, urgent);
 }
 
 void Filesystem::gc_checkpoints(bool low_space) {
@@ -242,9 +271,9 @@ void Filesystem::background_gc() {
       plan = gc_plan(policy, false);
     }
     if (plan.items.empty()) break;
-    std::vector<std::optional<Record>> records = gc_read(plan);
+    std::vector<GcRead> reads = gc_read(plan);
     std::unique_lock lock(mutex_);
-    if (!gc_apply(plan, records, false)) break;
+    if (!gc_apply(plan, reads, false)) break;
   }
   std::unique_lock lock(mutex_);
   gc_checkpoints(need == GcNeed::low_space);

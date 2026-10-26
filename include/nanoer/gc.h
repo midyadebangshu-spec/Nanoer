@@ -38,6 +38,7 @@ struct GcStats {
   std::uint64_t bytes_copied = 0;      // stored bytes
   std::uint64_t segments_emptied = 0;  // left with no live data
   std::uint64_t damaged = 0;           // records that could not be read: left in place
+  std::uint64_t packs_repacked = 0;    // packs mostly dead: their live pieces packed again
 };
 
 }  // namespace nanoer

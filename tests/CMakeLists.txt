@@ -17,6 +17,7 @@ add_executable(nanoer_unit_tests
   unit/journal_test.cpp
   unit/metadata_test.cpp
   unit/mkfs_test.cpp
+  unit/pack_test.cpp
   unit/record_test.cpp
   unit/segment_test.cpp
 )

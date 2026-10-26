@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <tuple>
 
 #include <fcntl.h>
 #include <linux/falloc.h>
@@ -27,6 +28,13 @@ constexpr std::uint64_t kAttrOpBytes = 64;  // rough encoded size of a PutInode
 // Segments normal writes never use: room for a checkpoint (which is what
 // frees space) and for continuing the log at the next mount.
 constexpr std::uint64_t kMinReserveSegments = 3;
+// Small files: files up to this size (and one chunk) written in the same
+// commit are compressed together, in packs of up to kPackSize bytes
+// (docs/M4_PLAN.md §5; measured in KNOWLEDGE.md §14). Pieces start below
+// 64 KiB, which the dedup index relies on.
+constexpr std::uint64_t kPackFileLimit = 16 << 10;
+constexpr std::size_t kPackSize = 64 << 10;
+static_assert(kPackSize <= 65536);
 // And some that only garbage collection may use, so that it can always copy
 // live data out of a victim, and write the checkpoints that free it, even
 // when the filesystem is full.
@@ -345,13 +353,17 @@ std::shared_ptr<const Bytes> Filesystem::read_chunk(const ChunkRef& ref) {
   auto it = meta_.segments.find(segment);
   if (it == meta_.segments.end()) throw Error(Errc::corrupt, "chunk in a free segment");
   ChunkCache::Key key{ref.offset, it->second.seq};
-  if (auto hit = cache_.get(key)) return hit;
-  Record record = read_record(store_, ref.offset, sb_.segment_offset(segment) + sb_.segment_size(),
-                              it->second.seq);
-  auto data = std::make_shared<const Bytes>(decode_data_chunk(record));
-  if (data->size() != ref.size) throw Error(Errc::corrupt, "chunk has the wrong size");
-  cache_.put(key, data);
-  return data;
+  std::shared_ptr<const Bytes> data = cache_.get(key);
+  if (!data) {
+    Record record = read_record(store_, ref.offset, sb_.segment_offset(segment) + sb_.segment_size(),
+                                it->second.seq);
+    data = std::make_shared<const Bytes>(decode_data_chunk(record));
+    if (!ref.packed && data->size() != ref.size) throw Error(Errc::corrupt, "chunk has the wrong size");
+    cache_.put(key, data);  // a pack whole: its pieces are often read together
+  }
+  if (!ref.packed) return data;
+  if (std::uint64_t{ref.piece} + ref.size > data->size()) throw Error(Errc::corrupt, "piece outside its pack");
+  return std::make_shared<const Bytes>(data->begin() + ref.piece, data->begin() + ref.piece + ref.size);
 }
 
 Bytes Filesystem::load_chunk(const Inode& file, std::uint64_t index) {
@@ -479,6 +491,7 @@ void Filesystem::commit() {
       Blake3Hash id{};
       std::optional<ChunkRef> duplicate;  // of live data
       std::optional<std::size_t> same_as;  // an earlier job in this commit
+      bool packed = false;                 // stored as a piece of a pack
       ChunkRef ref;
     };
     const std::uint64_t cs = sb_.chunk_size();
@@ -495,13 +508,14 @@ void Filesystem::commit() {
         jobs.push_back({ino, index, &data, all_zero(data), {}});
       }
     }
-    auto in_parallel = [&](const std::function<void(std::size_t)>& f) {
+    auto parallel = [&](std::size_t n, const std::function<void(std::size_t)>& f) {
       if (pool_) {
-        pool_->parallel_for(jobs.size(), f);
+        pool_->parallel_for(n, f);
       } else {
-        for (std::size_t i = 0; i < jobs.size(); ++i) f(i);
+        for (std::size_t i = 0; i < n; ++i) f(i);
       }
     };
+    auto in_parallel = [&](const std::function<void(std::size_t)>& f) { parallel(jobs.size(), f); };
     // Dedup: identify every chunk first (BLAKE3 is faster than compressing);
     // a chunk whose content is already stored, or stored earlier in this
     // commit, is only referenced.
@@ -518,16 +532,77 @@ void Filesystem::commit() {
           job.same_as = it->second;
           continue;
         }
-        job.duplicate = find_duplicate(job.id, static_cast<std::uint32_t>(job.data->size()));
+        job.duplicate = find_duplicate(job.id, *job.data);
         if (!job.duplicate) first.emplace(key, i);
+      }
+    }
+    // Small files left to store go into packs: together they compress far
+    // better than one by one. In directory and name order where the
+    // directory changed in this commit (new files), else by inode number.
+    struct Pack {
+      std::vector<std::size_t> members;
+      Bytes data;
+      EncodedChunk encoded;
+    };
+    std::vector<Pack> packs;
+    if (has_shared_records(sb_)) {
+      const std::uint64_t limit = std::min(kPackFileLimit, cs);
+      std::vector<std::size_t> small;
+      std::unordered_set<InodeId> small_inodes;
+      for (std::size_t i = 0; i < jobs.size(); ++i) {
+        const Job& job = jobs[i];
+        if (job.hole || job.duplicate || job.same_as || job.index != 0) continue;
+        const Inode* file = meta_.find(job.ino);
+        if (file->size > limit || file->size != job.data->size()) continue;
+        small.push_back(i);
+        small_inodes.insert(job.ino);
+      }
+      if (small.size() >= 2) {
+        std::unordered_map<InodeId, std::pair<InodeId, std::string_view>> where;
+        for (InodeId d : dirty_inodes_) {
+          const Inode* dir = meta_.find(d);
+          if (!dir || !dir->is_dir()) continue;
+          for (const auto& [name, child] : dir->entries) {
+            if (small_inodes.contains(child)) where.try_emplace(child, d, name);
+          }
+        }
+        auto order = [&](std::size_t i) {
+          auto w = where.find(jobs[i].ino);
+          return w == where.end() ? std::make_tuple(1, jobs[i].ino, std::string_view(), jobs[i].ino)
+                                  : std::make_tuple(0, w->second.first, w->second.second, jobs[i].ino);
+        };
+        std::sort(small.begin(), small.end(), [&](std::size_t a, std::size_t b) { return order(a) < order(b); });
+        for (std::size_t i : small) {
+          if (packs.empty() || packs.back().data.size() + jobs[i].data->size() > kPackSize) packs.emplace_back();
+          Pack& p = packs.back();
+          jobs[i].ref.piece = static_cast<std::uint32_t>(p.data.size());
+          p.data.insert(p.data.end(), jobs[i].data->begin(), jobs[i].data->end());
+          p.members.push_back(i);
+        }
+        // A file alone in its pack gains nothing from it.
+        std::erase_if(packs, [](const Pack& p) { return p.members.size() < 2; });
+        for (const Pack& p : packs) {
+          for (std::size_t i : p.members) jobs[i].packed = true;
+        }
       }
     }
     in_parallel([&](std::size_t i) {
       Job& job = jobs[i];
-      if (!job.hole && !job.duplicate && !job.same_as) {
+      if (!job.hole && !job.duplicate && !job.same_as && !job.packed) {
         job.encoded = encode_chunk(*job.data, sb_.default_codec, sb_.default_level);
       }
     });
+    parallel(packs.size(), [&](std::size_t i) {
+      packs[i].encoded = encode_chunk(packs[i].data, sb_.default_codec, sb_.default_level);
+    });
+    for (Pack& p : packs) {
+      ChunkRef pack = journal_->append_chunk(p.encoded, 0, 0, std::nullopt, true);
+      for (std::size_t i : p.members) {
+        Job& job = jobs[i];
+        job.ref = {pack.offset, pack.stored_size, static_cast<std::uint32_t>(job.data->size()), job.ref.piece,
+                   true, dedup_ ? hash_key(job.id.data()) : 0};
+      }
+    }
 
     std::vector<Op> ops = std::move(pending_ops_);
     pending_ops_.clear();
@@ -538,7 +613,7 @@ void Filesystem::commit() {
       // then this chunk is stored after all.
       if (job.duplicate) {
         std::optional<DedupTarget> t = meta_.dedup.find(job.duplicate->hash);
-        if (!t || t->offset != job.duplicate->offset) {
+        if (t != DedupTarget{job.duplicate->offset, job.duplicate->packed, job.duplicate->piece}) {
           job.duplicate.reset();
           job.encoded = encode_chunk(*job.data, sb_.default_codec, sb_.default_level);
         }
@@ -551,6 +626,8 @@ void Filesystem::commit() {
         op = op::SetChunkRef{job.ino, job.index, job.ref, !job.ref.packed};
         ++dedup_hits_;
         dedup_bytes_ += job.ref.size;
+      } else if (job.packed) {
+        op = op::SetChunkRef{job.ino, job.index, job.ref, false};  // the first piece claims the pack
       } else if (dedup_) {
         job.ref = journal_->append_chunk(job.encoded, job.ino, job.index * cs, job.id);
         op = op::SetChunkRef{job.ino, job.index, job.ref, false};
@@ -583,10 +660,11 @@ void Filesystem::commit() {
   maybe_checkpoint();
 }
 
-std::optional<ChunkRef> Filesystem::find_duplicate(const Blake3Hash& id, std::uint32_t size) {
+std::optional<ChunkRef> Filesystem::find_duplicate(const Blake3Hash& id, ByteView data) {
+  const auto size = static_cast<std::uint32_t>(data.size());
   std::uint64_t key = hash_key(id.data());
   std::optional<DedupTarget> t = meta_.dedup.find(key);
-  if (!t || t->packed) return std::nullopt;
+  if (!t) return std::nullopt;
   std::uint64_t segment = meta_.segment_of(t->offset);
   auto usage = meta_.segments.find(segment);
   if (usage == meta_.segments.end()) return std::nullopt;
@@ -594,14 +672,22 @@ std::optional<ChunkRef> Filesystem::find_duplicate(const Blake3Hash& id, std::ui
   std::optional<Record> r = try_read_record_header(
       store_, t->offset, sb_.segment_offset(segment) + sb_.segment_size(), usage->second.seq);
   if (!r || r->header.type != RecordType::data_chunk) return std::nullopt;
+  ChunkRef ref{t->offset, static_cast<std::uint32_t>(r->stored_size()), size, t->piece, t->packed, key};
   try {
     DataChunkInfo info = parse_data_chunk(*r);
-    if (info.pack || !info.blake3 || *info.blake3 != id || info.uncompressed_size != size) return std::nullopt;
+    if (info.pack != t->packed) return std::nullopt;
+    if (!t->packed) {
+      if (!info.blake3 || *info.blake3 != id || info.uncompressed_size != size) return std::nullopt;
+    } else {
+      // A pack records no identity for its pieces: compare the bytes (a
+      // small file's, from a pack the cache usually still holds).
+      if (std::uint64_t{t->piece} + size > info.uncompressed_size) return std::nullopt;
+      std::shared_ptr<const Bytes> piece = read_chunk(ref);
+      if (!std::equal(piece->begin(), piece->end(), data.begin(), data.end())) return std::nullopt;
+    }
   } catch (const Error&) {
     return std::nullopt;
   }
-  ChunkRef ref{t->offset, static_cast<std::uint32_t>(r->stored_size()), size};
-  ref.hash = key;
   return ref;
 }
 

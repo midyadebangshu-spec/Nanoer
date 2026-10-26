@@ -76,13 +76,16 @@ class Journal {
 
   // With `blake3`, the record carries the data's identity and the returned
   // reference its dedup key.
+  // With `pack`, the record holds several small files' data (no owner).
   ChunkRef append_chunk(const EncodedChunk& chunk, InodeId ino, std::uint64_t file_offset,
-                        const std::optional<Blake3Hash>& blake3 = std::nullopt);
+                        const std::optional<Blake3Hash>& blake3 = std::nullopt, bool pack = false);
   // GC: appends a copy of an intact data chunk record (same header fields
   // and payload, the current segment's sequence number). Returns where.
   // `urgent`: may use one of the reserve segments. Throws Error(no_space)
   // before writing anything if there is no room.
   std::uint64_t append_copy(const Record& record, bool urgent);
+  // GC: a pack built again from the live pieces of an old one.
+  ChunkRef append_repacked(const EncodedChunk& pack, bool urgent);
   LogPosition append_transaction(std::uint64_t txid, const std::vector<Op>& ops);
   // Writes a complete snapshot of `meta`, split into parts as needed.
   // Returns where its first part starts (what the superblock points to).

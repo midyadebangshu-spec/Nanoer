@@ -451,6 +451,37 @@ files inside metadata (as Btrfs does), and **pack** many small files into one
 shared compressed chunk, ideally with a zstd dictionary trained on similar
 files.
 
+**As built (M4): packing, no inlining.** Measured first (§14): inlining
+files up to 2 KiB would take more space (and RAM, while metadata is in
+memory) than packing them.
+
+- **What:** at commit, regular files of at most 16 KiB (and one chunk)
+  whose whole content is written in that commit, after dedup (a small file
+  identical to a stored one or to a piece takes that).
+- **Order:** by directory and name for files whose directory changed in
+  this commit (new files always qualify), by inode number for the rest
+  (rewritten files, usually created together anyway). Neighbours on disk
+  are then the files read together (a compiler reading headers, `grep
+  -r`). Finding every file's directory would need a scan of all
+  directories at every commit, so this is the cheap version of the plan's
+  "by directory, then by name".
+- **Packs** of up to 64 KiB of data are compressed as one record with the
+  `pack` flag; each file refers to its **piece** (offset and length in the
+  pack). A file alone in its pack is stored as an ordinary chunk.
+- **Reading** a piece decompresses its pack once into the safe-space cache
+  (the whole pack), then copies the piece out.
+- **Dedup of pieces:** a pack records no identity for its pieces, so a
+  match is confirmed by comparing the bytes (a small file's).
+- **Changes:** a changed piece is simply written again (packed in the next
+  commit, or as a chunk once the file passes 16 KiB). A pack's space is
+  freed with its last piece (§8 of the format).
+- **GC repacks** a pack it visits whose live pieces are less than half its
+  data: decompressed, the live pieces packed again and compressed (outside
+  the lock), and each piece re-pointed. *Limit:* victim choice sees a
+  pack's whole size as live, so dead space inside packs only goes when GC
+  visits their segment for other reasons; a test also showed GC never
+  visits the segment being written.
+
 ### 7.9 Crash consistency and `fsync`
 
 POSIX promises durability only after `fsync`/`fdatasync`. The classic way
@@ -1312,6 +1343,8 @@ rejected.
 | 2026-10-26 | Background GC thresholds: idle 10 s and 25 % dead, or under 15 % free | collects when nobody is waiting, or before space gets tight | GC only on demand (every full filesystem would stall on its next write) |
 | 2026-10-26 | Dedup index: open addressing, 16-byte entries packing offset, pack flag and piece offset | ≈21–43 bytes per unique chunk, against ≈50+ for `std::unordered_map` | a node-based map; full 32-byte hashes |
 | 2026-10-26 | Hash before compressing; confirm every hit against the full BLAKE3 in the record, and again when applying it | no CPU spent compressing duplicates; a key collision or a record released earlier in the commit can never share wrong data | trusting the 8-byte key; byte-by-byte comparison (needs the old data read and decompressed) |
+| 2026-10-26 | Pack files ≤ 16 KiB into packs ≤ 64 KiB; no pack of one; GC repacks under half live | measured: 30 % less for small files, 64 KiB gets almost all of 128 KiB's gain at half the read cost | 32 KiB / 128 KiB (≈1 % smaller, twice the decompression per read); inlining (more space, RAM) |
+| 2026-10-26 | Pack order: directory and name where the directory changed in the commit, else inode number | files read together end up together, without scanning every directory at each commit | the plan's exact "directory, then name" for every file (needs a full scan) |
 | 2026-10-26 | `no_dedup` as a compat feature bit | a preference that an older reader may ignore safely (it does not dedup anyway) | an incompat bit; a separate settings area |
 
 ---

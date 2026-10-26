@@ -2,6 +2,7 @@
 // rewrites that never fill the store, and the races between GC and writes
 // (docs/M4_PLAN.md §3).
 
+#include <algorithm>
 #include <chrono>
 #include <map>
 #include <random>

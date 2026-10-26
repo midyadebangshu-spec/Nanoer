@@ -10,6 +10,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -218,7 +219,7 @@ class Filesystem {
   void maybe_commit();
   void commit();
   // A live record with exactly this content, confirmed by its full BLAKE3.
-  std::optional<ChunkRef> find_duplicate(const Blake3Hash& id, std::uint32_t size);
+  std::optional<ChunkRef> find_duplicate(const Blake3Hash& id, ByteView data);
   void maybe_checkpoint();
   void checkpoint();
   void stop_background();
@@ -242,12 +243,21 @@ class Filesystem {
   struct GcPlan {
     std::vector<GcVictim> victims;
     std::vector<GcItem> items;  // in offset order
+    CodecId codec{};            // for packs built again
+    int level = 0;
+  };
+  struct GcRead {
+    std::optional<Record> record;  // the record to copy, intact
+    // A mostly dead pack: its live pieces packed again, and where each
+    // moved (old piece offset -> new).
+    std::optional<EncodedChunk> repacked;
+    std::map<std::uint32_t, std::uint32_t> pieces;
   };
   enum class GcNeed { none, idle, low_space };
   GcNeed gc_need() const;  // shared lock is enough
   GcPlan gc_plan(const GcPolicy& policy, bool urgent) const;  // shared lock is enough
-  std::vector<std::optional<Record>> gc_read(const GcPlan& plan);  // no lock needed
-  bool gc_apply(const GcPlan& plan, std::vector<std::optional<Record>>& records, bool urgent);
+  std::vector<GcRead> gc_read(const GcPlan& plan);  // no lock needed
+  bool gc_apply(const GcPlan& plan, std::vector<GcRead>& reads, bool urgent);
   bool gc_step_locked(const GcPolicy& policy, bool urgent);
   void gc_checkpoints(bool low_space);
   void background_gc();

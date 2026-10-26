@@ -109,14 +109,15 @@ LogPosition Journal::append_record(RecordType type, std::uint8_t flags, ByteView
 }
 
 ChunkRef Journal::append_chunk(const EncodedChunk& chunk, InodeId ino, std::uint64_t file_offset,
-                               const std::optional<Blake3Hash>& blake3) {
+                               const std::optional<Blake3Hash>& blake3, bool pack) {
   std::size_t header = blake3 ? kDataChunkHeaderSizeWithId : kDataChunkHeaderSize;
   std::uint64_t size = record_size(header - kRecordHeaderSize, chunk.payload.size());
   ensure_room(size, reserve_);
-  Bytes record = encode_data_chunk_record(writer_->seq(), chunk, ino, file_offset, blake3);
+  Bytes record = encode_data_chunk_record(writer_->seq(), chunk, ino, file_offset, blake3, pack);
   std::uint64_t at = *writer_->append(record);
   bytes_since_checkpoint_ += size;
   ChunkRef ref{at, static_cast<std::uint32_t>(size), chunk.uncompressed_size};
+  ref.packed = pack;
   if (blake3) ref.hash = hash_key(blake3->data());
   return ref;
 }
@@ -132,6 +133,17 @@ std::uint64_t Journal::append_copy(const Record& r, bool urgent) {
   std::uint64_t at = *writer_->append(record);
   bytes_since_checkpoint_ += size;
   return at;
+}
+
+ChunkRef Journal::append_repacked(const EncodedChunk& pack, bool urgent) {
+  std::uint64_t size = record_size(kDataChunkHeaderSize - kRecordHeaderSize, pack.payload.size());
+  ensure_room(size, urgent ? gc_reserve_ : reserve_);
+  Bytes record = encode_data_chunk_record(writer_->seq(), pack, 0, 0, std::nullopt, true);
+  std::uint64_t at = *writer_->append(record);
+  bytes_since_checkpoint_ += size;
+  ChunkRef ref{at, static_cast<std::uint32_t>(size), pack.uncompressed_size};
+  ref.packed = true;
+  return ref;
 }
 
 LogPosition Journal::append_transaction(std::uint64_t txid, const std::vector<Op>& ops) {
