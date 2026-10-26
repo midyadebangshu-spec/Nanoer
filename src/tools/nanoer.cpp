@@ -6,10 +6,14 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <sys/xattr.h>
 
 #include "common.h"
 #include "nanoer/check.h"
@@ -45,6 +49,11 @@ void usage(std::ostream& out) {
          "  gc [options] TARGET       compact the filesystem (it must not be mounted): copy the\n"
          "                            live data out of mostly empty segments and free them\n"
          "      --max-full PERCENT      collect segments at most this full (default 90)\n"
+         "  stats [--codecs] TARGET   where the space goes: what holes, dedup and compression\n"
+         "                            saved; segments, GC, memory. TARGET: an image or device\n"
+         "                            (not mounted), or the mount point of a mounted filesystem\n"
+         "      --codecs                also break stored data down by codec (reads every\n"
+         "                              record header; not for a mount point)\n"
          "  version                   print the version\n"
          "\n"
          "fsck exit codes: 0 clean, 1 errors fixed, 4 errors left, 8 could not run.\n"
@@ -254,11 +263,92 @@ int cmd_gc(const std::vector<std::string_view>& args) {
   return 0;
 }
 
+// ---- stats -----------------------------------------------------------------
+
+void print_stats(const std::string& target, const SpaceStats& s) {
+  auto pct = [](std::uint64_t part, std::uint64_t whole) {
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "%.1f%%", whole ? 100.0 * static_cast<double>(part) / static_cast<double>(whole) : 0.0);
+    return std::string(buf);
+  };
+  auto minus = [&](std::uint64_t v) { return "-" + format_size(v) + " (" + pct(v, s.logical_bytes) + ")"; };
+  std::int64_t compression = static_cast<std::int64_t>(s.unique_bytes) - static_cast<std::int64_t>(s.stored_bytes);
+  std::cout << target << ": " << s.files << " files, " << s.directories << " directories, " << s.other_inodes
+            << " other\n\n"
+            << "Contents:\n"
+            << "  logical size:      " << format_size(s.logical_bytes) << "\n"
+            << "  holes and zeros:   " << minus(s.saved_by_holes()) << "\n"
+            << "  dedup:             " << minus(s.dedup_bytes) << ", " << s.shared_records << " records shared\n"
+            << "  compression:       "
+            << (compression >= 0 ? minus(static_cast<std::uint64_t>(compression))
+                                 : "+" + format_size(static_cast<std::uint64_t>(-compression)) + " (headers)")
+            << ", " << s.packed_files << " small files in " << s.packs << " packs\n";
+  if (s.pack_dead_bytes) std::cout << "  dead in packs:     +" << format_size(s.pack_dead_bytes) << "\n";
+  std::cout << "  stored:            " << format_size(s.stored_bytes) << " (" << pct(s.stored_bytes, s.logical_bytes)
+            << " of logical) in " << s.records << " records\n";
+  for (const auto& [codec, c] : s.by_codec) {
+    std::cout << "    " << codec << ": " << c.records << " records, " << format_size(c.data_bytes) << " stored as "
+              << format_size(c.stored_bytes) << " (" << pct(c.stored_bytes, c.data_bytes) << ")\n";
+  }
+  std::uint64_t used = s.segments_in_use * s.segment_bytes;
+  std::cout << "\nSpace:\n"
+            << "  segments:          " << s.segments << " of " << format_size(s.segment_bytes) << ": " << s.segments_in_use
+            << " in use, " << s.segments_free << " free, " << s.segments_pending << " free after the next checkpoint\n"
+            << "  in use:            " << format_size(used) << ": " << format_size(s.live_bytes) << " live, "
+            << format_size(used - std::min(used, s.live_bytes))
+            << " not live (dead data, the log, and room not yet written in the current segment)\n"
+            << "\nGarbage collection since mounting: " << format_size(s.gc_bytes_copied) << " copied in "
+            << s.gc_records_copied << " records, " << s.gc_segments_emptied << " segments emptied, "
+            << s.gc_packs_repacked << " packs repacked";
+  if (s.gc_damaged) std::cout << ", " << s.gc_damaged << " damaged records left in place (run nanoer fsck)";
+  std::cout << "\nDedup: " << (s.dedup ? "on" : "off") << ", " << s.dedup_entries << " contents indexed ("
+            << format_size(s.dedup_index_bytes) << ")\n"
+            << "Metadata in memory: about " << format_size(s.metadata_bytes) << "\n";
+}
+
+int cmd_stats(const std::vector<std::string_view>& args) {
+  bool codecs = false;
+  std::string target;
+  for (std::string_view a : args) {
+    if (a == "--codecs") {
+      codecs = true;
+    } else if (!a.empty() && a[0] == '-') {
+      return fail(kProgram, "unknown stats option " + std::string(a));
+    } else {
+      target = std::string(a);
+    }
+  }
+  if (target.empty()) return fail(kProgram, "stats needs a TARGET");
+  if (std::filesystem::is_directory(target)) {
+    // A mount point: nanoerfs answers this attribute on its root.
+    if (codecs) return fail(kProgram, "--codecs needs the filesystem unmounted");
+    std::string value(64 << 10, '\0');
+    ssize_t n = ::getxattr(target.c_str(), kStatsXattr, value.data(), value.size());
+    if (n < 0) return fail(kProgram, target + " is not the mount point of a Nanoer filesystem");
+    value.resize(static_cast<std::size_t>(n));
+    print_stats(target, decode_stats(value));
+    return 0;
+  }
+  auto store = FileStore::open(target, FileStore::Mode::read_only);
+  Filesystem::Options options;
+  options.read_only = true;
+  options.start_threads = false;
+  options.safe_space = 0;
+  auto fs = Filesystem::mount(*store, options);
+  print_stats(target, fs->space_stats(codecs));
+  return 0;
+}
+
 // ---- bench -----------------------------------------------------------------
 
 struct Sample {
   Bytes data;
   std::size_t files = 0;
+  struct File {
+    std::size_t start, size;  // in data
+    bool whole;               // all of the file (not cut at the per-file limit)
+  };
+  std::vector<File> parts;
 };
 
 struct Limits {
@@ -276,6 +366,8 @@ void add_file(Sample& s, const std::filesystem::path& path, const Limits& limits
   in.read(reinterpret_cast<char*>(s.data.data() + old), static_cast<std::streamsize>(room));
   s.data.resize(old + static_cast<std::size_t>(in.gcount()));
   ++s.files;
+  bool whole = in.gcount() < static_cast<std::streamsize>(room) || in.peek() == std::ifstream::traits_type::eof();
+  s.parts.push_back({old, s.data.size() - old, whole});
 }
 
 Sample collect(const std::vector<std::string>& paths, const Limits& limits) {
@@ -362,6 +454,42 @@ int cmd_bench(const std::vector<std::string_view>& args) {
   }
   std::cout << "\nstored = size on disk as a percentage of the original (incompressible chunks "
                "stored raw)\n";
+
+  // What M4's dedup and small-file packing would save on this sample, with
+  // the default codec (zstd level 1).
+  std::uint64_t chunks = 0, unique = 0;
+  std::set<Blake3Hash> seen;
+  std::uint64_t small_files = 0, small_bytes = 0, alone = 0, packed = 0;
+  Bytes pack;
+  auto stored = [](ByteView d) { return static_cast<std::uint64_t>(encode_chunk(d, CodecId::zstd, 1).payload.size()); };
+  for (const Sample::File& f : sample.parts) {
+    for (std::size_t off = 0; off < f.size; off += chunk_size) {
+      ByteView c(sample.data.data() + f.start + off, std::min<std::size_t>(chunk_size, f.size - off));
+      ++chunks;
+      unique += seen.insert(blake3(c)).second;
+    }
+    if (f.whole && f.size > 0 && f.size <= (16u << 10) && f.size <= chunk_size) {
+      ByteView d(sample.data.data() + f.start, f.size);
+      ++small_files;
+      small_bytes += f.size;
+      alone += stored(d);
+      if (pack.size() + f.size > (64u << 10)) {
+        packed += stored(pack);
+        pack.clear();
+      }
+      pack.insert(pack.end(), d.begin(), d.end());
+    }
+  }
+  if (!pack.empty()) packed += stored(pack);
+  std::cout << "\nDedup: " << chunks - unique << " of " << chunks << " chunks are duplicates: about "
+            << std::fixed << std::setprecision(1)
+            << (chunks ? 100.0 * static_cast<double>(chunks - unique) / static_cast<double>(chunks) : 0.0)
+            << "% less to store\n";
+  if (small_files) {
+    std::cout << "Small files: " << small_files << " files up to 16 KiB (" << format_size(small_bytes)
+              << "): " << format_size(alone) << " one by one, " << format_size(packed) << " packed ("
+              << (100.0 - 100.0 * static_cast<double>(packed) / static_cast<double>(alone)) << "% less)\n";
+  }
   return 0;
 }
 
@@ -382,6 +510,7 @@ int main(int argc, char** argv) {
     if (command == "bench") return cmd_bench(args);
     if (command == "fsck") return cmd_fsck(args);
     if (command == "gc") return cmd_gc(args);
+    if (command == "stats") return cmd_stats(args);
     if (command == "version") {
       std::cout << "nanoer " NANOER_VERSION " (format " << kVersionMajor << "." << kVersionMinor << ")\n";
       return 0;

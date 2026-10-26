@@ -89,10 +89,15 @@ case "$MODE" in
   persist)
     SRC=${1:-/usr/include}
     cp -a "$SRC" "$MNT/tree"
+    cp -a "$SRC" "$MNT/copy"  # stored again: dedup
     unmount
     mount_fs
     diff -r --no-dereference "$SRC" "$MNT/tree"
+    diff -r --no-dereference "$SRC" "$MNT/copy"
     echo "tree identical after remount"
+    # The statistics of a mounted filesystem, through user.nanoer.stats.
+    "$BIN/nanoer" stats "$MNT" | tee "$WORK/stats.txt"
+    grep -q "records shared" "$WORK/stats.txt"
     ;;
   kill)
     WRITER=$(dirname "$0")/kill_writer.py

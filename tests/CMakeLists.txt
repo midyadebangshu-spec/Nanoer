@@ -20,6 +20,7 @@ add_executable(nanoer_unit_tests
   unit/pack_test.cpp
   unit/record_test.cpp
   unit/segment_test.cpp
+  unit/stats_test.cpp
 )
 target_link_libraries(nanoer_unit_tests PRIVATE nanoer_core nanoer_warnings GTest::gtest_main)
 gtest_discover_tests(nanoer_unit_tests DISCOVERY_TIMEOUT 60)

@@ -29,6 +29,7 @@
 #include "nanoer/gc.h"
 #include "nanoer/journal.h"
 #include "nanoer/metadata.h"
+#include "nanoer/stats.h"
 #include "nanoer/thread_pool.h"
 
 namespace nanoer {
@@ -179,6 +180,9 @@ class Filesystem {
 
   FsStats statfs();
   FsInfo info();
+  // Where the space goes (stats.cpp). `by_codec` reads every record header.
+  // Also served as the extended attribute user.nanoer.stats of the root.
+  SpaceStats space_stats(bool by_codec = false);
 
   // Garbage collection until no segment at most `max_utilization` full is
   // left, then the two checkpoints that free what it emptied (nanoer gc).
@@ -222,6 +226,7 @@ class Filesystem {
   std::optional<ChunkRef> find_duplicate(const Blake3Hash& id, ByteView data);
   void maybe_checkpoint();
   void checkpoint();
+  SpaceStats space_stats_locked(bool by_codec);  // shared lock is enough
   void stop_background();
   void background();
 

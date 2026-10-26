@@ -1345,6 +1345,9 @@ rejected.
 | 2026-10-26 | Hash before compressing; confirm every hit against the full BLAKE3 in the record, and again when applying it | no CPU spent compressing duplicates; a key collision or a record released earlier in the commit can never share wrong data | trusting the 8-byte key; byte-by-byte comparison (needs the old data read and decompressed) |
 | 2026-10-26 | Pack files ≤ 16 KiB into packs ≤ 64 KiB; no pack of one; GC repacks under half live | measured: 30 % less for small files, 64 KiB gets almost all of 128 KiB's gain at half the read cost | 32 KiB / 128 KiB (≈1 % smaller, twice the decompression per read); inlining (more space, RAM) |
 | 2026-10-26 | Pack order: directory and name where the directory changed in the commit, else inode number | files read together end up together, without scanning every directory at each commit | the plan's exact "directory, then name" for every file (needs a full scan) |
+| 2026-10-26 | `nanoer stats` from the metadata (one header read per pack); a mount serves it as the virtual `user.nanoer.stats` on its root; `user.nanoer.*` reserved (setting one: `EPERM`) | no extra channel to the daemon, readable by any user, cheap enough to ask often | an ioctl or control file (FUSE ioctls are awkward, and need tools of their own) |
+| 2026-10-26 | The by-codec breakdown only offline (`nanoer stats --codecs IMAGE`) | it reads every record header: too slow to answer through an extended attribute on a big filesystem | per-chunk codec in the metadata (bytes per chunk, for a figure rarely needed) |
+| 2026-10-26 | `nanoer bench` also estimates dedup (BLAKE3 of file-aligned chunks) and packing (files ≤ 16 KiB in 64 KiB packs, zstd 1) | anyone can see what M4 saves on their own files before using it | a separate tool |
 | 2026-10-26 | `no_dedup` as a compat feature bit | a preference that an older reader may ignore safely (it does not dedup anyway) | an incompat bit; a separate settings area |
 
 ---

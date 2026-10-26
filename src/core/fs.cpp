@@ -1196,6 +1196,10 @@ std::vector<DirEntry> Filesystem::list(InodeId ino) {
 Bytes Filesystem::getxattr(InodeId ino, std::string_view name) {
   std::shared_lock lock(mutex_);
   Inode& i = inode(ino);
+  if (ino == kRootInode && name == kStatsXattr) {
+    std::string text = encode_stats(space_stats_locked(false));
+    return Bytes(text.begin(), text.end());
+  }
   auto it = i.xattrs.find(name);
   if (it == i.xattrs.end()) throw_posix(ENODATA);
   return it->second;
@@ -1215,6 +1219,7 @@ void Filesystem::setxattr(InodeId ino, std::string_view name, ByteView value, in
   if (name.empty()) throw_posix(EINVAL);
   if (name.size() > kMaxXattrNameLength) throw_posix(ERANGE);
   if (value.size() > kMaxXattrValueSize) throw_posix(E2BIG);
+  if (name.starts_with(kNanoerXattrPrefix)) throw_posix(EPERM);  // reserved for Nanoer
   bool exists = i.xattrs.contains(name);
   if ((flags & XATTR_CREATE) && exists) throw_posix(EEXIST);
   if ((flags & XATTR_REPLACE) && !exists) throw_posix(ENODATA);

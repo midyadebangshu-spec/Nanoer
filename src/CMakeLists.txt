@@ -15,6 +15,7 @@ add_library(nanoer_core STATIC
   core/mkfs.cpp
   core/record.cpp
   core/segment.cpp
+  core/stats.cpp
   core/thread_pool.cpp
 )
 target_include_directories(nanoer_core PUBLIC ${PROJECT_SOURCE_DIR}/include)
