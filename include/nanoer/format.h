@@ -30,13 +30,18 @@ inline constexpr unsigned kDefaultChunkShift = 17;  // 128 KiB
 inline constexpr std::uint64_t kMinSegmentCount = 4;
 inline constexpr std::size_t kMaxLabelLength = 63;
 
-// Feature flags this build understands (none yet in format 1.0).
+// Feature flags.
 //   compat:     safe to ignore
 //   ro_compat:  readable without understanding, but not writable
 //   incompat:   must be understood to read the filesystem at all
+namespace incompat_features {
+// A data chunk record may have several references (dedup) or hold several
+// small files (a pack): SetChunkRef operations, version 2 checkpoints.
+inline constexpr std::uint64_t shared_records = 0x1;
+}  // namespace incompat_features
 inline constexpr std::uint64_t kKnownCompatFeatures = 0;
 inline constexpr std::uint64_t kKnownRoCompatFeatures = 0;
-inline constexpr std::uint64_t kKnownIncompatFeatures = 0;
+inline constexpr std::uint64_t kKnownIncompatFeatures = incompat_features::shared_records;
 
 // Superblock state flags (not features: any version may ignore them).
 namespace state_flags {
@@ -79,6 +84,10 @@ struct Superblock {
     return data_start + index * segment_size();
   }
 };
+
+inline bool has_shared_records(const Superblock& sb) {
+  return (sb.features_incompat & incompat_features::shared_records) != 0;
+}
 
 Bytes encode_superblock(const Superblock& sb);
 

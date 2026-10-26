@@ -47,11 +47,19 @@ void usage(std::ostream& out) {
          "Also installed as fsck.nanoer, for fsck -t nanoer and boot-time checks.\n";
 }
 
-std::string features(std::uint64_t f) {
+std::string features(std::uint64_t f, std::uint64_t named = 0, const char* name = nullptr) {
   if (f == 0) return "none";
-  char buf[32];
-  std::snprintf(buf, sizeof buf, "0x%llx", static_cast<unsigned long long>(f));
-  return buf;
+  std::string out;
+  if (f & named) {
+    out = name;
+    f &= ~named;
+  }
+  if (f) {
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "0x%llx", static_cast<unsigned long long>(f));
+    out += (out.empty() ? "" : " + ") + std::string(buf);
+  }
+  return out;
 }
 
 const char* state_name(DecodedSuperblock::State s) {
@@ -96,7 +104,7 @@ int cmd_info(const std::vector<std::string_view>& args) {
             << "  new data:        " << codec_name(sb.default_codec) << " level "
             << int{sb.default_level} << "\n"
             << "  features:        compat " << features(sb.features_compat) << ", ro_compat "
-            << features(sb.features_ro_compat) << ", incompat " << features(sb.features_incompat)
+            << features(sb.features_ro_compat) << ", incompat " << features(sb.features_incompat, incompat_features::shared_records, "shared-records")
             << (loaded.read_only ? " (read-only for this version)" : "") << "\n"
             << "  state:           "
             << (sb.state & state_flags::errors ? "damage was found; run nanoer fsck" : "clean") << "\n"

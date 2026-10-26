@@ -87,7 +87,7 @@ TEST(Superblock, NewerVersionAndUnknownIncompatAreUnsupported) {
   EXPECT_EQ(decode_superblock(reseal(newer)).state, DecodedSuperblock::State::unsupported);
 
   Superblock sb = sample();
-  sb.features_incompat = 1;
+  sb.features_incompat = 1ull << 40;  // not known to this build
   EXPECT_EQ(decode_superblock(encode_superblock(sb)).state, DecodedSuperblock::State::unsupported);
 
   sb.features_incompat = 0;

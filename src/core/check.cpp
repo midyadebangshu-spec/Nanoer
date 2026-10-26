@@ -12,6 +12,7 @@
 
 #include <sys/stat.h>
 
+#include "nanoer/checksum.h"
 #include "nanoer/error.h"
 #include "nanoer/format.h"
 #include "nanoer/io.h"
@@ -100,6 +101,7 @@ void rescue_superblocks(Store& store, FsckReport& report, const std::optional<Su
   // Every checkpoint's first part, newest first.
   struct Candidate {
     std::uint64_t txid, offset, seq;
+    bool shared_records;  // its snapshot says which encoding, so which feature
   };
   std::vector<Candidate> candidates;
   std::uint64_t max_seq = 0;
@@ -110,7 +112,8 @@ void rescue_superblocks(Store& store, FsckReport& report, const std::optional<Su
     while (auto r = scan.next()) {
       if (r->header.type == RecordType::checkpoint && r->extra.size() == kCheckpointExtraSize &&
           load_le<std::uint32_t>(r->extra.data() + 8) == 0) {
-        candidates.push_back({load_le<std::uint64_t>(r->extra.data()), r->offset, scan.header().seq});
+        candidates.push_back({load_le<std::uint64_t>(r->extra.data()), r->offset, scan.header().seq,
+                              Metadata::is_v2_checkpoint(r->payload)});
       }
     }
   }
@@ -120,6 +123,9 @@ void rescue_superblocks(Store& store, FsckReport& report, const std::optional<Su
     sb.checkpoint_offset = c.offset;
     sb.checkpoint_seq = c.seq;
     sb.next_segment_seq = max_seq + 1;
+    if (!known) {
+      sb.features_incompat = c.shared_records ? incompat_features::shared_records : 0;
+    }
     try {
       ReplayResult r = replay(store, sb);
       // The chunk size: any chunk past the first tells it exactly.
@@ -469,13 +475,24 @@ class Checker {
   // Phase 4 (and 5 with --deep).
   void space() {
     const std::uint64_t cs = sb_.chunk_size();
-    std::unordered_map<std::uint64_t, InodeId> owner_of;
-    std::map<std::uint64_t, std::uint64_t> live;
+    // Every record, with the references to it.
+    struct Use {
+      ChunkRef ref;  // the first reference seen
+      std::uint32_t count = 0;
+    };
+    std::unordered_map<std::uint64_t, Use> uses;
+    for (auto& [id, inode] : meta_->inodes) {
+      for (const auto& [index, ref] : inode.chunks) {
+        Use& u = uses.try_emplace(ref.offset, Use{ref, 0}).first->second;
+        ++u.count;
+      }
+    }
     struct Bad {
       InodeId ino;
       std::uint64_t index;
     };
     std::vector<Bad> bad;
+    std::unordered_set<std::uint64_t> seen;
     for (auto& [id, inode] : meta_->inodes) {
       for (const auto& [index, ref] : inode.chunks) {
         ++report_.chunks;
@@ -484,51 +501,119 @@ class Checker {
           bad.push_back({id, index});  // invisible data: nothing is lost
           continue;
         }
-        std::string problem = check_chunk(id, index, ref);
-        if (problem.empty() && owner_of.contains(ref.offset)) problem = "shares its data with another file";
+        const Use& u = uses.at(ref.offset);
+        std::string problem;
+        if (u.count > 1 && !meta_->shared_records()) {
+          if (!seen.insert(ref.offset).second) problem = "shares its data with another file";
+        } else if (u.ref.stored_size != ref.stored_size || u.ref.packed != ref.packed) {
+          problem = "disagrees with another file about its data";
+        }
+        if (problem.empty()) problem = check_chunk(id, index, ref);
         if (!problem.empty()) {
           error(path_of(id) + ", " + range(index * cs, ref.size) + ": " + problem);
           report_.lost.push_back(path_of(id) + ": " + range(index * cs, ref.size));
           bad.push_back({id, index});
-          continue;
         }
-        owner_of.emplace(ref.offset, id);
-        live[meta_->segment_of(ref.offset)] += ref.stored_size;
       }
     }
-    for (const Bad& b : bad) fix(op::RemoveChunk{b.ino, b.index});
 
+    // Reference counts and space, from the references themselves: each
+    // record's space counts once (without shared records, every reference
+    // claims space of its own, even a wrong second one).
+    std::unordered_map<std::uint64_t, std::uint32_t> counts;
+    std::map<std::uint64_t, std::uint64_t> live;
+    for (const auto& [offset, u] : uses) {
+      if (u.ref.packed || u.count > 1) counts.emplace(offset, u.count);
+      live[meta_->segment_of(offset)] += u.ref.stored_size * (meta_->shared_records() ? 1 : u.count);
+    }
+    bool counts_wrong = meta_->shared_records() && counts != meta_->shared;
+    bool space_wrong = false;
     for (auto& [index, usage] : meta_->segments) {
       std::uint64_t expected = live.contains(index) ? live[index] : 0;
-      if (usage.live_bytes != expected && !options_.repair) {
-        error("segment " + std::to_string(index) + ": space accounting is wrong");
+      if (usage.live_bytes != expected) space_wrong = true;
+    }
+    if (counts_wrong) error("the reference counts of shared data are wrong");
+    if (space_wrong) error("the space accounting of segments is wrong");
+    if (options_.repair && (counts_wrong || space_wrong)) {
+      // Make them exact before removing anything, so removals count right.
+      if (meta_->shared_records()) meta_->shared = counts;
+      for (auto& [index, usage] : meta_->segments) usage.live_bytes = live.contains(index) ? live[index] : 0;
+    }
+    for (const Bad& b : bad) fix(op::RemoveChunk{b.ino, b.index});
+  }
+
+  // What the record at a location says, read once however many files
+  // reference it.
+  struct RecordCheck {
+    std::string problem;
+    DataChunkInfo info;
+    std::uint64_t stored_size = 0;
+    std::optional<Bytes> data;  // with --deep, for packs (pieces are hashed)
+  };
+
+  const RecordCheck& check_record(const ChunkRef& ref) {
+    if (auto it = records_.find(ref.offset); it != records_.end()) return it->second;
+    RecordCheck c;
+    std::uint64_t seg = meta_->segment_of(ref.offset);
+    auto usage = meta_->segments.find(seg);
+    std::optional<Record> r;
+    if (usage == meta_->segments.end()) {
+      c.problem = "its data is in a free segment";
+    } else {
+      std::uint64_t limit = sb_.segment_offset(seg) + sb_.segment_size();
+      r = options_.deep ? try_read_record(store_, ref.offset, limit, usage->second.seq)
+                        : try_read_record_header(store_, ref.offset, limit, usage->second.seq);
+      if (!r || r->header.type != RecordType::data_chunk) c.problem = "its data is missing or damaged";
+    }
+    if (c.problem.empty()) {
+      try {
+        c.info = parse_data_chunk(*r);
+        c.stored_size = r->stored_size();
+        if (options_.deep) {
+          Bytes data = decode_data_chunk(*r);
+          if (c.info.blake3 && blake3(data) != *c.info.blake3) throw Error(Errc::corrupt, "identity");
+          if (c.info.pack) c.data = std::move(data);
+          ++report_.chunks_verified;
+        }
+      } catch (const Error&) {
+        c.problem = "its data is damaged";
       }
     }
+    // Pack contents are kept only until all their pieces are checked; a
+    // handful at a time is enough, as pieces of a pack are usually together.
+    if (c.data) {
+      packs_.push_back(ref.offset);
+      if (packs_.size() > 64) {
+        if (auto it = records_.find(packs_.front()); it != records_.end()) it->second.data.reset();
+        packs_.pop_front();
+      }
+    }
+    return records_.emplace(ref.offset, std::move(c)).first->second;
   }
 
   std::string check_chunk(InodeId id, std::uint64_t index, const ChunkRef& ref) {
-    std::uint64_t seg = meta_->segment_of(ref.offset);
-    auto usage = meta_->segments.find(seg);
-    if (usage == meta_->segments.end()) return "its data is in a free segment";
-    std::uint64_t limit = sb_.segment_offset(seg) + sb_.segment_size();
-    std::optional<Record> r = options_.deep
-                                  ? try_read_record(store_, ref.offset, limit, usage->second.seq)
-                                  : try_read_record_header(store_, ref.offset, limit, usage->second.seq);
-    if (!r || r->header.type != RecordType::data_chunk) return "its data is missing or damaged";
-    try {
-      DataChunkInfo info = parse_data_chunk(*r);
-      if (info.inode != id || info.file_offset != index * sb_.chunk_size()) {
-        return "its data belongs to another file";
-      }
-      if (info.uncompressed_size != ref.size || r->stored_size() != ref.stored_size) {
-        return "its size does not match its data";
-      }
-      if (options_.deep) {
-        decode_data_chunk(*r);
-        ++report_.chunks_verified;
-      }
-    } catch (const Error&) {
-      return "its data is damaged";
+    const RecordCheck& c = check_record(ref);
+    if (!c.problem.empty()) return c.problem;
+    const DataChunkInfo& info = c.info;
+    if (info.pack != ref.packed) return "its data is not what it was written as";
+    if (c.stored_size != ref.stored_size) return "its size does not match its data";
+    if (ref.packed) {
+      if (std::uint64_t{ref.piece} + ref.size > info.uncompressed_size) return "it lies outside its pack";
+    } else if (info.uncompressed_size != ref.size) {
+      return "its size does not match its data";
+    }
+    // Data that may be shared (it has an identity) or packed has no single
+    // owner; any other data belongs to one file, at one position.
+    if (!ref.packed && !ref.hash && !info.blake3 &&
+        (info.inode != id || info.file_offset != index * sb_.chunk_size())) {
+      return "its data belongs to another file";
+    }
+    if (ref.hash && !ref.packed && (!info.blake3 || hash_key(info.blake3->data()) != ref.hash)) {
+      return "its identity does not match its data";
+    }
+    if (ref.hash && ref.packed && c.data) {
+      Blake3Hash h = blake3(ByteView(*c.data).subspan(ref.piece, ref.size));
+      if (hash_key(h.data()) != ref.hash) return "its identity does not match its data";
     }
     return {};
   }
@@ -537,12 +622,23 @@ class Checker {
   void repair() {
     bool anything = !fixes_.empty() || new_checkpoint_ || rewrite_both_ || clear_errors_flag_;
     if (!anything) return;
-    // Space accounting is derived from the chunks; make it exact.
+    // Space accounting and reference counts are derived from the chunks;
+    // make them exact (each record's space counts once).
     std::map<std::uint64_t, std::uint64_t> live;
+    std::unordered_map<std::uint64_t, std::pair<ChunkRef, std::uint32_t>> uses;
     for (const auto& [id, inode] : meta_->inodes) {
-      for (const auto& [index, ref] : inode.chunks) live[meta_->segment_of(ref.offset)] += ref.stored_size;
+      for (const auto& [index, ref] : inode.chunks) {
+        auto& u = uses.try_emplace(ref.offset, ref, 0).first->second;
+        if (u.second++ == 0 || !meta_->shared_records()) live[meta_->segment_of(ref.offset)] += ref.stored_size;
+      }
     }
     for (auto& [index, usage] : meta_->segments) usage.live_bytes = live[index];
+    if (meta_->shared_records()) {
+      meta_->shared.clear();
+      for (const auto& [offset, u] : uses) {
+        if (u.first.packed || u.second > 1) meta_->shared.emplace(offset, u.second);
+      }
+    }
 
     std::uint64_t next_seq = std::max(sb_.next_segment_seq, replayed_->max_seq + 1);
     Journal journal(store_, sb_, *meta_, next_seq);
@@ -579,6 +675,8 @@ class Checker {
   std::vector<Op> fixes_;
   std::unordered_map<InodeId, std::string> paths_;
   std::optional<InodeId> lost_found_;
+  std::unordered_map<std::uint64_t, RecordCheck> records_;
+  std::deque<std::uint64_t> packs_;
   bool new_checkpoint_ = false;
   bool rewrite_both_ = false;
   bool clear_errors_flag_ = false;

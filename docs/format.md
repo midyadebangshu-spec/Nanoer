@@ -117,7 +117,14 @@ it; a boot-time `fsck -a` then knows the filesystem needs a full check.
 Other bits are reserved and written as zero. An unknown bit set is not an
 error (old readers ignore the field), but writers preserve it.
 
-**Features.** No feature bits are defined in version 1.0.
+**Features.**
+
+| Kind | Bit | Name | Meaning |
+|---|---:|---|---|
+| incompat | 0 | `shared_records` | a data chunk record may have several references (dedup) or hold several small files (a pack); the log may contain SetChunkRef (§8) and checkpoints use version 2 (§9) |
+
+`mkfs` sets `shared_records` on every new filesystem. Without it a
+filesystem is exactly as earlier drafts of 1.0 wrote it, and stays so.
 
 ## 4. Segments
 
@@ -218,8 +225,13 @@ Flags:
 
 | Bit | Name | Meaning |
 |---:|---|---|
-| 0 | `has_blake3` | the `blake3` field is present (deduplicated chunk) |
-| 1–7 | — | reserved; a set unknown bit makes the record unreadable |
+| 0 | `has_blake3` | the `blake3` field is present: the chunk has an identity and may be shared |
+| 1 | `pack` | the data is several small files' contents, back to back (§8, *pieces*); `inode` and `file_offset` are 0, and `has_blake3` is not set |
+| 2–7 | — | reserved; a set unknown bit makes the record unreadable |
+
+`inode` and `file_offset` name the chunk's one owner only when neither
+flag is set: data with an identity may be shared, and its first owner may
+be gone.
 
 The payload is the compressed data (or the raw data for codec 0, where
 `payload_len` must equal `uncompressed_size`).
@@ -290,6 +302,7 @@ Each operation is a one-byte code followed by its fields:
 | 7 | TruncateChunks | `ino`, `first_index` | remove every chunk with index ≥ `first_index` |
 | 8 | SetXattr | `ino`, `name` bytes(255), `value` bytes(65536) | add or replace |
 | 9 | RemoveXattr | `ino`, `name` bytes(255) | remove an existing xattr |
+| 10 | SetChunkRef | `ino`, `index`, *extended reference* (below) | like SetChunk; only with `shared_records` |
 
 All fields are `varint` unless marked. *Attributes*, in order:
 `id`, `mode` (st_mode, type and permission bits), `uid`, `gid`, `nlink`,
@@ -297,6 +310,33 @@ All fields are `varint` unless marked. *Attributes*, in order:
 since the Unix epoch), `rdev`, `parent` (directories: the containing
 directory; root: itself; others: 0), `symlink` (bytes(4095): the target of a
 symlink, else empty).
+
+An *extended reference* is `flags` (varint), `offset`, `stored_size`,
+`size`, then `piece` (varint) if flag 0 is set, then `key` (8 bytes) if
+flag 1 is set:
+
+| Flag | Name | Meaning |
+|---:|---|---|
+| 0 | `packed` | the record is a pack; this chunk is the `size` bytes at `piece` in its uncompressed data |
+| 1 | `hash` | `key`: the first 8 bytes of the chunk data's BLAKE3, little-endian, never 0 (the dedup key) |
+| 2 | `share` | the record already has a reference; this is one more (dedup). Not with `packed` |
+| 3+ | — | reserved; a set unknown flag means the log is damaged |
+
+**Space and references** (with `shared_records`). A record's space
+(`stored_size`) counts once, however many chunks refer to it. A reader
+keeps a reference count for every pack and every other record with more
+than one reference:
+
+- a SetChunk, or a SetChunkRef without `share` or `packed`, refers to a
+  record nothing else refers to yet: its space is claimed;
+- a SetChunkRef with `share` adds a reference to a record that has one;
+- the first piece of a pack claims the pack's space, later pieces add a
+  reference;
+- removing or replacing a chunk drops one reference; the last one
+  releases the space.
+
+Without `shared_records`, every chunk claims space of its own, and a
+record referred to twice is damage.
 
 Rules (a violation means the log is damaged):
 
@@ -331,22 +371,28 @@ Type-specific header (32 bytes), the same values in every part except
 The payloads of the parts, concatenated, form the **snapshot stream**:
 
 ```
-"NNRCKPT1"                         8 bytes
+"NNRCKPT1" or "NNRCKPT2"           8 bytes; version 2 only with shared_records
 last_txid, next_inode              varint
 segment_count                      varint
   index, seq, live_bytes           varint, per segment in use
 inode_count                        varint
   attributes                       as in §8, per inode, in increasing id order
   chunk_count                      varint
-    index, offset, stored_size, size   varint, per chunk
+    index, offset, stored_size, size   varint, per chunk (version 1)
+    index, extended reference      per chunk (version 2; §8)
   entry_count                      varint
     name bytes(255), ino           per entry
   xattr_count                      varint
     name bytes(255), value bytes(65536)   per xattr
 ```
 
-`live_bytes` of a segment is the sum of `stored_size` of the chunks stored
-in it; a reader must check that the recorded value matches the chunks. A
+`live_bytes` of a segment is the sum of `stored_size` of the records stored
+in it that something refers to, each counted once (§8); a reader must check
+that the recorded value matches the chunks. In version 2, `share` marks
+every reference to a record that has more than one, so a reader counts
+references only for those and for packs; a record marked `share` with a
+single reference, or references to one record that disagree on
+`stored_size` or `packed`, mean the checkpoint is damaged. A
 reader must also check that the root exists and is a directory, that every
 entry resolves, and that no id reaches `next_inode`.
 
@@ -462,3 +508,4 @@ therefore always has a checkpoint.
 | 1.0 (draft) | initial: geometry, superblock, segments, records, data chunks |
 | 1.0 (draft, M2) | metadata transactions, checkpoints, segment seals, log replay, segment reuse; mkfs writes an initial checkpoint |
 | 1.0 (draft, M3) | transaction `durable_back` (was reserved, so older images read as "unknown"); superblock `state` flags (was reserved); damage detection, contradictory transactions, checkpoint fallback and rescue (§10.2) |
+| 1.0 (draft, M4) | `shared_records` feature: SetChunkRef, shared records and packs, reference counting, checkpoint version 2; data chunk `pack` flag |

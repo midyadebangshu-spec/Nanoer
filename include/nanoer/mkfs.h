@@ -20,6 +20,9 @@ struct FormatOptions {
   std::optional<Uuid> uuid;  // random when not set
   std::uint32_t root_uid = 0;  // owner of the root directory
   std::uint32_t root_gid = 0;
+  // Shared records (dedup, small-file packs). Off only to make a filesystem
+  // as M3 made them, for compatibility tests.
+  bool shared_records = true;
 };
 
 // The smallest store that can hold a filesystem with this segment size.

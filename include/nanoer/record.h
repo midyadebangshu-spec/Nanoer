@@ -28,7 +28,8 @@ inline constexpr std::size_t kDataChunkHeaderSizeWithId = kDataChunkHeaderSize +
 
 namespace data_chunk_flags {
 inline constexpr std::uint8_t has_blake3 = 0x01;
-inline constexpr std::uint8_t known = has_blake3;
+inline constexpr std::uint8_t pack = 0x02;  // several small files' data; no owner
+inline constexpr std::uint8_t known = has_blake3 | pack;
 }  // namespace data_chunk_flags
 
 struct RecordHeader {
@@ -80,11 +81,13 @@ struct DataChunkInfo {
   std::uint64_t inode = 0;
   std::uint64_t file_offset = 0;
   std::optional<Blake3Hash> blake3;  // content identity, when deduplicated
+  bool pack = false;  // holds pieces of several files (inode and file_offset are 0)
 };
 
 Bytes encode_data_chunk_record(std::uint64_t seq, const EncodedChunk& chunk, std::uint64_t inode,
                                std::uint64_t file_offset,
-                               const std::optional<Blake3Hash>& blake3 = std::nullopt);
+                               const std::optional<Blake3Hash>& blake3 = std::nullopt,
+                               bool pack = false);
 
 // Parses a data chunk record's type-specific header. Throws Error(corrupt).
 DataChunkInfo parse_data_chunk(const Record& record);

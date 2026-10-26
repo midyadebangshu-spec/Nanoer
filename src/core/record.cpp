@@ -123,14 +123,18 @@ Record read_record(Store& store, std::uint64_t offset, std::uint64_t limit, std:
 }
 
 Bytes encode_data_chunk_record(std::uint64_t seq, const EncodedChunk& chunk, std::uint64_t inode,
-                               std::uint64_t file_offset, const std::optional<Blake3Hash>& blake3) {
+                               std::uint64_t file_offset, const std::optional<Blake3Hash>& blake3,
+                               bool pack) {
+  if (pack && (inode || file_offset || blake3)) {
+    throw Error(Errc::invalid_argument, "a pack has no owner and no identity");
+  }
   Bytes extra(blake3 ? 64 : 32, 0);
   extra[chunk_off::codec] = static_cast<std::uint8_t>(chunk.codec);
   store_le(extra.data() + chunk_off::uncompressed_size, chunk.uncompressed_size);
   store_le(extra.data() + chunk_off::xxh3, chunk.xxh3);
   store_le(extra.data() + chunk_off::inode, inode);
   store_le(extra.data() + chunk_off::file_offset, file_offset);
-  std::uint8_t flags = 0;
+  std::uint8_t flags = pack ? data_chunk_flags::pack : 0;
   if (blake3) {
     std::memcpy(extra.data() + chunk_off::blake3, blake3->data(), blake3->size());
     flags |= data_chunk_flags::has_blake3;
@@ -158,6 +162,8 @@ DataChunkInfo parse_data_chunk(const Record& r) {
     std::memcpy(id.data(), e + chunk_off::blake3, id.size());
     info.blake3 = id;
   }
+  info.pack = r.header.flags & data_chunk_flags::pack;
+  if (info.pack && (has_id || info.inode || info.file_offset)) corrupt_at(r.offset, "bad pack header");
   if (info.uncompressed_size > (std::uint32_t{1} << kMaxChunkShift)) {
     corrupt_at(r.offset, "chunk larger than the maximum chunk size");
   }

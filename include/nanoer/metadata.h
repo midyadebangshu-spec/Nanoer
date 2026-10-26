@@ -36,8 +36,20 @@ struct ChunkRef {
   std::uint64_t offset = 0;       // absolute offset of its data chunk record
   std::uint32_t stored_size = 0;  // bytes the record occupies (for space accounting)
   std::uint32_t size = 0;         // uncompressed bytes
+  // With shared records (docs/format.md §8):
+  std::uint32_t piece = 0;  // packs: where this chunk's bytes start in the pack
+  bool packed = false;      // the record is a pack of several small files' data
+  std::uint64_t hash = 0;   // dedup key of the data (hash_key()); 0: none
   bool operator==(const ChunkRef&) const = default;
 };
+
+// The dedup key: the first 8 bytes of the data's BLAKE3, little-endian.
+// Equal keys are only a hint; the full BLAKE3 is in the record.
+inline std::uint64_t hash_key(const std::uint8_t* blake3) {
+  std::uint64_t k = 0;
+  for (int i = 7; i >= 0; --i) k = (k << 8) | blake3[i];
+  return k;
+}
 
 struct InodeAttrs {
   InodeId id = 0;
@@ -81,28 +93,35 @@ struct PutInode { InodeAttrs attrs; };  // create, or replace the attributes
 struct DeleteInode { InodeId ino; };    // and all its chunks and xattrs
 struct SetEntry { InodeId dir; std::string name; InodeId ino; };  // add or replace
 struct RemoveEntry { InodeId dir; std::string name; };
-struct SetChunk { InodeId ino; std::uint64_t index; ChunkRef ref; };
+struct SetChunk { InodeId ino; std::uint64_t index; ChunkRef ref; };  // a new record
 struct RemoveChunk { InodeId ino; std::uint64_t index; };
 struct TruncateChunks { InodeId ino; std::uint64_t first_index; };  // remove index >= first
 struct SetXattr { InodeId ino; std::string name; Bytes value; };
 struct RemoveXattr { InodeId ino; std::string name; };
+// Shared records only. Like SetChunk, with the extra fields of ChunkRef; with
+// `share`, `ref` is a record that is already referenced (dedup), and gains a
+// reference instead of being counted as new space.
+struct SetChunkRef { InodeId ino; std::uint64_t index; ChunkRef ref; bool share = false; };
 }  // namespace op
 
 using Op = std::variant<op::PutInode, op::DeleteInode, op::SetEntry, op::RemoveEntry,
                         op::SetChunk, op::RemoveChunk, op::TruncateChunks, op::SetXattr,
-                        op::RemoveXattr>;
+                        op::RemoveXattr, op::SetChunkRef>;
 
 void encode_op(Encoder& out, const Op& op);
 Op decode_op(Decoder& in);
 
 class Metadata {
  public:
-  Metadata(std::uint64_t data_start, unsigned segment_shift)
-      : data_start_(data_start), segment_shift_(segment_shift) {}
+  // `shared_records`: the filesystem has that feature (records may be shared
+  // or be packs); otherwise SetChunkRef is invalid and checkpoints use the
+  // version 1 encoding.
+  Metadata(std::uint64_t data_start, unsigned segment_shift, bool shared_records = false)
+      : data_start_(data_start), segment_shift_(segment_shift), shared_records_(shared_records) {}
 
   // A new filesystem: just the root directory.
   static Metadata empty(std::uint64_t data_start, unsigned segment_shift, std::uint32_t uid,
-                        std::uint32_t gid, std::int64_t now_ns);
+                        std::uint32_t gid, std::int64_t now_ns, bool shared_records = false);
 
   // Applies one change. Throws Error(corrupt) if it does not fit the current
   // state (during replay that means the log is damaged).
@@ -118,22 +137,37 @@ class Metadata {
   // A complete snapshot, for checkpoints (docs/format.md §9).
   Bytes encode_checkpoint() const;
   static Metadata decode_checkpoint(ByteView data, std::uint64_t data_start,
-                                    unsigned segment_shift);
+                                    unsigned segment_shift, bool shared_records = false);
+
+  // Whether a snapshot stream (or its first bytes) uses the version 2
+  // encoding, which only filesystems with shared records write.
+  static bool is_v2_checkpoint(ByteView stream_start);
+
+  bool shared_records() const { return shared_records_; }
+  // References to the record at `ref.offset` (1 unless listed in `shared`).
+  std::uint32_t references(const ChunkRef& ref) const;
 
   bool operator==(const Metadata&) const = default;
 
   std::unordered_map<InodeId, Inode> inodes;
   // Every segment not free: holds log records, live data, or both.
   std::map<std::uint64_t, SegmentUsage> segments;
+  // Every pack, and every other record with more than one reference: record
+  // offset -> number of references. Any other referenced record has one.
+  // A record's space is counted once, however many references it has.
+  std::unordered_map<std::uint64_t, std::uint32_t> shared;
   InodeId next_inode = kRootInode + 1;
   std::uint64_t last_txid = 0;  // the last transaction applied
 
  private:
   void release(const ChunkRef& ref);
   void claim(const ChunkRef& ref);
+  void add_ref(const ChunkRef& ref, bool share);
+  void drop_ref(const ChunkRef& ref);
 
   std::uint64_t data_start_;
   unsigned segment_shift_;
+  bool shared_records_;
 };
 
 }  // namespace nanoer

@@ -184,6 +184,35 @@ TEST(Fsck, ChunkBorrowedFromAnotherFile) {
   expect_found_and_repaired(*store, "belongs to another file");
 }
 
+TEST(Fsck, SharingDataWithoutAnIdentity) {
+  // Only data with a BLAKE3 identity may be shared (dedup); other data
+  // belongs to the file it was written for.
+  auto store = sample();
+  inject(*store, [](const Metadata& m) {
+    const Inode& a = *m.find(find(m, kRootInode, "a"));
+    InodeId x = find(m, find(m, kRootInode, "d"), "x");
+    return std::vector<Op>{op::SetChunkRef{x, 0, a.chunks.at(0), true}};
+  });
+  expect_found_and_repaired(*store, "belongs to another file");
+}
+
+TEST(Fsck, FilesystemWithoutSharedRecords) {
+  // As M3 made them: still mounts, works and checks clean.
+  MemStore store(32 << 20);
+  make_filesystem(store, {.segment_shift = 20, .chunk_shift = 14, .shared_records = false});
+  {
+    auto fs = Filesystem::mount(store, options());
+    InodeId a = fs->mknod(kRootInode, "a", S_IFREG | 0644, 0, {}).ino;
+    fs->write(a, 0, data_for(1));
+  }
+  EXPECT_FALSE(has_shared_records(load_superblock(store).sb));
+  EXPECT_EQ(check(store, true).exit_code(), 0);
+  auto fs = Filesystem::mount(store, options());
+  Bytes back(40000);
+  EXPECT_EQ(fs->read(fs->lookup(kRootInode, "a").ino, 0, back), back.size());
+  EXPECT_EQ(back, data_for(1));
+}
+
 TEST(Fsck, DamagedChunkHeaderAndPayload) {
   auto store = sample();
   // Find the chunk records first: a scan stops at the first damaged record.

@@ -7,6 +7,7 @@
 
 #include "nanoer/encoding.h"
 #include "nanoer/error.h"
+#include "nanoer/io.h"
 
 namespace nanoer {
 namespace {
@@ -22,9 +23,20 @@ enum class OpCode : std::uint8_t {
   truncate_chunks = 7,
   set_xattr = 8,
   remove_xattr = 9,
+  set_chunk_ref = 10,  // shared records only
 };
 
+// Flags of set_chunk_ref and of version 2 checkpoint chunks.
+namespace ref_flags {
+constexpr std::uint64_t packed = 0x1;  // followed by the piece offset
+constexpr std::uint64_t hash = 0x2;    // followed by the 8-byte dedup key
+constexpr std::uint64_t share = 0x4;   // set_chunk_ref: a reference to an existing record;
+                                       // checkpoint: the record has several references
+constexpr std::uint64_t known = packed | hash | share;
+}  // namespace ref_flags
+
 constexpr char kCheckpointMagic[8] = {'N', 'N', 'R', 'C', 'K', 'P', 'T', '1'};
+constexpr char kCheckpointMagicV2[8] = {'N', 'N', 'R', 'C', 'K', 'P', 'T', '2'};
 
 [[noreturn]] void corrupt(const std::string& what) {
   throw Error(Errc::corrupt, "metadata: " + what);
@@ -86,6 +98,36 @@ ChunkRef decode_ref(Decoder& in) {
   r.offset = in.varint();
   r.stored_size = u32(in.varint());
   r.size = u32(in.varint());
+  return r;
+}
+
+// The extended form: flags, the three fields above, then what the flags say.
+void encode_ref_ex(Encoder& out, const ChunkRef& r, bool share) {
+  std::uint64_t flags = (r.packed ? ref_flags::packed : 0) | (r.hash ? ref_flags::hash : 0) |
+                        (share ? ref_flags::share : 0);
+  out.varint(flags);
+  encode_ref(out, r);
+  if (r.packed) out.varint(r.piece);
+  if (r.hash) {
+    std::uint8_t key[8];
+    store_le(key, r.hash);
+    out.raw(ByteView(key, 8));
+  }
+}
+
+ChunkRef decode_ref_ex(Decoder& in, bool& share) {
+  std::uint64_t flags = in.varint();
+  if (flags & ~ref_flags::known) corrupt("unknown chunk flags");
+  ChunkRef r = decode_ref(in);
+  if (flags & ref_flags::packed) {
+    r.packed = true;
+    r.piece = u32(in.varint());
+  }
+  if (flags & ref_flags::hash) {
+    r.hash = load_le<std::uint64_t>(in.raw(8).data());
+    if (r.hash == 0) corrupt("zero dedup key");
+  }
+  share = flags & ref_flags::share;
   return r;
 }
 
@@ -152,6 +194,12 @@ void encode_op(Encoder& out, const Op& op) {
                    out.varint(o.ino);
                    out.str(o.name);
                  },
+                 [&](const op::SetChunkRef& o) {
+                   out.u8(static_cast<std::uint8_t>(OpCode::set_chunk_ref));
+                   out.varint(o.ino);
+                   out.varint(o.index);
+                   encode_ref_ex(out, o.ref, o.share);
+                 },
              },
              op);
 }
@@ -191,6 +239,13 @@ Op decode_op(Decoder& in) {
       InodeId ino = in.varint();
       return op::RemoveXattr{ino, in.str(kMaxXattrNameLength)};
     }
+    case OpCode::set_chunk_ref: {
+      InodeId ino = in.varint();
+      std::uint64_t index = in.varint();
+      bool share = false;
+      ChunkRef ref = decode_ref_ex(in, share);
+      return op::SetChunkRef{ino, index, ref, share};
+    }
   }
   corrupt("unknown operation");
 }
@@ -198,8 +253,8 @@ Op decode_op(Decoder& in) {
 // ---- Metadata --------------------------------------------------------------
 
 Metadata Metadata::empty(std::uint64_t data_start, unsigned segment_shift, std::uint32_t uid,
-                         std::uint32_t gid, std::int64_t now_ns) {
-  Metadata m(data_start, segment_shift);
+                         std::uint32_t gid, std::int64_t now_ns, bool shared_records) {
+  Metadata m(data_start, segment_shift, shared_records);
   Inode root;
   root.id = kRootInode;
   root.mode = S_IFDIR | 0755;
@@ -237,6 +292,51 @@ void Metadata::release(const ChunkRef& ref) {
   it->second.live_bytes -= ref.stored_size;
 }
 
+std::uint32_t Metadata::references(const ChunkRef& ref) const {
+  auto it = shared.find(ref.offset);
+  return it == shared.end() ? 1 : it->second;
+}
+
+// A record's space is claimed by its first reference and released by its
+// last. Only packs and records referenced more than once are counted.
+void Metadata::add_ref(const ChunkRef& ref, bool share) {
+  if ((ref.packed || share || ref.hash) && !shared_records_) {
+    corrupt("shared records on a filesystem without that feature");
+  }
+  if (ref.packed) {
+    if (share) corrupt("a pack piece marked as shared");
+    auto [it, first] = shared.try_emplace(ref.offset, 0);
+    if (first) claim(ref);
+    if (it->second == UINT32_MAX) corrupt("too many references to one record");
+    ++it->second;
+  } else if (share) {
+    auto [it, first] = shared.try_emplace(ref.offset, 1);
+    if (it->second == UINT32_MAX) corrupt("too many references to one record");
+    ++it->second;
+  } else {
+    if (shared.contains(ref.offset)) corrupt("a new chunk at a location already in use");
+    claim(ref);
+  }
+}
+
+void Metadata::drop_ref(const ChunkRef& ref) {
+  auto it = shared.find(ref.offset);
+  if (it == shared.end()) {
+    if (ref.packed) corrupt("a pack piece of an unknown pack");
+    release(ref);
+    return;
+  }
+  --it->second;
+  if (ref.packed) {
+    if (it->second == 0) {
+      shared.erase(it);
+      release(ref);
+    }
+  } else if (it->second <= 1) {
+    shared.erase(it);  // one reference left: no longer counted
+  }
+}
+
 void Metadata::apply(const Op& op) {
   auto need = [&](InodeId ino) -> Inode& {
     Inode* inode = find(ino);
@@ -265,7 +365,7 @@ void Metadata::apply(const Op& op) {
           [&](const op::DeleteInode& o) {
             if (o.ino == kRootInode) corrupt("deleting the root directory");
             Inode& inode = need(o.ino);
-            for (const auto& [index, ref] : inode.chunks) release(ref);
+            for (const auto& [index, ref] : inode.chunks) drop_ref(ref);
             inodes.erase(o.ino);
           },
           [&](const op::SetEntry& o) {
@@ -280,11 +380,22 @@ void Metadata::apply(const Op& op) {
             dir.entries.erase(it);
           },
           [&](const op::SetChunk& o) {
+            if (o.ref.packed || o.ref.piece || o.ref.hash) corrupt("extended chunk fields in SetChunk");
             Inode& file = need_file(o.ino);
             auto [it, inserted] = file.chunks.try_emplace(o.index, o.ref);
-            claim(o.ref);
+            add_ref(o.ref, false);
             if (!inserted) {
-              release(it->second);
+              drop_ref(it->second);
+              it->second = o.ref;
+            }
+          },
+          [&](const op::SetChunkRef& o) {
+            if (!o.ref.packed && o.ref.piece) corrupt("a piece offset outside a pack");
+            Inode& file = need_file(o.ino);
+            auto [it, inserted] = file.chunks.try_emplace(o.index, o.ref);
+            add_ref(o.ref, o.share);
+            if (!inserted) {
+              drop_ref(it->second);
               it->second = o.ref;
             }
           },
@@ -292,13 +403,13 @@ void Metadata::apply(const Op& op) {
             Inode& file = need_file(o.ino);
             auto it = file.chunks.find(o.index);
             if (it == file.chunks.end()) return;
-            release(it->second);
+            drop_ref(it->second);
             file.chunks.erase(it);
           },
           [&](const op::TruncateChunks& o) {
             Inode& file = need_file(o.ino);
             auto it = file.chunks.lower_bound(o.first_index);
-            for (auto i = it; i != file.chunks.end(); ++i) release(i->second);
+            for (auto i = it; i != file.chunks.end(); ++i) drop_ref(i->second);
             file.chunks.erase(it, file.chunks.end());
           },
           [&](const op::SetXattr& o) {
@@ -314,9 +425,14 @@ void Metadata::apply(const Op& op) {
 
 // ---- checkpoints -----------------------------------------------------------
 
+bool Metadata::is_v2_checkpoint(ByteView stream_start) {
+  return stream_start.size() >= 8 && std::memcmp(stream_start.data(), kCheckpointMagicV2, 8) == 0;
+}
+
 Bytes Metadata::encode_checkpoint() const {
   Encoder out;
-  out.raw(ByteView(reinterpret_cast<const std::uint8_t*>(kCheckpointMagic), 8));
+  out.raw(ByteView(
+      reinterpret_cast<const std::uint8_t*>(shared_records_ ? kCheckpointMagicV2 : kCheckpointMagic), 8));
   out.varint(last_txid);
   out.varint(next_inode);
   out.varint(segments.size());
@@ -337,7 +453,13 @@ Bytes Metadata::encode_checkpoint() const {
     out.varint(inode.chunks.size());
     for (const auto& [index, ref] : inode.chunks) {
       out.varint(index);
-      encode_ref(out, ref);
+      if (shared_records_) {
+        // "share" marks a record with several references, so that loading
+        // counts only those.
+        encode_ref_ex(out, ref, !ref.packed && shared.contains(ref.offset));
+      } else {
+        encode_ref(out, ref);
+      }
     }
     out.varint(inode.entries.size());
     for (const auto& [name, ino] : inode.entries) {
@@ -354,10 +476,13 @@ Bytes Metadata::encode_checkpoint() const {
 }
 
 Metadata Metadata::decode_checkpoint(ByteView data, std::uint64_t data_start,
-                                     unsigned segment_shift) {
+                                     unsigned segment_shift, bool shared_records) {
   Decoder in(data);
-  if (std::memcmp(in.raw(8).data(), kCheckpointMagic, 8) != 0) corrupt("not a checkpoint");
-  Metadata m(data_start, segment_shift);
+  ByteView magic = in.raw(8);
+  bool v2 = std::memcmp(magic.data(), kCheckpointMagicV2, 8) == 0;
+  if (!v2 && std::memcmp(magic.data(), kCheckpointMagic, 8) != 0) corrupt("not a checkpoint");
+  if (v2 && !shared_records) corrupt("checkpoint with shared records on a filesystem without them");
+  Metadata m(data_start, segment_shift, shared_records);
   m.last_txid = in.varint();
   m.next_inode = in.varint();
 
@@ -370,6 +495,13 @@ Metadata Metadata::decode_checkpoint(ByteView data, std::uint64_t data_start,
     if (!m.segments.emplace(index, SegmentUsage{seq, 0}).second) corrupt("duplicate segment");
   }
 
+  // Records with several references, and packs: their references are
+  // counted here, and their space claimed once at the end.
+  struct Counted {
+    ChunkRef ref;
+    std::uint32_t count = 0;
+  };
+  std::unordered_map<std::uint64_t, Counted> counted;
   std::uint64_t inode_count = in.varint();
   for (std::uint64_t i = 0; i < inode_count; ++i) {
     Inode inode;
@@ -377,8 +509,19 @@ Metadata Metadata::decode_checkpoint(ByteView data, std::uint64_t data_start,
     std::uint64_t chunks = in.varint();
     for (std::uint64_t c = 0; c < chunks; ++c) {
       std::uint64_t index = in.varint();
-      ChunkRef ref = decode_ref(in);
-      m.claim(ref);
+      bool share = false;
+      ChunkRef ref = v2 ? decode_ref_ex(in, share) : decode_ref(in);
+      if (!ref.packed && ref.piece) corrupt("a piece offset outside a pack");
+      if (ref.packed || share) {
+        auto it = counted.try_emplace(ref.offset, Counted{ref, 0}).first;
+        if (it->second.ref.stored_size != ref.stored_size || it->second.ref.packed != ref.packed) {
+          corrupt("references to one record disagree");
+        }
+        if (it->second.count == UINT32_MAX) corrupt("too many references to one record");
+        ++it->second.count;
+      } else {
+        m.claim(ref);
+      }
       if (!inode.chunks.emplace(index, ref).second) corrupt("duplicate chunk");
     }
     std::uint64_t entries = in.varint();
@@ -397,6 +540,11 @@ Metadata Metadata::decode_checkpoint(ByteView data, std::uint64_t data_start,
     if (!m.inodes.emplace(id, std::move(inode)).second) corrupt("duplicate inode");
   }
   if (!in.done()) corrupt("trailing bytes in checkpoint");
+  for (const auto& [offset, c] : counted) {
+    if (!c.ref.packed && c.count < 2) corrupt("a record marked shared has one reference");
+    m.claim(c.ref);
+    m.shared.emplace(offset, c.count);
+  }
 
   // Cross-checks: every reference resolves, and the space accounting that
   // was recorded matches what the chunks add up to.

@@ -1,12 +1,15 @@
-// Damaged or hostile on-disk structures: superblocks, segment headers and
-// records must be rejected cleanly, never crash.
+// Damaged or hostile on-disk structures: superblocks, segment headers,
+// records, checkpoint snapshots and metadata operations must be rejected
+// cleanly, never crash.
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
 
+#include "nanoer/encoding.h"
 #include "nanoer/error.h"
 #include "nanoer/format.h"
 #include "nanoer/io.h"
+#include "nanoer/metadata.h"
 #include "nanoer/record.h"
 #include "nanoer/segment.h"
 
@@ -46,6 +49,23 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
       }
     }
     offset += record->stored_size();
+  }
+
+  // A checkpoint snapshot, with and without shared records. One that is
+  // accepted must encode to a snapshot that decodes to the same state.
+  for (bool shared : {false, true}) {
+    try {
+      nanoer::Metadata m = nanoer::Metadata::decode_checkpoint(input, nanoer::kDataStart, 20, shared);
+      nanoer::Bytes again = m.encode_checkpoint();
+      if (!(nanoer::Metadata::decode_checkpoint(again, nanoer::kDataStart, 20, shared) == m)) {
+        __builtin_trap();
+      }
+      // Then the input, read as operations, applied to it.
+      nanoer::Decoder ops(input);
+      while (!ops.done()) m.apply(nanoer::decode_op(ops));
+    } catch (const nanoer::Error& e) {
+      if (e.code() != nanoer::Errc::corrupt) __builtin_trap();
+    }
   }
   return 0;
 }
