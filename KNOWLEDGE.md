@@ -986,6 +986,12 @@ table fallback that processes 8 bytes per step.
 - **Lesson:** the crash workload at first never reused a segment, so the
   most delicate code (reuse) was never crash-tested. The workload now
   asserts that reuse happened.
+- **Lesson:** a test workload that called `pick()` twice in one argument
+  list ran a different workload under Clang than under GCC: the order in
+  which arguments are evaluated is unspecified (GCC goes right to left).
+  An assertion about the workload's shape held for one and not the other.
+  One random draw per statement keeps generated workloads the same
+  everywhere.
 - **Lesson:** the image fuzzer found, within minutes, a case no hand-written
   test had: on a small store, freeing segments at mount had destroyed the
   older checkpoint, so a damaged newest superblock made the filesystem
