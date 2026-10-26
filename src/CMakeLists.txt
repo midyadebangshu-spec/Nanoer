@@ -7,6 +7,7 @@ add_library(nanoer_core STATIC
   core/error.cpp
   core/format.cpp
   core/fs.cpp
+  core/gc.cpp
   core/io.cpp
   core/journal.cpp
   core/metadata.cpp

@@ -26,6 +26,10 @@ constexpr std::uint64_t kAttrOpBytes = 64;  // rough encoded size of a PutInode
 // Segments normal writes never use: room for a checkpoint (which is what
 // frees space) and for continuing the log at the next mount.
 constexpr std::uint64_t kMinReserveSegments = 3;
+// And some that only garbage collection may use, so that it can always copy
+// live data out of a victim, and write the checkpoints that free it, even
+// when the filesystem is full.
+constexpr std::uint64_t kGcHeadroomSegments = 2;
 
 std::int64_t now() { return static_cast<std::int64_t>(now_ns()); }
 
@@ -58,7 +62,7 @@ Filesystem::Filesystem(Store& store, const Superblock& sb, ReplayResult replayed
       checkpoint_bytes_(replayed.checkpoint_bytes),
       meta_(std::move(replayed.meta)),
       cache_(options.safe_space) {
-  last_commit_ns_ = last_checkpoint_ns_ = now();
+  last_commit_ns_ = last_checkpoint_ns_ = last_change_ns_ = now();
 }
 
 std::unique_ptr<Filesystem> Filesystem::mount(Store& store, const Options& options) {
@@ -141,7 +145,7 @@ std::unique_ptr<Filesystem> Filesystem::mount(Store& store, const Options& optio
   if (!fs->read_only_) {
     std::unique_lock lock(fs->mutex_);
     fs->journal_->resume(end);
-    fs->journal_->set_reserve(kMinReserveSegments);
+    fs->journal_->set_reserve(kMinReserveSegments + kGcHeadroomSegments, kGcHeadroomSegments);
     // Files deleted while still open when the system went down.
     std::vector<InodeId> orphans;
     for (const auto& [id, inode] : fs->meta_.inodes) {
@@ -193,6 +197,11 @@ void Filesystem::background() {
       maybe_checkpoint();
     } catch (const std::exception& e) {
       log_error("background commit failed", e);
+    }
+    try {
+      background_gc();
+    } catch (const std::exception& e) {
+      log_error("garbage collection failed", e);
     }
     wait_lock.lock();
   }
@@ -254,6 +263,7 @@ void Filesystem::check_writable() const {
 
 void Filesystem::record(Op op) {
   meta_.apply(op);
+  if (!in_gc_) last_change_ns_ = now();
   Encoder size;
   encode_op(size, op);
   pending_bytes_ += size.size();
@@ -261,6 +271,7 @@ void Filesystem::record(Op op) {
 }
 
 void Filesystem::mark(InodeId ino) {
+  last_change_ns_ = now();
   if (dirty_inodes_.insert(ino).second) pending_bytes_ += kAttrOpBytes;
 }
 
@@ -405,14 +416,43 @@ void Filesystem::admit(std::uint64_t bytes) {
   // Conservative: dirty data is counted uncompressed, at a full chunk each.
   const std::uint64_t per_chunk = sb_.chunk_size() + kDataChunkHeaderSize;
   auto needed = [&] { return dirty_chunks_ * per_chunk + pending_bytes_ + bytes + (64 << 10); };
-  if (needed() <= available_bytes()) return;
-  // Write out what is waiting, then free dead segments: they are released
-  // by one checkpoint and become free at the next.
+  auto short_by = [&] { return needed() > available_bytes() ? needed() - available_bytes() : 0; };
+  if (short_by() == 0) return;
+  // Write out what is waiting, then free dead segments: they are released by
+  // one checkpoint and become free at the next. Checkpoints cost space too
+  // (they may leave a nearly full segment for a new one), so only when they
+  // free something.
   commit();
-  checkpoint();
-  checkpoint();
-  if (needed() <= available_bytes()) return;
-  throw_posix(ENOSPC);
+  auto free_dead = [&] {
+    if (!checkpoints_free_space()) return;
+    checkpoint();
+    checkpoint();
+    gc_emptied_ = 0;
+  };
+  free_dead();
+  // Then collect garbage: copy the live data out of the emptiest segments
+  // until what they hold covers the need, and free them the same way.
+  const std::uint64_t usable = sb_.segment_size() - kSegmentHeaderSize - kSealRecordSize;
+  const GcPolicy urgent{.greedy = true, .max_utilization = 0.97};
+  for (int round = 0; round < 8 && short_by() > 0; ++round) {
+    std::uint64_t emptied = gc_emptied_;
+    bool moved = false;
+    for (int step = 0; step < 64 && (gc_emptied_ - emptied) * usable < short_by(); ++step) {
+      if (!gc_step_locked(urgent, true)) break;
+      moved = true;
+    }
+    if (!moved && !checkpoints_free_space()) break;
+    free_dead();
+  }
+  if (short_by() > 0) throw_posix(ENOSPC);
+}
+
+bool Filesystem::checkpoints_free_space() const {
+  if (journal_->pending_free_segments() > 0) return true;
+  for (const auto& [index, usage] : meta_.segments) {
+    if (usage.live_bytes == 0 && index != journal_->current_index()) return true;
+  }
+  return false;
 }
 
 void Filesystem::maybe_commit() {
@@ -519,7 +559,8 @@ void Filesystem::checkpoint() {
     // Keep room for the next checkpoint (it grows with the metadata).
     std::uint64_t usable = sb_.segment_size() - kSegmentHeaderSize - kSealRecordSize;
     checkpoint_bytes_ = meta_.encode_checkpoint().size();
-    journal_->set_reserve(kMinReserveSegments + (checkpoint_bytes_ * 3 / 2 + usable - 1) / usable);
+    journal_->set_reserve(kMinReserveSegments + kGcHeadroomSegments + (checkpoint_bytes_ * 3 / 2 + usable - 1) / usable,
+                          kGcHeadroomSegments);
   } catch (const std::exception& e) {
     in_checkpoint_ = false;
     failed_ = true;
@@ -1086,6 +1127,8 @@ FsInfo Filesystem::info() {
   info.read_errors = read_errors_;
   info.log_damaged = damage_.found;
   info.checkpoint_fallback = checkpoint_fallback_;
+  info.segment_bytes = sb_.segment_size() - kSegmentHeaderSize - kSealRecordSize;
+  info.gc = gc_stats_;
   return info;
 }
 

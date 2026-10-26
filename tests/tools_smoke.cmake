@@ -61,6 +61,16 @@ if(pos EQUAL -1)
   message(FATAL_ERROR "fsck --repair did not rewrite the damaged superblock:\n${OUTPUT}")
 endif()
 
+# gc: compacts an unmounted filesystem (nothing to do on a new one), and the
+# result checks clean.
+run(TRUE "${NANOER}" gc "${IMG}")
+string(FIND "${OUTPUT}" "segments emptied" pos)
+if(pos EQUAL -1)
+  message(FATAL_ERROR "nanoer gc did not report:\n${OUTPUT}")
+endif()
+run(FALSE "${NANOER}" gc --max-full 200 "${IMG}")
+run_rc(0 "${NANOER}" fsck --deep "${IMG}")
+
 # Refuses to overwrite a filesystem without --force, and to clobber an existing file.
 run(FALSE "${MKFS}" "${IMG}")
 run(FALSE "${MKFS}" --size 512M "${IMG}")

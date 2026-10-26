@@ -56,9 +56,9 @@ struct Model {
 class ModelTest {
  public:
   explicit ModelTest(std::uint64_t seed) : rng_(seed) {
-    // Small segments: without M4's copying garbage collection, only segments
-    // whose data is entirely dead are reclaimed, and small ones get there
-    // sooner. The test must stay within capacity, not measure it.
+    // Small segments, so checkpoints free whole segments often and garbage
+    // collection has many to choose from. The test must stay within
+    // capacity, not measure it.
     store_ = std::make_unique<FaultStore>(96 << 20);
     make_filesystem(*store_, {.segment_shift = 20, .chunk_shift = 14});
     store_->flush();
@@ -87,6 +87,7 @@ class ModelTest {
       else if (choice < 85) punch();
       else if (choice < 93) read_check();
       else if (choice < 97) sync();
+      else if (choice < 98) collect();
       else if (choice < 99) remount();
       else crash();
       if (step % 50 == 0) compare();
@@ -316,6 +317,14 @@ class ModelTest {
   void sync() {
     fs_->sync();
     synced_ = model_;
+  }
+
+  // Garbage collection moves data but changes nothing visible; it commits
+  // what is waiting first, like a sync.
+  void collect() {
+    fs_->collect_garbage(0.9);
+    synced_ = model_;
+    compare();
   }
 
   void remount() {

@@ -13,6 +13,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <shared_mutex>
 #include <string>
 #include <string_view>
@@ -24,6 +25,7 @@
 #include "nanoer/bytes.h"
 #include "nanoer/cache.h"
 #include "nanoer/format.h"
+#include "nanoer/gc.h"
 #include "nanoer/journal.h"
 #include "nanoer/metadata.h"
 #include "nanoer/thread_pool.h"
@@ -91,6 +93,8 @@ struct FsInfo {
   std::uint64_t segments_in_use = 0;
   std::uint64_t segments_pending_free = 0;
   std::uint64_t segments_free = 0;
+  std::uint64_t segment_bytes = 0;  // data a segment holds
+  GcStats gc;                       // since mounting
   std::uint64_t last_txid = 0;
   std::uint64_t replayed_transactions = 0;  // at mount
   std::uint64_t log_bytes_since_checkpoint = 0;
@@ -115,6 +119,7 @@ class Filesystem {
     std::uint64_t checkpoint_bytes = 256 << 20;  // log written before a checkpoint
     unsigned checkpoint_interval_s = 300;    // ... or this long, if anything was written
     unsigned threads = 0;                    // compression threads; 0: one per CPU
+    unsigned gc_idle_s = 10;                 // background GC after this long without changes
     bool read_only = false;
     bool count_lookups = true;  // FUSE lookup counting (in-process users turn it off)
     bool start_threads = true;  // false: call start() later (after daemonizing)
@@ -167,11 +172,19 @@ class Filesystem {
 
   FsStats statfs();
   FsInfo info();
+
+  // Garbage collection until no segment at most `max_utilization` full is
+  // left, then the two checkpoints that free what it emptied (nanoer gc).
+  // Returns how many more segments are free than before. It also runs by
+  // itself: in the background, and before any ENOSPC.
+  std::uint64_t collect_garbage(double max_utilization = 0.9);
   bool read_only() const { return read_only_; }
   std::uint32_t chunk_size() const { return sb_.chunk_size(); }
   const Superblock& superblock() const { return sb_; }
 
  private:
+  friend struct FilesystemTestAccess;  // tests: GC steps one phase at a time
+
   Filesystem(Store& store, const Superblock& sb, ReplayResult replayed, const Options& options,
              bool read_only);
 
@@ -194,6 +207,7 @@ class Filesystem {
   void drop_dirty(InodeId ino, std::uint64_t first_index);
   void truncate(Inode& file, std::uint64_t size);
   void admit(std::uint64_t bytes);
+  bool checkpoints_free_space() const;  // two checkpoints would free a segment
   std::uint64_t available_bytes() const;
   void maybe_commit();
   void commit();
@@ -201,6 +215,34 @@ class Filesystem {
   void checkpoint();
   void stop_background();
   void background();
+
+  // Garbage collection (gc.cpp). A step chooses victims and their live
+  // records (shared lock), reads the records (no lock), then copies them
+  // and re-points what still points at them (unique lock).
+  struct GcItem {
+    struct User {
+      InodeId ino;
+      std::uint64_t index;
+      ChunkRef ref;
+    };
+    std::uint64_t offset;
+    std::uint64_t seq;    // of its segment, when chosen
+    std::uint64_t limit;  // where its segment ends
+    std::uint32_t stored_size;
+    std::vector<User> users;
+  };
+  struct GcPlan {
+    std::vector<GcVictim> victims;
+    std::vector<GcItem> items;  // in offset order
+  };
+  enum class GcNeed { none, idle, low_space };
+  GcNeed gc_need() const;  // shared lock is enough
+  GcPlan gc_plan(const GcPolicy& policy, bool urgent) const;  // shared lock is enough
+  std::vector<std::optional<Record>> gc_read(const GcPlan& plan);  // no lock needed
+  bool gc_apply(const GcPlan& plan, std::vector<std::optional<Record>>& records, bool urgent);
+  bool gc_step_locked(const GcPolicy& policy, bool urgent);
+  void gc_checkpoints(bool low_space);
+  void background_gc();
 
   Store& store_;
   Superblock sb_;
@@ -229,6 +271,11 @@ class Filesystem {
   bool in_checkpoint_ = false;
   std::int64_t last_commit_ns_ = 0;
   std::int64_t last_checkpoint_ns_ = 0;
+  std::int64_t last_change_ns_ = 0;  // by a user of the filesystem (not GC)
+  bool in_gc_ = false;
+  GcStats gc_stats_;
+  std::uint64_t gc_emptied_ = 0;  // segments GC emptied since the last checkpoints
+  std::set<std::pair<std::uint64_t, std::uint64_t>> gc_skip_;  // segments with damaged data
 
   std::mutex counts_mutex_;  // FUSE lookup and open counts
   std::unordered_map<InodeId, std::uint64_t> lookups_;

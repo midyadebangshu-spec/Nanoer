@@ -480,9 +480,10 @@ writes. One `fdatasync` at the end makes the whole commit durable.
   anything changes, conservatively (dirty data counted uncompressed at a
   full chunk each). If the check fails, Nanoer commits, writes two
   checkpoints to free released segments, and checks again before returning
-  `ENOSPC`. A **reserve** of segments (3, plus room for 1.5× the last
-  checkpoint) is never used by normal writes, so a checkpoint and the next
-  mount always have room. **Deletes, rmdir, removing xattrs and shrinking
+  `ENOSPC` (from M4: and collects garbage first, §7.12). A **reserve** of
+  segments (3, plus room for 1.5× the last checkpoint, plus 2 that only GC
+  may use, from M4) is never used by normal writes, so a checkpoint and the
+  next mount always have room. **Deletes, rmdir, removing xattrs and shrinking
   files skip the check**: they are how a full filesystem gets space back,
   and their transactions are tiny. If a filesystem is so full that mount
   cannot start a new segment, it mounts **read-only** with a warning rather
@@ -496,7 +497,7 @@ writes. One `fdatasync` at the end makes the whole commit durable.
   data fills it: in the model-based test, about 0.5 MB of live data held 16
   of 23 segments (4 MiB each). Workloads that write files once (copies,
   untar, builds) are unaffected; rewrite-heavy ones (databases, VM images)
-  need M4.
+  need M4. (M4's garbage collection removes this limit, §7.12.)
 
 ### 7.11 Crash safety, damage and `fsck` (M3)
 
@@ -589,6 +590,57 @@ codes follow e2fsck: 0 clean, 1 repaired, 4 errors left, 8 could not run.
 **How it is tested** (§12): every crash point of a workload, I/O errors at
 every point, crafted inconsistencies for each `fsck` repair, random damage,
 an image fuzzer, and `kill -9` on a real mount.
+
+### 7.12 Garbage collection (M4)
+
+**What it does.** It picks segments with little live data, copies their
+live records into the log, and re-points the chunks that refer to them;
+the existing release rule (§7.10) then frees the emptied segments after two
+checkpoints. Payloads are copied as they are, CRCs checked, nothing
+decompressed (recompressing cold data is M5's tiering). No format change:
+a copy is an ordinary data chunk record, and re-pointing is an ordinary
+transaction (SetChunk, or SetChunkRef for shared records and packs).
+
+**A step, in three phases**, so that foreground work waits as little as
+possible:
+
+1. under the shared lock: choose victims and list every chunk referring
+   into them (one pass over the metadata);
+2. with no lock: read the live records and check them;
+3. under the exclusive lock: append the copies and re-point only the
+   chunks that *still* refer to the old location, then commit.
+
+A victim's sequence number is noted in phase 1 and checked in phase 3: if
+the segment was freed and reused meanwhile, the step is dropped (and what
+was read is not even taken as damage). A chunk rewritten meanwhile keeps
+its new data; its copy is simply dead. (The plan said copies are *written*
+without the lock; appending to the log needs the lock, so only the reading
+is done without it.) Damaged records are left where they are, reported,
+the errors flag set, and that segment is not tried again in this mount.
+
+**Choosing victims.** Cost-benefit as in Sprite LFS, `(1 − u) × age /
+(1 + u)` with the sequence number as age, in the background; greedy (least
+live data) when space is short. Segments fuller than 75 % (idle), 80 %
+(background, low on space) or 97 % (before `ENOSPC`) are not worth copying.
+
+**When.** In the background when the filesystem has had no changes for
+10 s and more than 25 % of the space in use is dead, or when free segments
+fall below 15 %; before any `ENOSPC`; and offline with `nanoer gc`.
+
+**Space for GC itself** (found by the rewrite test, which failed three
+times on the way):
+
+- GC needs somewhere to copy to when the filesystem is full: **2 reserve
+  segments only GC may use** (with only one, the checkpoints after a round
+  could use it up).
+- **A step moves no more live data than there is room for its copies**: a
+  victim copied halfway frees nothing and wastes the room.
+- **Checkpoints only when they free something:** each may leave a nearly
+  full segment behind for a new one.
+
+Copies share the log with new writes, so hot and cold data mix in the same
+segments; separating them (as some log-structured systems do) is left for
+M5's tiering.
 
 ---
 
@@ -1087,6 +1139,21 @@ Release build, 4-core VM.
 Crash exploration is dominated by system time (building and mounting
 images in memory), so it parallelises poorly; nightly CI runs it whole.
 
+### 2026-10-26: garbage collection under random rewrites
+
+`Gc.RewritesNeverFillTheStore`: a 16 MiB store (15 segments of 1 MiB,
+6 reserved), 7 MiB of incompressible live data in 256 KiB files (≈78 % of
+what normal writes may use), then 160 MiB of random rewrites of 1–4 chunks
+of 16 KiB, debug build:
+
+| | |
+|---|---|
+| `ENOSPC` | never |
+| GC copied | 319 MiB: write amplification 3.0 (greedy, at ≈78 % utilisation) |
+| after `collect_garbage` | 9 segments in use for 7.06 segments of live data (1.27×) |
+
+Before M4 the same workload fails within one pass over the files.
+
 ### 2026-10-24: what M4's techniques could save on `/usr` (before M4)
 
 All regular files under `/usr` on the development VM (Ubuntu 24.04 with
@@ -1202,6 +1269,10 @@ rejected.
 | 2026-10-26 | Explicit "share" in the operation; reference counts kept only for packs and records with several references; checkpoints mark shared references | a reader needs no table of every record (≈40 bytes each) to tell a new record from a shared one; counts are rebuilt from the references at mount, never stored | a count for every record; deriving "already referenced" from a full set of locations |
 | 2026-10-26 | The 8-byte dedup key lives in each chunk reference (RAM and checkpoint) | dropping a reference can remove the index entry without another lookup table; 8 bytes per chunk | a separate location → key table; full 32-byte hashes |
 | 2026-10-26 | Header owner (inode, offset) checked only for data with no identity and not packed | data with an identity may be shared, and its first owner deleted | dropping the owner check (it catches misdirected references) |
+| 2026-10-26 | GC copies records verbatim and re-points with ordinary operations | no format change; crash safety is the same prefix rule as every write | a "move" operation (one per record, but a new format element) |
+| 2026-10-26 | GC reads without the lock and checks the victim's sequence number before applying | foreground work does not wait for GC's reads; a reused segment cannot slip through | holding the lock for the whole step |
+| 2026-10-26 | 2 reserve segments only GC may use; GC steps bounded by the room for copies; checkpoints only when they free space | measured: with 1 segment, or unbounded steps, or unconditional checkpoints, a full filesystem still returned `ENOSPC` | letting GC use the whole reserve (the checkpoints that free its victims need it) |
+| 2026-10-26 | Background GC thresholds: idle 10 s and 25 % dead, or under 15 % free | collects when nobody is waiting, or before space gets tight | GC only on demand (every full filesystem would stall on its next write) |
 
 ---
 

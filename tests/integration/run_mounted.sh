@@ -12,6 +12,8 @@
 #                       each, fsck must find it clean and every fsynced file
 #                       must be intact
 #   command CMD...      run any command with NANOER_TEST_DIR set
+# NANOER_MKFS_OPTS replaces the default "--size 8G" (say, a small store with
+# small segments, so garbage collection runs all the time).
 # Exits 77 (skipped) when FUSE is not usable here.
 set -euo pipefail
 
@@ -67,7 +69,8 @@ mount_fs() {
   return 1
 }
 
-"$BIN/mkfs.nanoer" --size 8G "$IMG" >/dev/null
+# shellcheck disable=SC2086  # word splitting of the options is intended
+"$BIN/mkfs.nanoer" ${NANOER_MKFS_OPTS:---size 8G} "$IMG" >/dev/null
 mount_fs
 
 case "$MODE" in
@@ -106,16 +109,23 @@ case "$MODE" in
       python3 "$WRITER" write "$MNT" "$LOG" "$round" &
       writer=$!
       # Load nobody checks, except fsck: more kinds of operation in flight.
+      # KILL_LOAD picks which (default: all).
       load=()
-      # (In a subshell: its mmap dies with SIGBUS when the mount goes away,
-      # and the shell would report that.)
-      ("$BIN/nanoer-fsx" -N 100000000 -S "$round" "$MNT/load-$round.fsx"; true) >/dev/null 2>&1 &
-      load+=($!)
-      (mkdir -p "$MNT/load-$round" && tar -C /usr -cf - include | tar -C "$MNT/load-$round" -xf -) \
-        >/dev/null 2>&1 &
-      load+=($!)
-      build "$MNT/load-$round/build" >/dev/null 2>&1 &
-      load+=($!)
+      if [[ " ${KILL_LOAD:-fsx tar build} " == *" fsx "* ]]; then
+        # (In a subshell: its mmap dies with SIGBUS when the mount goes away,
+        # and the shell would report that.)
+        ("$BIN/nanoer-fsx" -N 100000000 -S "$round" "$MNT/load-$round.fsx"; true) >/dev/null 2>&1 &
+        load+=($!)
+      fi
+      if [[ " ${KILL_LOAD:-fsx tar build} " == *" tar "* ]]; then
+        (mkdir -p "$MNT/load-$round" && tar -C /usr -cf - include | tar -C "$MNT/load-$round" -xf -) \
+          >/dev/null 2>&1 &
+        load+=($!)
+      fi
+      if [[ " ${KILL_LOAD:-fsx tar build} " == *" build "* ]]; then
+        build "$MNT/load-$round/build" >/dev/null 2>&1 &
+        load+=($!)
+      fi
       # A random moment: between commits, mid-write, mid-checkpoint.
       sleep "$(awk -v r="$RANDOM" 'BEGIN { printf "%.2f", 1 + r % 300 / 100 }')"
       kill -9 "$PID"
@@ -123,8 +133,10 @@ case "$MODE" in
       PID=
       fusermount3 -u -z "$MNT" 2>/dev/null || umount -l "$MNT" 2>/dev/null || true
       wait "$writer" || true
-      kill "${load[@]}" 2>/dev/null || true
-      wait "${load[@]}" 2>/dev/null || true
+      if [ ${#load[@]} -gt 0 ]; then
+        kill "${load[@]}" 2>/dev/null || true
+        wait "${load[@]}" 2>/dev/null || true
+      fi
       if ! "$BIN/nanoer" fsck --deep "$IMG"; then
         echo "round $round: fsck found errors after kill -9"
         exit 1

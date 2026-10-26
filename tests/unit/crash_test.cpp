@@ -173,8 +173,10 @@ std::string dump(Filesystem& fs) {
 
 // A mix of everything a filesystem does, with a sync after every few steps.
 // Large enough to fill segments many times over in a small store, so seals,
-// checkpoints and segment reuse all happen. Throws on the first error.
-void workload(Filesystem& fs, const std::function<void()>& synced) {
+// checkpoints and segment reuse all happen. With `gc`, garbage collection
+// runs after some syncs (it changes nothing visible). Throws on the first
+// error.
+void workload(Filesystem& fs, const std::function<void()>& synced, bool gc = false) {
   std::mt19937_64 rng(42);
   auto pick = [&](std::uint64_t n) { return rng() % n; };
   std::vector<std::string> names = {"a", "b", "c", "d", "e", "f"};
@@ -226,6 +228,7 @@ void workload(Filesystem& fs, const std::function<void()>& synced) {
     if (step % 4 == 3) {
       fs.sync();
       synced();
+      if (gc && step % 24 == 23) fs.collect_garbage(0.97);
     }
   }
 }
@@ -242,7 +245,7 @@ Bytes fresh_image() {
   return store.image();
 }
 
-Recording record_workload() {
+Recording record_workload(bool gc = false) {
   Recording r;
   r.store = std::make_unique<RecordingStore>(fresh_image());
   auto fs = Filesystem::mount(*r.store, options());
@@ -251,8 +254,14 @@ Recording record_workload() {
   workload(*fs, [&] {
     r.states.push_back(dump(*fs));
     r.synced_after.push_back(r.store->events().size());
-  });
+  }, gc);
   FsInfo info = fs->info();
+  if (gc) {
+    std::cout << "[ crash ] GC copied " << info.gc.records_copied << " records, emptied "
+              << info.gc.segments_emptied << " segments\n";
+    EXPECT_GT(info.gc.records_copied, 100u) << "the workload must make GC move data";
+    EXPECT_GE(info.gc.segments_emptied, 2u);
+  }
   // A segment is (re)started when its header block is written.
   const Superblock& sb = fs->superblock();
   std::size_t starts = 0;
@@ -266,7 +275,8 @@ Recording record_workload() {
             << r.states.size() - 1 << " syncs, " << starts << " segment starts in " << used.size()
             << " distinct segments, " << info.files << " files\n";
   EXPECT_GT(starts, used.size()) << "the workload must reuse segments";
-  EXPECT_GE(used.size(), 3u) << "the workload must cross segments";
+  // (GC keeps the data compact: it needs fewer distinct segments.)
+  EXPECT_GE(used.size(), gc ? 2u : 3u) << "the workload must cross segments";
   fs->abandon();  // no unmount: the crash points are what matter
   return r;
 }
@@ -316,10 +326,9 @@ std::size_t syncs_done(const Recording& r, std::size_t events) {
   return k;
 }
 
-}  // namespace
 
-TEST(Crash, EveryCrashPointRecoversARealState) {
-  Recording r = record_workload();
+// Every crash point (sampled, or all with NANOER_EXHAUSTIVE) of a recording.
+void explore(const Recording& r) {
   const auto& events = r.store->events();
   ASSERT_GT(r.states.size(), 20u);
   ASSERT_GT(events.size(), 200u) << "the workload should write a lot";
@@ -368,6 +377,12 @@ TEST(Crash, EveryCrashPointRecoversARealState) {
   std::cout << "[ crash ] " << images << " crash images checked over " << events.size()
             << " writes and flushes, " << r.states.size() << " syncs\n";
 }
+
+}  // namespace
+
+TEST(Crash, EveryCrashPointRecoversARealState) { explore(record_workload()); }
+
+TEST(Crash, GarbageCollectionIsCrashSafe) { explore(record_workload(true)); }
 
 TEST(Crash, CrashesDuringMountAreSafeToo) {
   Recording r = record_workload();

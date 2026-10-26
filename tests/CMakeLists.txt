@@ -8,6 +8,7 @@ add_executable(nanoer_unit_tests
   unit/crash_test.cpp
   unit/damage_test.cpp
   unit/fs_model_test.cpp
+  unit/gc_test.cpp
   unit/fs_test.cpp
   unit/codec_test.cpp
   unit/format_test.cpp
@@ -42,7 +43,16 @@ if(NANOER_BUILD_FUSE)
   # where builds may be running).
   add_test(NAME integration_persist COMMAND ${RUN_MOUNTED} ${TOOLS_DIR} persist /usr/include)
   add_test(NAME integration_kill COMMAND ${RUN_MOUNTED} ${TOOLS_DIR} kill)
-  set_tests_properties(integration_posix integration_fsx integration_persist integration_kill PROPERTIES
+  # The same on small stores with small segments: garbage collection runs
+  # all the time.
+  add_test(NAME integration_fsx_small COMMAND ${RUN_MOUNTED} ${TOOLS_DIR} fsx)
+  add_test(NAME integration_kill_small COMMAND ${RUN_MOUNTED} ${TOOLS_DIR} kill)
+  set_tests_properties(integration_fsx_small PROPERTIES ENVIRONMENT
+    "FSX_OPS=20000;NANOER_MKFS_OPTS=--size 40M --segment-size 1M")
+  set_tests_properties(integration_kill_small PROPERTIES ENVIRONMENT
+    "KILL_LOAD=fsx;KILL_LIVE_LIMIT_MB=40;NANOER_MKFS_OPTS=--size 160M --segment-size 1M")
+  set_tests_properties(integration_posix integration_fsx integration_persist integration_kill
+                       integration_fsx_small integration_kill_small PROPERTIES
     SKIP_RETURN_CODE 77 LABELS integration RUN_SERIAL TRUE TIMEOUT 1200)
   set_tests_properties(integration_fsx PROPERTIES ENVIRONMENT "FSX_OPS=10000")
 endif()

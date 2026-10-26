@@ -29,11 +29,11 @@ std::uint64_t record_size(std::size_t extra, std::size_t payload) {
 Journal::Journal(Store& store, const Superblock& sb, Metadata& meta, std::uint64_t next_seq)
     : store_(store), sb_(sb), meta_(meta), next_seq_(next_seq) {}
 
-void Journal::start() { open_segment(allocate(true)); }
+void Journal::start() { open_segment(allocate(0)); }
 
 void Journal::resume(const LogPosition& end) {
   writer_.emplace(SegmentWriter::resume(store_, sb_, end.index, end.seq, end.offset));
-  roll_over(true);
+  roll_over(0);
   flush();
   // Everything replayed is on disk and now part of the sealed log.
   appended_txid_ = durable_txid_ = meta_.last_txid;
@@ -42,6 +42,16 @@ void Journal::resume(const LogPosition& end) {
 std::uint64_t Journal::free_segments() const {
   std::uint64_t used = meta_.segments.size() + pending_free_.size();
   return used >= sb_.segment_count ? 0 : sb_.segment_count - used;
+}
+
+std::uint64_t Journal::copy_room(bool urgent) const {
+  std::uint64_t keep = urgent ? gc_reserve_ : reserve_;
+  std::uint64_t free = free_segments();
+  // Each new segment loses its header, its seal, and at worst the tail
+  // left behind by a record that did not fit.
+  std::uint64_t per_segment = sb_.segment_size() - kSegmentHeaderSize - kSealRecordSize -
+                              (std::uint64_t{1} << sb_.chunk_shift) - kMaxRecordHeaderSize;
+  return current_remaining() + (free > keep ? free - keep : 0) * per_segment;
 }
 
 std::uint64_t Journal::current_remaining() const {
@@ -54,10 +64,8 @@ std::size_t Journal::max_transaction_payload() const {
                                   kRecordHeaderSize - kTransactionExtraSize - kRecordAlignment);
 }
 
-std::uint64_t Journal::allocate(bool may_use_reserve) {
-  if (!may_use_reserve && free_segments() <= reserve_) {
-    throw Error(Errc::no_space, "the filesystem is full");
-  }
+std::uint64_t Journal::allocate(std::uint64_t keep_free) {
+  if (free_segments() <= keep_free) throw Error(Errc::no_space, "the filesystem is full");
   for (std::uint64_t i = 0; i < sb_.segment_count; ++i) {
     if (!meta_.segments.contains(i) && !pending_free_.contains(i)) return i;
   }
@@ -71,8 +79,8 @@ void Journal::open_segment(std::uint64_t index) {
   meta_.segments[index] = SegmentUsage{seq, 0};
 }
 
-void Journal::roll_over(bool may_use_reserve) {
-  std::uint64_t next = allocate(may_use_reserve);
+void Journal::roll_over(std::uint64_t keep_free) {
+  std::uint64_t next = allocate(keep_free);
   std::uint8_t extra[kSealExtraSize];
   store_le(extra, next);
   store_le(extra + 8, next_seq_);  // the sequence number open_segment() will give it
@@ -81,19 +89,19 @@ void Journal::roll_over(bool may_use_reserve) {
   open_segment(next);
 }
 
-void Journal::ensure_room(std::uint64_t size, bool may_use_reserve) {
+void Journal::ensure_room(std::uint64_t size, std::uint64_t keep_free) {
   // Every segment keeps room for its seal at the end.
   if (size + kSealRecordSize <= writer_->remaining()) return;
-  roll_over(may_use_reserve);
+  roll_over(keep_free);
   if (size + kSealRecordSize > writer_->remaining()) {
     throw Error(Errc::invalid_argument, "record larger than a segment");
   }
 }
 
 LogPosition Journal::append_record(RecordType type, std::uint8_t flags, ByteView extra,
-                                   ByteView payload, bool may_use_reserve) {
+                                   ByteView payload, std::uint64_t keep_free) {
   std::uint64_t size = record_size(extra.size(), payload.size());
-  ensure_room(size, may_use_reserve);
+  ensure_room(size, keep_free);
   Bytes record = encode_record(type, flags, writer_->seq(), extra, payload);
   std::uint64_t at = *writer_->append(record);
   bytes_since_checkpoint_ += size;
@@ -102,11 +110,24 @@ LogPosition Journal::append_record(RecordType type, std::uint8_t flags, ByteView
 
 ChunkRef Journal::append_chunk(const EncodedChunk& chunk, InodeId ino, std::uint64_t file_offset) {
   std::uint64_t size = record_size(kDataChunkHeaderSize - kRecordHeaderSize, chunk.payload.size());
-  ensure_room(size, false);
+  ensure_room(size, reserve_);
   Bytes record = encode_data_chunk_record(writer_->seq(), chunk, ino, file_offset);
   std::uint64_t at = *writer_->append(record);
   bytes_since_checkpoint_ += size;
   return {at, static_cast<std::uint32_t>(size), chunk.uncompressed_size};
+}
+
+std::uint64_t Journal::append_copy(const Record& r, bool urgent) {
+  if (r.header.type != RecordType::data_chunk) throw Error(Errc::invalid_argument, "not a data chunk");
+  std::uint64_t size = r.stored_size();
+  // What GC copies is freed again two checkpoints later; when space is
+  // urgent it may use the part of the reserve kept for GC alone (the rest
+  // stays for those checkpoints and the next mount).
+  ensure_room(size, urgent ? gc_reserve_ : reserve_);
+  Bytes record = encode_record(RecordType::data_chunk, r.header.flags, writer_->seq(), r.extra, r.payload);
+  std::uint64_t at = *writer_->append(record);
+  bytes_since_checkpoint_ += size;
+  return at;
 }
 
 LogPosition Journal::append_transaction(std::uint64_t txid, const std::vector<Op>& ops) {
@@ -124,7 +145,7 @@ LogPosition Journal::append_transaction(std::uint64_t txid, const std::vector<Op
   appended_txid_ = txid;
   // Transactions may use the reserve: they are small, and refusing one after
   // its changes are already live in memory would be worse.
-  return append_record(RecordType::metadata_log, 0, ByteView(extra), out.buffer(), true);
+  return append_record(RecordType::metadata_log, 0, ByteView(extra), out.buffer(), 0);
 }
 
 LogPosition Journal::append_checkpoint(const Metadata& meta) {
@@ -139,7 +160,7 @@ LogPosition Journal::append_checkpoint(const Metadata& meta) {
     std::uint64_t left = stream.size() - done;
     // Start a new segment rather than write a tiny part into a nearly full one.
     if (room < overhead + std::min(left, kMinCheckpointPart)) {
-      roll_over(true);
+      roll_over(0);
       room = current_remaining();
     }
     std::uint64_t n = std::min({left, kMaxCheckpointPart, room - overhead});
@@ -150,7 +171,7 @@ LogPosition Journal::append_checkpoint(const Metadata& meta) {
     store_le<std::uint64_t>(extra + 16, stream.size());
     store_le(extra + 24, hash);
     LogPosition at = append_record(RecordType::checkpoint, 0, ByteView(extra),
-                                   ByteView(stream.data() + done, n), true);
+                                   ByteView(stream.data() + done, n), 0);
     if (!first) first = at;
     done += n;
     ++part;

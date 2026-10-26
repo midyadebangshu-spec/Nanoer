@@ -75,6 +75,11 @@ class Journal {
   void resume(const LogPosition& end);
 
   ChunkRef append_chunk(const EncodedChunk& chunk, InodeId ino, std::uint64_t file_offset);
+  // GC: appends a copy of an intact data chunk record (same header fields
+  // and payload, the current segment's sequence number). Returns where.
+  // `urgent`: may use one of the reserve segments. Throws Error(no_space)
+  // before writing anything if there is no room.
+  std::uint64_t append_copy(const Record& record, bool urgent);
   LogPosition append_transaction(std::uint64_t txid, const std::vector<Op>& ops);
   // Writes a complete snapshot of `meta`, split into parts as needed.
   // Returns where its first part starts (what the superblock points to).
@@ -102,10 +107,17 @@ class Journal {
 
   // Normal appends leave this many free segments untouched, so a checkpoint
   // (which is what frees space) can always be written.
-  void set_reserve(std::uint64_t segments) { reserve_ = segments; }
+  // `gc_segments` of them may be used by garbage collection when space is
+  // urgent (append_copy).
+  void set_reserve(std::uint64_t segments, std::uint64_t gc_segments = 0) {
+    reserve_ = segments;
+    gc_reserve_ = segments > gc_segments ? segments - gc_segments : 0;
+  }
   std::uint64_t reserve() const { return reserve_; }
 
   std::uint64_t free_segments() const;
+  // Bytes of records append_copy() can take before it runs out of room.
+  std::uint64_t copy_room(bool urgent) const;
   std::uint64_t pending_free_segments() const { return pending_free_.size(); }
   std::uint64_t current_remaining() const;
   std::uint64_t current_index() const { return writer_->index(); }
@@ -115,11 +127,13 @@ class Journal {
   std::size_t max_transaction_payload() const;
 
  private:
+  // `keep_free`: refuse to start a segment unless more than this many
+  // are free (the reserve for normal writes, 0 for what frees space).
   LogPosition append_record(RecordType type, std::uint8_t flags, ByteView extra, ByteView payload,
-                            bool may_use_reserve);
-  void ensure_room(std::uint64_t record_size, bool may_use_reserve);
-  void roll_over(bool may_use_reserve);
-  std::uint64_t allocate(bool may_use_reserve);
+                            std::uint64_t keep_free);
+  void ensure_room(std::uint64_t record_size, std::uint64_t keep_free);
+  void roll_over(std::uint64_t keep_free);
+  std::uint64_t allocate(std::uint64_t keep_free);
   void open_segment(std::uint64_t index);
 
   Store& store_;
@@ -127,6 +141,7 @@ class Journal {
   Metadata& meta_;
   std::uint64_t next_seq_;
   std::uint64_t reserve_ = 0;
+  std::uint64_t gc_reserve_ = 0;  // what GC leaves free when space is urgent
   std::uint64_t bytes_since_checkpoint_ = 0;
   std::uint64_t appended_txid_ = 0;  // newest transaction appended
   std::uint64_t durable_txid_ = 0;   // newest transaction made durable by a flush

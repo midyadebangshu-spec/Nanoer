@@ -7,14 +7,15 @@
 The writer records an operation in LOG (on another filesystem) only after
 fsync() on the Nanoer mount returned: from then on it must survive a crash.
 A delete is recorded before it starts too, so a crash halfway through may go
-either way. Live data is kept under LIVE_LIMIT by deleting older files.
+either way. Live data is kept under LIVE_LIMIT (KILL_LIVE_LIMIT_MB in the environment)
+by deleting older files.
 """
 import hashlib
 import os
 import random
 import sys
 
-LIVE_LIMIT = 128 << 20
+LIVE_LIMIT = int(os.environ.get("KILL_LIVE_LIMIT_MB", "128")) << 20
 
 
 def log_line(log, line):

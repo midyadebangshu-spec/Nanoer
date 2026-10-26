@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -41,6 +42,9 @@ void usage(std::ostream& out) {
          "      --repair, -y, -a, -p    repair what is safe to repair\n"
          "      --deep                  also read and verify every data chunk\n"
          "      -n                      check only (the default)\n"
+         "  gc [options] TARGET       compact the filesystem (it must not be mounted): copy the\n"
+         "                            live data out of mostly empty segments and free them\n"
+         "      --max-full PERCENT      collect segments at most this full (default 90)\n"
          "  version                   print the version\n"
          "\n"
          "fsck exit codes: 0 clean, 1 errors fixed, 4 errors left, 8 could not run.\n"
@@ -212,6 +216,43 @@ int cmd_fsck(const std::vector<std::string_view>& args) {
   return report.exit_code();
 }
 
+// ---- gc --------------------------------------------------------------------
+
+int cmd_gc(const std::vector<std::string_view>& args) {
+  double max_full = 0.9;
+  std::string target;
+  for (std::size_t i = 0; i < args.size(); ++i) {
+    if (args[i] == "--max-full" && i + 1 < args.size()) {
+      int percent = std::atoi(std::string(args[++i]).c_str());
+      if (percent < 1 || percent > 97) return fail(kProgram, "--max-full must be 1 to 97");
+      max_full = percent / 100.0;
+    } else if (!args[i].empty() && args[i][0] == '-') {
+      return fail(kProgram, "unknown gc option " + std::string(args[i]));
+    } else {
+      target = std::string(args[i]);
+    }
+  }
+  if (target.empty()) return fail(kProgram, "gc needs a TARGET");
+  auto store = FileStore::open(target, FileStore::Mode::read_write);
+  Filesystem::Options options;
+  options.start_threads = false;
+  auto fs = Filesystem::mount(*store, options);
+  if (fs->read_only()) return fail(kProgram, "the filesystem can only be mounted read-only; run nanoer fsck");
+  FsInfo before = fs->info();
+  std::uint64_t freed = fs->collect_garbage(max_full);
+  FsInfo after = fs->info();
+  fs->unmount();
+  std::cout << target << ": copied " << format_size(after.gc.bytes_copied) << " in "
+            << after.gc.records_copied << " records; " << after.gc.segments_emptied << " segments emptied, "
+            << freed << " more free (" << before.segments_free << " -> " << after.segments_free << " of "
+            << fs->superblock().segment_count << ")\n";
+  if (after.gc.damaged) {
+    std::cout << after.gc.damaged << " damaged records were left in place; run nanoer fsck\n";
+    return 1;
+  }
+  return 0;
+}
+
 // ---- bench -----------------------------------------------------------------
 
 struct Sample {
@@ -339,6 +380,7 @@ int main(int argc, char** argv) {
     if (command == "info") return cmd_info(args);
     if (command == "bench") return cmd_bench(args);
     if (command == "fsck") return cmd_fsck(args);
+    if (command == "gc") return cmd_gc(args);
     if (command == "version") {
       std::cout << "nanoer " NANOER_VERSION " (format " << kVersionMajor << "." << kVersionMinor << ")\n";
       return 0;
