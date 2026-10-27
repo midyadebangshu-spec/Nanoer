@@ -5,29 +5,18 @@
 namespace nanoer {
 
 // A target in one word: the record offset (8-byte aligned, below 2^48:
-// 256 TiB), the packed flag in bit 0, the piece offset in the top 16 bits:
-// as it is below 64 KiB (small files' packs), else in 4 KiB units with
-// bit 1 set (cold units, whose pieces are whole chunks).
-namespace {
-constexpr std::uint32_t kPieceUnit = 4096;
-bool scaled(const DedupTarget& t) { return t.piece >> 16; }
-}  // namespace
-
+// 256 TiB), the packed flag in bit 0, the piece offset in the top 16 bits.
 bool DedupIndex::fits(const DedupTarget& t) {
-  bool piece_fits = !scaled(t) || (t.piece % kPieceUnit == 0 && !((t.piece / kPieceUnit) >> 16));
-  return t.offset % 8 == 0 && !(t.offset >> 48) && piece_fits && (t.packed || !t.piece);
+  return t.offset % 8 == 0 && !(t.offset >> 48) && !(t.piece >> 16) && (t.packed || !t.piece);
 }
 
 std::uint64_t DedupIndex::pack(const DedupTarget& t) {
   if (!fits(t)) throw Error(Errc::invalid_argument, "dedup target out of range");
-  std::uint64_t piece = scaled(t) ? t.piece / kPieceUnit : t.piece;
-  return t.offset | (t.packed ? 1 : 0) | (scaled(t) ? 2 : 0) | (piece << 48);
+  return t.offset | (t.packed ? 1 : 0) | (std::uint64_t{t.piece} << 48);
 }
 
 DedupTarget DedupIndex::unpack(std::uint64_t v) {
-  auto piece = static_cast<std::uint32_t>(v >> 48);
-  if (v & 2) piece *= kPieceUnit;
-  return {v & 0x0000'ffff'ffff'fff8ull, (v & 1) != 0, piece};
+  return {v & 0x0000'ffff'ffff'fff8ull, (v & 1) != 0, static_cast<std::uint32_t>(v >> 48)};
 }
 
 std::size_t DedupIndex::home(std::uint64_t key) const {

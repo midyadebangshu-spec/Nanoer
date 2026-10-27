@@ -295,10 +295,10 @@ class Filesystem {
     std::uint64_t limit;  // where that segment ends
   };
   struct TierItem {
-    enum class Kind { unit, single, pack };
+    enum class Kind { single, pack };
     Kind kind{};
-    // unit: one file's chunks, in order; single and pack: every reference
-    // to the record (single: the one record they all refer to).
+    // Every reference to the record (a chunk only one file refers to, a
+    // record shared through dedup, or a pack of small files).
     std::vector<TierMember> members;
     StorageForm form{};
   };
@@ -310,14 +310,12 @@ class Filesystem {
     bool ok = false;
     bool in_place = false;  // no smaller: mark cold as it is
     EncodedChunk encoded;
-    std::vector<std::uint32_t> pieces;  // unit: where each member starts
     std::map<std::uint32_t, std::uint32_t> moved;  // pack: old piece -> new
     // single: the old record's header fields, kept
     InodeId owner = 0;
     std::uint64_t file_offset = 0;
     std::optional<Blake3Hash> blake3;
     std::uint64_t stored_before = 0;
-    std::optional<std::size_t> damaged;  // the member whose record could not be read
   };
   bool cold_enabled() const;
   // The file's data is cold now: its form if so.

@@ -71,7 +71,8 @@ Filesystem::Filesystem(Store& store, const Superblock& sb, ReplayResult replayed
       replayed_transactions_(replayed.transactions),
       checkpoint_bytes_(replayed.checkpoint_bytes),
       meta_(std::move(replayed.meta)),
-      // Shards of at least 4 MiB, so that each holds several cold units.
+      // Shards of at least 4 MiB: each holds many chunks, and its 2Q queue
+      // (a quarter) several.
       cache_(options.safe_space,
              static_cast<unsigned>(std::clamp<std::uint64_t>(options.safe_space / (4 << 20), 1, 16))) {
   last_commit_ns_ = last_checkpoint_ns_ = last_change_ns_ = now();

@@ -3,13 +3,21 @@
 **Status: APPROVED 2026-10-27** with the recommended answer to every
 decision in §11; built. Part of stage 1 ([`STAGE1_PLAN.md`](STAGE1_PLAN.md)).
 
-**Where the build differs from this plan** (each smaller than a change of
-scope; listed here and in `KNOWLEDGE.md`):
+**Changed with approval: no cold units (decision 2 revised, 2026-10-27).**
+The 1 MiB cold units of §3 read 25–30 % slower sequentially on a real
+mount than hot data (315–339 against 469–483 MB/s) and 3× slower at random,
+failing §1.2; 256 and 512 KiB units were no better (the §10 fallback).
+Chunks recompressed one by one with zstd 9 read as fast as hot data, and
+save less (−6.5 % on a log file instead of −10.3 %). Of the three options
+put to the user, option 1 was approved: **each cold chunk is recompressed
+on its own** (zstd 9; zstd 19 under `max`), for every policy. The problem,
+the measurements and the options are in `KNOWLEDGE.md` §7.7.
 
-1. **Cold units stay in the dedup index** (§3 said they would not): the
-   index now holds piece offsets beyond 64 KiB in 4 KiB units, so a copy of
-   cold data is still stored once. No format change (the index is in
-   memory).
+**Where the build differs from this plan otherwise** (each smaller than a
+change of scope; listed here and in `KNOWLEDGE.md`):
+
+1. **Cold data stays in the dedup index** (§3 said cold units would not
+   be): recompressed chunks keep their identity.
 2. **Cold means unchanged by change time** (and mtime, if later), not by
    mtime alone: `tar` and `cp -p` copy mtimes, so unpacked archives would
    look years old.

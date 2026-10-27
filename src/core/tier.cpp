@@ -126,11 +126,6 @@ Filesystem::TierPlan Filesystem::tier_plan(std::uint64_t budget, std::int64_t no
                                            std::optional<std::int64_t> age_s,
                                            const std::vector<InodeId>* only) {
   TierPlan plan;
-  const std::uint64_t cs = sb_.chunk_size();
-  // Cold units of up to 1 MiB, and no more than a quarter of a segment (a
-  // record must fit in one, with room to spare).
-  const std::uint64_t unit_bytes = std::min(kColdUnitBytes, sb_.segment_size() / 4);
-  const std::size_t per_unit = static_cast<std::size_t>(std::max<std::uint64_t>(1, unit_bytes / cs));
 
   std::size_t next_only = 0;
   auto next_file = [&]() -> std::optional<InodeId> {
@@ -151,34 +146,20 @@ Filesystem::TierPlan Filesystem::tier_plan(std::uint64_t budget, std::int64_t no
     std::optional<StorageForm> form = cold_now(*file, now_ns, age_s);
     if (!form) continue;
     // The file's chunks that only it refers to and that are not cold yet,
-    // in order, split into units as even as possible.
-    std::vector<TierMember> eligible;
+    // each recompressed on its own (KNOWLEDGE.md §7.7: chunks compressed
+    // together in larger units read 25-30 % slower).
     for (const auto& [index, ref] : file->chunks) {
       if (ref.cold || ref.packed || meta_.references(ref) != 1) continue;
       auto usage = meta_.segments.find(meta_.segment_of(ref.offset));
       if (usage == meta_.segments.end() || tier_skip_.contains({ref.offset, usage->second.seq})) continue;
-      std::uint64_t limit = sb_.segment_offset(usage->first) + sb_.segment_size();
-      eligible.push_back({*id, index, ref, usage->second.seq, limit});
-    }
-    if (eligible.empty()) continue;
-    const std::size_t units = (eligible.size() + per_unit - 1) / per_unit;
-    std::size_t at = 0;
-    for (std::size_t u = 0; u < units; ++u) {
-      std::size_t n = eligible.size() / units + (u < eligible.size() % units ? 1 : 0);
-      TierItem item{n == 1 ? TierItem::Kind::single : TierItem::Kind::unit, {}, *form};
-      std::uint64_t bytes = 0;
-      for (std::size_t k = 0; k < n; ++k) {
-        bytes += eligible[at + k].ref.size;
-        item.members.push_back(eligible[at + k]);
-      }
-      if (plan.bytes > 0 && plan.bytes + bytes > budget) {
+      if (plan.bytes > 0 && plan.bytes + ref.size > budget) {
         // The rest of a large file waits for the next step.
         if (!only) tier_queue_.push_back(*id);
         return plan;
       }
-      at += n;
-      plan.bytes += bytes;
-      plan.items.push_back(std::move(item));
+      std::uint64_t limit = sb_.segment_offset(usage->first) + sb_.segment_size();
+      plan.items.push_back({TierItem::Kind::single, {{*id, index, ref, usage->second.seq, limit}}, *form});
+      plan.bytes += ref.size;
     }
   }
   if (only) return plan;
@@ -201,7 +182,6 @@ std::vector<Filesystem::TierRead> Filesystem::tier_read(const TierPlan& plan) {
   auto read_one = [&](std::size_t i) {
     const TierItem& item = plan.items[i];
     TierRead& r = out[i];
-    std::size_t at = 0;  // the member being read
     try {
       auto read = [&](const TierMember& m) -> std::optional<Record> {
         std::optional<Record> rec = try_read_record(store_, m.ref.offset, m.limit, m.seq);
@@ -210,22 +190,7 @@ std::vector<Filesystem::TierRead> Filesystem::tier_read(const TierPlan& plan) {
         }
         return rec;
       };
-      Bytes data;
-      if (item.kind == TierItem::Kind::unit) {
-        for (at = 0; at < item.members.size(); ++at) {
-          const TierMember& m = item.members[at];
-          std::optional<Record> rec = read(m);
-          if (!rec) throw Error(Errc::corrupt, "unreadable");
-          DataChunkInfo info = parse_data_chunk(*rec);
-          if (info.pack || info.uncompressed_size != m.ref.size) throw Error(Errc::corrupt, "not as referenced");
-          Bytes chunk = decode_data_chunk(*rec);
-          r.pieces.push_back(static_cast<std::uint32_t>(data.size()));
-          data.insert(data.end(), chunk.begin(), chunk.end());
-          r.stored_before += m.ref.stored_size;
-        }
-        r.encoded = encode_chunk(data, item.form.codec, item.form.level);
-        r.in_place = stored_size_of(r.encoded, false) * 100 > r.stored_before * (100 - kTierMinGainPercent);
-      } else {
+      {
         const TierMember& m = item.members.front();
         std::optional<Record> rec = read(m);
         if (!rec) throw Error(Errc::corrupt, "unreadable");
@@ -237,7 +202,7 @@ std::vector<Filesystem::TierRead> Filesystem::tier_read(const TierPlan& plan) {
                            : info.uncompressed_size == u.ref.size;
           if (!fits || u.ref.offset != m.ref.offset) throw Error(Errc::corrupt, "not as referenced");
         }
-        data = decode_data_chunk(*rec);
+        Bytes data = decode_data_chunk(*rec);
         if (pack) {
           // Only the live pieces, in their order.
           std::map<std::uint32_t, std::uint32_t> live;  // piece -> size
@@ -265,7 +230,6 @@ std::vector<Filesystem::TierRead> Filesystem::tier_read(const TierPlan& plan) {
     } catch (const Error&) {
       // Unreadable: decided under the lock (the segment may have been reused).
       r = TierRead{};
-      r.damaged = item.kind == TierItem::Kind::unit ? at : 0;
     }
   };
   if (pool_) {
@@ -297,7 +261,7 @@ std::uint64_t Filesystem::tier_apply(const TierPlan& plan, std::vector<TierRead>
     }
     if (live.empty()) continue;
     if (!r.ok) {
-      const TierMember& m = item.members[r.damaged.value_or(0)];
+      const TierMember& m = item.members.front();
       if (!tier_eligible(m)) continue;  // it changed meanwhile: not damage
       // Damaged data stays where it is (reads report it).
       ++tier_stats_.damaged;
@@ -323,10 +287,10 @@ std::uint64_t Filesystem::tier_apply(const TierPlan& plan, std::vector<TierRead>
     }
     ChunkRef fresh;
     try {
-      if (item.kind == TierItem::Kind::single) {
-        fresh = journal_->append_chunk(r.encoded, r.owner, r.file_offset, r.blake3);
-      } else {
+      if (item.kind == TierItem::Kind::pack) {
         fresh = journal_->append_chunk(r.encoded, 0, 0, std::nullopt, true);
+      } else {
+        fresh = journal_->append_chunk(r.encoded, r.owner, r.file_offset, r.blake3);
       }
     } catch (const Error& e) {
       if (e.code() == Errc::no_space) break;  // nothing was written
@@ -339,21 +303,14 @@ std::uint64_t Filesystem::tier_apply(const TierPlan& plan, std::vector<TierRead>
       ref.stored_size = fresh.stored_size;
       ref.cold = true;
       bool share = false;
-      switch (item.kind) {
-        case TierItem::Kind::unit:
-          ref.packed = true;
-          ref.piece = r.pieces[live[j]];
-          break;
-        case TierItem::Kind::pack: ref.piece = r.moved.at(m.ref.piece); break;
-        case TierItem::Kind::single: share = j > 0; break;  // the first claims the record
+      if (item.kind == TierItem::Kind::pack) {
+        ref.piece = r.moved.at(m.ref.piece);
+      } else {
+        share = j > 0;  // the first claims the record
       }
       record(op::SetChunkRef{m.ino, m.index, ref, share});
     }
-    switch (item.kind) {
-      case TierItem::Kind::unit: ++tier_stats_.units; break;
-      case TierItem::Kind::single: ++tier_stats_.singles; break;
-      case TierItem::Kind::pack: ++tier_stats_.packs; break;
-    }
+    ++(item.kind == TierItem::Kind::pack ? tier_stats_.packs : tier_stats_.singles);
     tier_stats_.stored_before += r.stored_before;
     tier_stats_.stored_after += fresh.stored_size;
     marked += live.size();
@@ -373,11 +330,11 @@ std::uint64_t Filesystem::tier_apply(const TierPlan& plan, std::vector<TierRead>
 
 bool Filesystem::tier_room(const TierPlan& plan, bool background) const {
   // What a step writes is at most what it read, plus headers; each new
-  // segment may lose up to a unit at its end.
+  // segment may lose up to a chunk at its end.
   const std::uint64_t usable = sb_.segment_size() - kSegmentHeaderSize - kSealRecordSize;
-  const std::uint64_t unit = std::min(kColdUnitBytes, sb_.segment_size() / 4) + kMaxRecordHeaderSize;
+  const std::uint64_t tail = sb_.chunk_size() + kMaxRecordHeaderSize;
   std::uint64_t bytes = plan.bytes + plan.items.size() * kMaxRecordHeaderSize;
-  std::uint64_t segments = bytes / (usable - unit) + 2;
+  std::uint64_t segments = bytes / (usable - tail) + 2;
   std::uint64_t keep = journal_->reserve();
   if (background) keep = std::max(keep + 2, sb_.segment_count * kTierLowSpacePercent / 100);
   return journal_->free_segments() >= keep + segments;

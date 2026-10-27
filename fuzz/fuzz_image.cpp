@@ -64,7 +64,7 @@ const Base& base() {
       Bytes copy(fs->getattr(f5).size);
       fs->read(f5, 0, copy);
       fs->write(fs->mknod(kRootInode, "copy", S_IFREG | 0644, 0, {}).ino, 0, copy);
-      // Cold data: units, shared records recompressed, the pack again.
+      // Cold data: chunks and shared records recompressed, the pack again.
       fs->recompress_cold(0);
       fs->write(fs->lookup(kRootInode, "f0").ino, 5000, as_bytes("changed after going cold"));
     }  // unmount: checkpoint

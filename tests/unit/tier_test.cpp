@@ -37,7 +37,7 @@ Filesystem::Options options() {
   return o;
 }
 
-// 4 MiB segments and 128 KiB chunks: cold units of 8 chunks.
+// 4 MiB segments and 128 KiB chunks.
 std::unique_ptr<MemStore> make_store(std::uint64_t size = 96 << 20, bool cold_data = true) {
   auto store = std::make_unique<MemStore>(size);
   make_filesystem(*store, {.segment_shift = 22, .cold_data = cold_data});
@@ -45,7 +45,7 @@ std::unique_ptr<MemStore> make_store(std::uint64_t size = 96 << 20, bool cold_da
 }
 
 // Log lines: different in every chunk, and much alike across chunks, which
-// is what a larger unit and a higher level gain from.
+// is what a higher level gains from.
 Bytes log_text(std::mt19937_64& rng, std::size_t n) {
   static const char* const words[] = {"connection", "accepted", "from", "user", "session", "opened",
                                       "closed", "timeout", "request", "GET", "POST", "/api/v1/items",
@@ -110,7 +110,7 @@ std::uint64_t stored(Filesystem& fs) { return fs.info().stored_bytes; }
 
 }  // namespace
 
-TEST(Tier, ColdFilesBecomeUnitsSinglesAndPacks) {
+TEST(Tier, ColdChunksAndPacksAreRecompressed) {
   auto store = make_store();
   std::mt19937_64 rng(1);
   Files files;
@@ -128,22 +128,15 @@ TEST(Tier, ColdFilesBecomeUnitsSinglesAndPacks) {
     EXPECT_EQ(fs->recompress_cold(3600), 0u);  // written just now: not cold after an hour
     EXPECT_EQ(fs->recompress_cold(0), 20u + 1 + 6);
     FsInfo info = fs->info();
-    // 20 chunks: units of 7, 7 and 6; the lone chunk on its own; the pack
-    // again.
-    EXPECT_EQ(info.tier.units, 3u);
-    EXPECT_EQ(info.tier.singles, 1u);
+    // Every chunk on its own (each keeps its identity), and the pack again.
+    EXPECT_EQ(info.tier.singles, 20u + 1);
     EXPECT_EQ(info.tier.packs, 1u);
     EXPECT_EQ(info.tier.in_place, 0u);
-    std::map<std::uint64_t, int> units;
-    for (const auto& [index, ref] : inode(*fs, big).chunks) {
-      EXPECT_TRUE(ref.cold && ref.packed);
-      ++units[ref.offset];
-    }
-    EXPECT_EQ(units.size(), 3u);
+    for (const auto& [index, ref] : inode(*fs, big).chunks) EXPECT_TRUE(ref.cold && !ref.packed && ref.hash != 0);
     const ChunkRef& l = inode(*fs, lone).chunks.at(0);
     EXPECT_TRUE(l.cold && !l.packed && l.hash != 0);
     for (InodeId s : small) EXPECT_TRUE(inode(*fs, s).chunks.at(0).cold);
-    EXPECT_LT(stored(*fs), before * 95 / 100) << "zstd 9 in units: smaller";
+    EXPECT_LT(stored(*fs), before * 97 / 100) << "zstd 9: smaller";
     files.check(*fs);
     EXPECT_EQ(fs->recompress_cold(0), 0u);  // nothing is examined twice
   }
@@ -163,8 +156,8 @@ TEST(Tier, IncompressibleDataIsOnlyMarked) {
   std::map<std::uint64_t, ChunkRef> before = inode(*fs, ino).chunks;
   EXPECT_EQ(fs->recompress_cold(0), 10u);
   FsInfo info = fs->info();
-  EXPECT_EQ(info.tier.units, 0u);
-  EXPECT_EQ(info.tier.in_place, 2u);  // two units' worth, not rewritten
+  EXPECT_EQ(info.tier.singles, 0u);
+  EXPECT_EQ(info.tier.in_place, 10u);  // not rewritten
   for (const auto& [index, ref] : inode(*fs, ino).chunks) {
     EXPECT_TRUE(ref.cold);
     EXPECT_EQ(ref.offset, before.at(index).offset);
@@ -182,9 +175,9 @@ TEST(Tier, ChunkWrittenDuringRecompressionKeepsItsNewData) {
   InodeId ino = files.create(*fs, "f", log_text(rng, 16 * kChunk));
   fs->sync();
   auto plan = FilesystemTestAccess::tier_plan(*fs, 0);
-  ASSERT_EQ(plan.items.size(), 2u);
+  ASSERT_EQ(plan.items.size(), 16u);
   auto reads = FilesystemTestAccess::tier_read(*fs, plan);
-  // While the units are being made, chunks 3 and 12 change.
+  // While they are being recompressed, chunks 3 and 12 change.
   files.write(*fs, ino, 3 * kChunk, log_text(rng, kChunk));
   files.write(*fs, ino, 12 * kChunk + 100, log_text(rng, 50));
   fs->sync();
@@ -192,7 +185,7 @@ TEST(Tier, ChunkWrittenDuringRecompressionKeepsItsNewData) {
   EXPECT_FALSE(inode(*fs, ino).chunks.at(3).cold);
   EXPECT_FALSE(inode(*fs, ino).chunks.at(12).cold);
   files.check(*fs);  // nothing went back to the data that was read
-  // The next pass takes them, on their own.
+  // The next pass takes them.
   EXPECT_EQ(fs->recompress_cold(0), 2u);
   files.check(*fs);
   fs.reset();
@@ -266,7 +259,7 @@ TEST(Tier, NewCopiesOfColdDataAreStillDeduplicated) {
   fs->sync();
   ASSERT_EQ(fs->recompress_cold(0), 8u);
   std::uint64_t before = stored(*fs);
-  // The pieces of cold units are in the dedup index too.
+  // Cold records keep their identity: still in the dedup index.
   files.create(*fs, "copy", data);
   fs->sync();
   EXPECT_EQ(fs->info().dedup_hits, 8u);
@@ -292,7 +285,7 @@ TEST(Tier, GarbageCollectionRecompressesColdDataInsteadOfCopyingIt) {
   fs->sync();
   fs->collect_garbage();
   FsInfo info = fs->info();
-  EXPECT_GT(info.tier.units, 0u);
+  EXPECT_GT(info.tier.singles, 0u);
   EXPECT_GT(info.gc.segments_emptied, 0u);
   // The cold files' data was recompressed, not copied first: GC copied only
   // some of what is cold already.
@@ -315,12 +308,12 @@ TEST(Tier, DamagedDataIsLeftInPlace) {
   Bytes b = store->read(r.offset + r.stored_size - 8, 1);
   b[0] ^= 0xff;
   store->write(r.offset + r.stored_size - 8, b);
-  EXPECT_EQ(fs->recompress_cold(0), 8u);  // the other unit
+  EXPECT_EQ(fs->recompress_cold(0), 15u);  // the other chunks
   FsInfo info = fs->info();
   EXPECT_EQ(info.tier.damaged, 1u);
   EXPECT_TRUE(info.errors_seen);
   EXPECT_EQ(inode(*fs, ino).chunks.at(2), r);
-  EXPECT_EQ(fs->recompress_cold(0), 7u);  // the rest of its unit, without it
+  EXPECT_EQ(fs->recompress_cold(0), 0u);  // not tried again
   Bytes out(kChunk);
   EXPECT_THROW(fs->read(ino, 2 * kChunk, out), Error);
   fs.reset();

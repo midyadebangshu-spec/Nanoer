@@ -377,7 +377,7 @@ TEST(Fsck, ClearsTheErrorsFlag) {
 }
 
 TEST(Fsck, ColdDataIsClean) {
-  // Cold units, single records and in-place marks, as tiering makes them;
+  // Recompressed records and in-place marks, as tiering makes them;
   // and a superblock rebuilt from them keeps the feature.
   auto store = sample();
   {
@@ -396,7 +396,7 @@ TEST(Fsck, ColdDataIsClean) {
   EXPECT_EQ(buf, data_for(1));
 }
 
-TEST(Fsck, DamagedColdUnit) {
+TEST(Fsck, DamagedColdRecord) {
   auto store = sample();
   {
     auto fs = Filesystem::mount(*store, options());
@@ -405,17 +405,16 @@ TEST(Fsck, DamagedColdUnit) {
   Superblock sb = load_superblock(*store).sb;
   Metadata m = replay(*store, sb).meta;
   const Inode& a = *m.find(find(m, kRootInode, "a"));
-  const ChunkRef unit = a.chunks.at(0);
-  ASSERT_TRUE(unit.cold && unit.packed);
-  ASSERT_EQ(a.chunks.at(2).offset, unit.offset) << "the file's three chunks in one unit";
-  Bytes b = store->read(unit.offset + unit.stored_size - 30, 1);
+  const ChunkRef ref = a.chunks.at(1);
+  ASSERT_TRUE(ref.cold);
+  Bytes b = store->read(ref.offset + ref.stored_size - 30, 1);
   b[0] ^= 0x55;
-  store->write(unit.offset + unit.stored_size - 30, b);
+  store->write(ref.offset + ref.stored_size - 30, b);
   FsckReport deep = check(*store, true);
   EXPECT_EQ(deep.exit_code(), 4);
-  // Every chunk of the unit is reported, by file and byte range.
+  // Reported by file and byte range.
   std::size_t ranges = 0;
   for (const std::string& l : deep.lost) ranges += l.find("/a") != std::string::npos && l.find("bytes") != std::string::npos;
-  EXPECT_EQ(ranges, 3u) << all(deep.lost);
+  EXPECT_EQ(ranges, 1u) << all(deep.lost);
   expect_found_and_repaired(*store, "damaged", true);
 }

@@ -319,9 +319,8 @@ cold-data recompaction.
   open addressing with linear probing and backward-shift deletion,
   16 bytes an entry, kept between 37.5 % and 75 % full, so 21–43 bytes per
   unique chunk. A target fits one word: offsets are 8-aligned (the flag in
-  bit 0) and below 2^48; the piece offset is in the top 16 bits, as it is
-  below 64 KiB (small files' packs), else in 4 KiB units with bit 1 set
-  (M5's cold units, whose pieces are whole chunks: up to 256 MiB). The index is part of the in-memory metadata, kept by
+  bit 0) and below 2^48; packs are at most 64 KiB (the piece offset in the
+  top 16 bits). The index is part of the in-memory metadata, kept by
   `apply()`: replay and checkpoint loading rebuild it with no extra reads.
   The newest record with a content wins, so GC's copy takes over; an entry
   goes when its record is released (a pack piece: with any reference to
@@ -453,14 +452,14 @@ recompress). Doing it automatically is one of Nanoer's intended advantages.
   so data still read often loses nothing, and access times are never
   written. The change time, not mtime, because `tar` and `cp -p` copy
   mtimes: an archive just unpacked would otherwise look years old.
-- **What it becomes:** the file's chunks that only it refers to, in order,
-  split as evenly as possible into **cold units** of up to 1 MiB (eight
-  128 KiB chunks; a quarter of a segment if that is smaller), each a pack
-  compressed with zstd 9. A lone chunk, and data shared by several files
-  (dedup), is recompressed on its own, keeping its identity, and every
-  reference is re-pointed; a pack of small files is packed again. Shared
-  data waits until every file using it is cold. Under the `max` policy the
+- **What it becomes:** each chunk recompressed **on its own** with zstd 9,
+  keeping its header (owner, identity), so it stays in the dedup index.
+  Data shared by several files (dedup) is recompressed once and every
+  reference re-pointed; it waits until every file using it is cold. A pack
+  of small files is packed again with zstd 9. Under the `max` policy the
   cold form is zstd 19 after at most a day; `none` and `fast` never change.
+  (The plan grouped chunks into 1 MiB *cold units*; they read too slowly,
+  see *The cold unit problem* below.)
 - **Every reference to the new record is marked `cold`**, so a pass never
   examines it again. When recompressing does not save at least 3 % (media,
   data already dense), nothing is written: the references are only marked,
@@ -476,14 +475,76 @@ recompress). Doing it automatically is one of Nanoer's intended advantages.
   coldness). `nanoer tier [--age AGE] IMAGE` does all of it at once.
 - **With GC:** when GC meets data of a cold file that is not cold yet, it
   recompresses that file instead of copying the data first (not when space
-  is urgent); packs it repacks keep their users' form (cold units stay
+  is urgent); packs it repacks keep their users' form (cold packs stay
   zstd 9).
-- **Cold units and dedup:** the pieces are in the dedup index (in 4 KiB
-  units, §6), so a later copy of cold data is still stored once; a hit
-  is confirmed by comparing the bytes, as for small files' packs.
-- **Costs:** each cold byte is written once more over its life. A random
-  read of cold data decompresses its whole unit (§14); the safe space then
-  holds the unit, whose shards are at least 4 MiB so that it can.
+- **Costs:** each cold byte is written once more over its life. Reads cost
+  the same as for hot data (§14).
+
+**The cold unit problem (found in M5's measurements, 2026-10-27).**
+
+*What the plan said.* Cold data was to be compressed in **cold units**:
+eight consecutive 128 KiB chunks of a file compressed together with zstd 9
+into one record of up to 1 MiB (a pack, so the read path, counts, GC and
+`fsck` needed no change). The benchmark before the plan (§14) promised
+14 % less space than today with no loss of read speed, because zstd 9
+decompresses as fast as zstd 1. The plan required sequential reads of cold
+data within 10 % of hot data on a real mount.
+
+*What was measured.* A 1 GiB log file on a real mount, cold caches, three
+runs each:
+
+| How the data is stored | Sequential read | Stored |
+|---|---:|---:|
+| hot: zstd 1, 128 KiB chunks | 469–483 MB/s | 204.0 MiB |
+| zstd 9, 1 MiB units | 315–339 MB/s | 183.0 MiB (−10.3 %) |
+| zstd 9, 512 KiB units | 265–304 MB/s | 184.3 MiB (−9.7 %) |
+| zstd 9, 256 KiB units | 258–291 MB/s | 186.8 MiB (−8.4 %) |
+| zstd 9, each chunk on its own | 422–494 MB/s | 190.7 MiB (−6.5 %) |
+
+Random 4 KiB reads took 1.9 ms on average from 1 MiB units against 0.7 ms
+for hot data: each decompresses a whole unit to return 4 KiB. A 4 MiB
+kernel read-ahead instead of 1 MiB changed nothing (292–317 MB/s).
+
+*Why.* zstd 9 is not the cause: chunks recompressed one by one read as fast
+as hot data. Grouping is. A compressed zstd stream can only be decompressed
+whole, from its start, so any piece of a unit costs the full unit. The
+kernel reads ahead with several 128 KiB requests at once, and they fall in
+the same unit. At first each request decompressed the unit itself, up to
+eight times over (142 MB/s); with concurrent misses sharing one load
+(§8.2) one thread decompresses while the others wait (306–339 MB/s): the
+parallel decompression that makes hot data fast is lost. That explanation
+predicts smaller units would help; they did not (256 KiB units were no
+faster), so part of the cost of units is not understood. It was not
+investigated further, as the chosen option does not need it.
+
+*The options.*
+
+1. **Recompress each chunk on its own with zstd 9.** Reads as fast as hot
+   data, sequential and random (measured). Saves less: −6.5 % on the log
+   file instead of −10.3 %; on `/usr`, about 8.5 % instead of 14 % by the
+   pre-plan benchmark (measured in §14). Least code: single chunks were
+   already handled (lone chunks, shared data), unit code is removed.
+2. **Keep 1 MiB units, and decompress the next unit ahead of a
+   sequential reader** on the thread pool, so decompression overlaps reading
+   again. Keeps the full saving. Might close the sequential gap (not
+   measured; the unexplained part might remain); random reads stay 3×
+   slower. New code (detecting sequential readers, bounding prefetch in
+   the safe space, cancelling it) and tests; reverses the plan's decision
+   not to build a read-ahead in M5.
+3. **Keep 1 MiB units as they are**, accepting 25–30 % slower sequential
+   and 3× slower random reads of cold data, and changing the plan's
+   condition instead of meeting it.
+
+A variant of 1 was offered too: units with zstd 19 only under `max`.
+
+*Decision (approved 2026-10-27): option 1, for every policy.* It meets the
+read-speed condition with measured numbers, removes the part of the design
+that was not understood instead of building on it, and keeps cold data in
+the dedup index with no special case (the 4 KiB-unit piece encoding added
+for units was removed again). Option 2 stays open for later (M6, or the
+stage 3 kernel driver, where reads cost no FUSE round trips), once the
+remaining slowdown of units is understood; the `max` variant can be added
+if a folder needs the extra saving more than read speed.
 
 **Folder policies (M5, `src/core/policy.cpp`):** the extended attribute
 `user.nanoer.policy` (`none`, `fast`, `balanced`, `max`) on a folder is
@@ -754,8 +815,8 @@ times on the way):
 Copies share the log with new writes, so hot and cold data mix in the same
 segments; separating them (as some log-structured systems do) is left for
 M5's tiering. (M5 did not separate them either: a tiering step appends
-its cold units together, which groups them somewhat; a separate log for
-cold data stays an option if GC measurements ask for it.)
+the records it recompresses together, which groups them somewhat; a
+separate log for cold data stays an option if GC measurements ask for it.)
 
 ---
 
@@ -792,7 +853,7 @@ for neighbouring reads.
   stayed in the FIFO, so the scan evicted it once before it was promoted
   (in a cache-only test, 65 % of it survived a scan against the
   simplified form's 100 %). Shards are at least 4 MiB (fewer shards for a small
-  safe space), so that each holds several 1 MiB cold units.
+  safe space), so that each, and its FIFO (a quarter), holds many chunks.
 - **A bug the M5 benchmark found:** the shard was chosen from the low bits
   of `offset × constant ^ seq`. Record offsets are multiples of 8, so the
   low 3 bits of the product were always 0, and a segment's records share
@@ -802,9 +863,9 @@ for neighbouring reads.
   every shard.
 - **One load per missing chunk (M5):** threads that miss the same chunk at
   once wait for one decompression (`get_or_load`). The kernel reads ahead
-  with several requests in parallel, which often fall in one 1 MiB cold
-  unit: each used to decompress the whole unit. Found when cold data read
-  at half the speed of hot data on a real mount (§14).
+  with several requests in parallel, and several can fall in one record
+  (a pack; the 1 MiB cold units first built, where each request
+  decompressed the whole unit: §7.7).
 
 ### 8.3 Interaction with the kernel page cache
 
@@ -1188,8 +1249,8 @@ table fallback that processes 8 bytes per step.
   (only `corrupt` is acceptable from a damaged image). The index is a
   hint, so such a target is now simply not indexed; the input is a seed.
 - **M5 (cold data, policies, 2Q):**
-  - **Tiering:** units of 7, 7 and 6 for 20 chunks; lone chunks, packs and
-    shared data; incompressible data only marked; a chunk written, a file
+  - **Tiering:** every chunk of a cold file recompressed on its own, packs
+    and shared data; incompressible data only marked; a chunk written, a file
     deleted (and its segments reused) between reading and re-pointing;
     damaged data left in place and not tried again; no room, no error;
     GC recompressing instead of copying; the background pass; filesystems
@@ -1200,9 +1261,9 @@ table fallback that processes 8 bytes per step.
   - **Everywhere:** the crash-point exploration got a variant that
     recompresses (by itself and through GC; 2,499 crash images, all
     recovering a real state); the model test recompresses and counts every
-    file cold at once; `fsck` checks cold units clean, reports a damaged
-    unit by file and byte range for each of its chunks, and rebuilds lost
-    superblocks from them; the image fuzzer's base image has cold units;
+    file cold at once; `fsck` checks cold data clean, reports a damaged
+    cold record by file and byte range, and rebuilds lost superblocks from
+    cold data; the image fuzzer's base image has cold data;
     fsx and `kill -9` run with `cold_after=0,idle=0` on real mounts.
 - **Lesson:** a benchmark that looks wrong is worth explaining before
   trusting. The scan benchmark's first numbers showed an 8 MiB cache
@@ -1626,13 +1687,14 @@ rejected.
 | 2026-10-27 | M5 plan approved with the recommended answers: cold = not written for 7 days, whatever the reads; zstd 9 in 1 MiB units; policies none / fast / balanced / max in `user.nanoer.policy`, inherited at creation; no read-ahead; 2Q only if the scan benchmark shows it pays; M4 filesystems get policies but not cold data | user approval of `docs/M5_PLAN.md` | see plan §11 |
 | 2026-10-27 | Cold by change time (or mtime, if later) | users cannot set it; `tar` and `cp -p` copy mtimes | mtime alone (unpacked archives would look old); access times (a write per read) |
 | 2026-10-27 | `cold` reference flag behind an incompat feature bit `cold_data`, set by mkfs; superblocks rebuilt from a version 2 checkpoint get it | an M4 reader would take the flag for damage; refusing to mount is clearer | a checkpoint version 3; no flag (every pass would re-read every record) |
-| 2026-10-27 | Cold units are packs of one file's consecutive chunks, split evenly, up to 1 MiB or a quarter of a segment | the M4 pack machinery (read path, counts, GC, `fsck`) works unchanged; a record must fit in a segment with room | a new record type; fixed groups of 8 (a 9-chunk file would leave one alone) |
+| 2026-10-27 | (Superseded the same day, below.) Cold units are packs of one file's consecutive chunks, split evenly, up to 1 MiB or a quarter of a segment | the M4 pack machinery (read path, counts, GC, `fsck`) works unchanged; a record must fit in a segment with room | a new record type; fixed groups of 8 (a 9-chunk file would leave one alone) |
 | 2026-10-27 | Write only what shrinks by 3 %; otherwise mark cold in place | media is read once and never rewritten (writes and SSD wear for nothing) | always rewriting; guessing from the codec without reading |
 | 2026-10-27 | Shared data recompressed once, re-pointing all its users, when all are cold | dedup's savings are kept; a hot user would soon leave a fresh copy anyway | recompressing each user's copy (undoes dedup); never touching shared data |
-| 2026-10-27 | Cold unit pieces indexed for dedup in 4 KiB units | a copy of cold data is still stored once, at no format cost | leaving them out (the plan's first idea: every copy of cold data stored again) |
+| 2026-10-27 | (Superseded the same day, below.) Cold unit pieces indexed for dedup in 4 KiB units | a copy of cold data is still stored once, at no format cost | leaving them out (the plan's first idea: every copy of cold data stored again) |
 | 2026-10-27 | Background tiering only when idle, 2 s slices, 15 % free to spare, before GC; GC recompresses cold files it meets instead of copying them | no foreground work waits; data is rewritten once, not copied then recompressed | a separate thread; tiering inside GC only (cold data in full segments would never be recompressed) |
 | 2026-10-27 | Policies are copied to new files and folders at creation; a file's own copy decides | no lookup up the tree per write; a tree follows the folder it was made in, also when moved | inheriting at read time (renames would change how old data is stored) |
 | 2026-10-27 | Simplified 2Q replaces the LRU; shards of at least 4 MiB | measured: 98.8 % of a working set kept through a scan against 58.9 %, the scan no slower | full 2Q (worse, §8.2); ARC (not measured: more state, and 2Q already met the bar); keeping the LRU |
+| 2026-10-27 | **Cold data recompressed chunk by chunk (zstd 9; zstd 19 under `max`), no cold units**, for every policy; the dedup index's 4 KiB piece encoding removed again (approved by the user, option 1 of §7.7) | measured on a real mount: 1 MiB units read 25–30 % slower sequentially (315–339 against 469–483 MB/s) and 3× slower at random; 256 and 512 KiB units no better; chunks recompressed one by one read as fast as hot data | 1 MiB units with the next unit decompressed ahead of the reader (keeps −14 %; not measured, new code, reverses the no-read-ahead decision); units as they are (slower reads accepted); units only under `max` |
 | 2026-10-27 | Concurrent misses on one chunk share one load | parallel kernel read-ahead decompressed a cold unit once per request | a lock per chunk held while reading (blocks other readers of the shard) |
 | 2026-10-27 | Cache shard chosen by a full 64-bit mix of the key | the old hash used 2 of 16 shards (a bug since M2) | — |
 | 2026-10-27 | M5 proposed without an engine read-ahead (pending approval) | measured: the engine streams at 2,000 MB/s, a mount at 808 MB/s, so FUSE sets the speed | parallel prefetch into the safe space (STAGE1_PLAN's original M5 item) |
@@ -1675,8 +1737,10 @@ Built 2026-10-23, removed 2026-10-24 (recover it from git history, commit
   program asked for.
 - **CoW:** copy-on-write. Never overwrite; write anew and switch pointers.
 - **GC:** garbage collection. Reclaiming space from dead chunks.
-- **Cold unit:** consecutive chunks of one file recompressed together (zstd
-  9, up to 1 MiB) once the file has stopped changing.
+- **Cold data:** data of a file that has stopped changing, recompressed
+  with a higher level (zstd 9) and marked `cold`.
+- **Cold unit:** consecutive chunks of one file compressed together (up to
+  1 MiB). Built in M5 and dropped: reads too slow (§7.7).
 - **Policy:** how a folder's data is stored (`none`, `fast`, `balanced`,
   `max`), in the attribute `user.nanoer.policy`.
 - **Hot / cold data:** frequently / rarely accessed data.

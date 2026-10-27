@@ -351,11 +351,13 @@ changing in a denser form, and marks every reference to the new record
 `cold`, so that it is not examined again. The flag changes nothing in how
 the reference is read or counted. A cold record is either
 
-- a *cold unit*: a pack (`pack` flag) whose pieces are consecutive chunks
-  of one file, back to back from piece 0, in chunk order; or a pack of
-  small files recompressed with its pieces in the same order; or
 - a single chunk rewritten with another codec or level, with the same
-  `inode`, `file_offset` and `blake3` header fields as before.
+  `inode`, `file_offset` and `blake3` header fields as before; or
+- a pack (`pack` flag) of small files recompressed, its live pieces in
+  the same order.
+
+Any pack is valid for a reader, whatever its pieces; an early M5 build
+also wrote packs of one file's consecutive chunks (*cold units*).
 
 A reference may also be marked `cold` in place (a SetChunkRef naming the
 record it already refers to, which releases and claims the same space)
@@ -540,4 +542,4 @@ therefore always has a checkpoint.
 | 1.0 (draft, M2) | metadata transactions, checkpoints, segment seals, log replay, segment reuse; mkfs writes an initial checkpoint |
 | 1.0 (draft, M3) | transaction `durable_back` (was reserved, so older images read as "unknown"); superblock `state` flags (was reserved); damage detection, contradictory transactions, checkpoint fallback and rescue (§10.2) |
 | 1.0 (draft, M4) | `shared_records` feature: SetChunkRef, shared records and packs, reference counting, checkpoint version 2; data chunk `pack` flag; `no_dedup` compat preference; dedup shares only records whose `blake3` matches |
-| 1.0 (draft, M5) | `cold_data` feature: reference flag `cold`, cold units; the `user.nanoer.policy` attribute |
+| 1.0 (draft, M5) | `cold_data` feature: reference flag `cold`, cold records; the `user.nanoer.policy` attribute |

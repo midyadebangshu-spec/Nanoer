@@ -39,8 +39,9 @@ class ChunkCache {
   std::shared_ptr<const Bytes> get(const Key& key);
   // The chunk, from the cache or from `load` (then kept). Threads asking for
   // the same missing chunk at once wait for one load instead of each
-  // decompressing it (the kernel reads ahead in parallel, often within one
-  // cold unit). An exception from `load` reaches every waiter.
+  // decompressing it (the kernel reads ahead in parallel, and several
+  // requests can fall in one record: a pack, or a chunk read in parts). An
+  // exception from `load` reaches every waiter.
   std::shared_ptr<const Bytes> get_or_load(const Key& key,
                                            const std::function<std::shared_ptr<const Bytes>()>& load);
   // Chunks larger than a shard's share of the budget are not kept.

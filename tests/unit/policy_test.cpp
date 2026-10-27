@@ -131,7 +131,7 @@ TEST(Policy, EachStoresNewDataItsWay) {
   EXPECT_TRUE(cold(plain));
   EXPECT_EQ(codec_of(*fs, *store, files["none"]), CodecId::none);
   EXPECT_EQ(codec_of(*fs, *store, files["fast"]), CodecId::lz4);
-  EXPECT_TRUE(inode(*fs, files["max"]).chunks.at(0).packed) << "three chunks in one unit";
+  EXPECT_FALSE(inode(*fs, files["max"]).chunks.at(0).packed) << "each chunk on its own";
 
   // Space by policy.
   SpaceStats s = fs->space_stats();

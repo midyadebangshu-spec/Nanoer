@@ -357,7 +357,7 @@ int cmd_tier(const std::vector<std::string_view>& args) {
   fs->unmount();
   const TierStats& t = after.tier;
   std::cout << target << ": " << chunks << " chunks made cold in " << std::fixed << std::setprecision(1) << seconds
-            << " s: " << t.units << " cold units, " << t.singles << " single records, " << t.packs
+            << " s: " << t.singles << " records, " << t.packs
             << " packs, " << t.in_place << " left as they were (no smaller)\n"
             << "  rewritten: " << format_size(t.stored_before) << " -> " << format_size(t.stored_after)
             << "; stored data " << format_size(before.stored_bytes) << " -> " << format_size(after.stored_bytes)

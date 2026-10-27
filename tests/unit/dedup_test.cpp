@@ -93,22 +93,10 @@ TEST(DedupIndex, MatchesAMapThroughInsertsAndErasures) {
 TEST(DedupIndex, TargetsItCannotHoldAreLeftOut) {
   DedupIndex index;
   index.put(5, {1ull << 50, false, 0});  // beyond 256 TiB
-  index.put(6, {64, true, 70000});       // a piece past 64 KiB, not in whole 4 KiB
-  index.put(7, {64, true, 1u << 28});    // a piece past 256 MiB
+  index.put(6, {64, true, 70000});       // a piece past 64 KiB
   EXPECT_EQ(index.size(), 0u);
   EXPECT_FALSE(index.find(5));
   index.erase(6, {64, true, 70000});  // and erasing one is harmless
-}
-
-TEST(DedupIndex, PiecesOfColdUnitsInWholeChunks) {
-  DedupIndex index;
-  for (std::uint32_t piece : {0u, 65535u, 1u << 17, 7u << 17, (1u << 28) - 4096}) {
-    index.put(piece + 1, {800, true, piece});
-    EXPECT_EQ(index.find(piece + 1), (DedupTarget{800, true, piece})) << piece;
-  }
-  index.erase(1u + (1 << 17), {800, true, 1u << 17});
-  EXPECT_FALSE(index.find(1u + (1 << 17)));
-  EXPECT_EQ(index.size(), 4u);
 }
 
 TEST(Dedup, IdenticalFilesAreStoredOnce) {

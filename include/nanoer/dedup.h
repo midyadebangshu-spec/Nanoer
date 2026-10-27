@@ -17,7 +17,7 @@ namespace nanoer {
 struct DedupTarget {
   std::uint64_t offset = 0;  // the record (8-byte aligned)
   bool packed = false;       // a piece of a pack ...
-  std::uint32_t piece = 0;   // ... starting here in it
+  std::uint32_t piece = 0;   // ... starting here in it (packs are at most 64 KiB)
   bool operator==(const DedupTarget&) const = default;
 };
 
@@ -26,8 +26,7 @@ class DedupIndex {
   // Points `key` at `target`, replacing what it pointed at (the newest
   // record with a content wins: after GC moves a record, its copy). A
   // target the index cannot hold (an offset from 256 TiB, a piece from
-  // 64 KiB on that is not a multiple of 4 KiB below 256 MiB: rare in cold
-  // units, else possible only in other writers' or damaged images) is left
+  // 64 KiB on: possible only in other writers' or damaged images) is left
   // out: a missed duplicate at worst.
   void put(std::uint64_t key, const DedupTarget& target);
   std::optional<DedupTarget> find(std::uint64_t key) const;

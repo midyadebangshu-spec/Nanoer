@@ -203,7 +203,7 @@ void workload(Filesystem& fs, const std::function<void()>& synced, Extra extra =
         bool noisy = pick(4) != 0;  // mostly incompressible, so segments fill up
         for (auto& b : data) b = noisy ? static_cast<std::uint8_t>(rng()) : static_cast<std::uint8_t>('a' + step % 5);
         if (!noisy && extra == Extra::tier) {
-          // Text: what a higher level and larger units gain from.
+          // Text: what a higher level gains from.
           static const char* const words[] = {"error ", "warning ", "request ", "from ", "user ", "id=", "\n", "ok "};
           std::string text;
           while (text.size() < data.size()) text += words[pick(8)] + std::to_string(pick(1000));
@@ -291,11 +291,10 @@ Recording record_workload(Extra extra = Extra::none) {
   }, extra);
   FsInfo info = fs->info();
   if (extra == Extra::tier) {
-    std::cout << "[ crash ] recompressed " << info.tier.chunks << " chunks: " << info.tier.units << " units, "
-              << info.tier.singles << " single, " << info.tier.packs << " packs, " << info.tier.in_place
+    std::cout << "[ crash ] recompressed " << info.tier.chunks << " chunks: "
+              << info.tier.singles << " records, " << info.tier.packs << " packs, " << info.tier.in_place
               << " in place\n";
-    EXPECT_GT(info.tier.units, 10u) << "the workload must make cold units";
-    EXPECT_GT(info.tier.singles, 5u);
+    EXPECT_GT(info.tier.singles, 20u) << "the workload must recompress data";
     EXPECT_GT(info.tier.in_place, 10u);
   }
   if (gc) {
