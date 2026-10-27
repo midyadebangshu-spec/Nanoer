@@ -1,7 +1,23 @@
 # M5 plan: smart features (cold data recompressed, folder policies)
 
-**Status: APPROVED 2026-10-27** with the recommended answer to every
-decision in §11; built. Part of stage 1 ([`STAGE1_PLAN.md`](STAGE1_PLAN.md)).
+**Status: COMPLETE 2026-10-27.** Approved with the recommended answer to
+every decision in §11; decision 2 later revised with approval (below). Part of stage 1 ([`STAGE1_PLAN.md`](STAGE1_PLAN.md)).
+
+**Results** (measured: `KNOWLEDGE.md` §14, 2026-10-27), against §1:
+
+1. Cold data recompressed by itself: **met, at the low end.** `/usr`
+   stores 33.6 % of its size once cold, against 37.4 % (−10.2 %; the
+   target was at least 10 %); 31.4 % under `max`.
+2. Reading as fast as before: **met.** Cold 428 MB/s sequential against
+   449 hot; random 4 KiB reads 0.74 ms against 0.86.
+3. Crash-safe: **met.** Crash points with recompression (2,499 images
+   per run, every one a real state), the model test, `kill -9` on real
+   mounts while recompressing, `fsck` on cold data.
+4. Folder policies: **met** (`none`, `fast`, `balanced`, `max`, inherited).
+5. Cache decided by measurement: **2Q built and adopted** (98.8 % of a
+   working set kept through a scan, against 58.9 % for the LRU).
+6. Measured: **done**, except the M4 duplicate-heavy set after going cold
+   (not repeated: cold data keeps its dedup, which the tests check).
 
 **Changed with approval: no cold units (decision 2 revised, 2026-10-27).**
 The 1 MiB cold units of §3 read 25–30 % slower sequentially on a real

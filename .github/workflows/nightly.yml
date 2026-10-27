@@ -74,3 +74,7 @@ jobs:
           sudo KILL_ROUNDS=50 KILL_LOAD=fsx KILL_LIVE_LIMIT_MB=40
           NANOER_MKFS_OPTS="--size 160M --segment-size 1M"
           tests/integration/run_mounted.sh build/release/src kill
+      - name: Kill rounds while cold data is recompressed (every file cold at once)
+        run: >-
+          sudo KILL_ROUNDS=50 NANOER_MOUNT_OPTS="cold_after=0,idle=0"
+          tests/integration/run_mounted.sh build/release/src kill

@@ -1568,6 +1568,8 @@ options (safe space 256 MiB). Cold data made with `nanoer tier --age 0`
 | hot (M4: zstd 1, small files packed) | 1.7 GiB = 37.4 % | 44,620 | — |
 | **cold, default policy (zstd 9 per chunk)** | **1.5 GiB = 33.6 % (−10.2 %)** | 44,620 | 35.7 s (≈ 120 MB/s) |
 | cold, 1 MiB units (built first, dropped: §7.7) | 1.4 GiB = 32.3 % (−13.6 %) | 19,422 | 54.9 s |
+| hot, `max` policy (zstd 3) | 1.6 GiB = 35.7 % | 44,619 | — |
+| **cold, `max` policy (zstd 19 per chunk)** | **1.4 GiB = 31.4 %** | 44,619 | 638.8 s (≈ 7 MB/s) |
 | cold, `max` policy, 1 MiB units with zstd 19 (dropped) | 1.3 GiB = 29.6 % | 19,199 | 562.8 s |
 Per chunk, 3,945 records were only marked (no 3 % gain) and 2,816 packs
 of small files were packed again. Afterwards `nanoer gc` copied 46 MiB and
@@ -1594,7 +1596,8 @@ file stored 204.0 MiB hot and 190.7 MiB cold.
   plan's condition (within 10 %) is met.
 - `/usr` stores 10 % less once cold, at the low end of what the plan
   aimed for (at least 10 %); units would have saved 13.6 % at the cost
-  of 25–30 % slower reads (§7.7).
+  of 25–30 % slower reads (§7.7). Under `max` it stores 31.4 %, but
+  recompressing is 18 times slower: right for archives, not as a default.
 - Toward 800 GB → 500 GB (62.5 %): an OS tree is at 33.6 %, source and
   text far lower; encoded media stays near 100 % whatever the level.
 
