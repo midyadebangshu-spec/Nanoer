@@ -1,8 +1,8 @@
 # M6 plan: metadata on disk, format migration, benchmark report
 
-**Status: PROPOSED, waiting for approval.** Part of stage 1
-([`STAGE1_PLAN.md`](STAGE1_PLAN.md)); the last milestone of the stage. No M6
-code is written until this plan is approved.
+**Status: APPROVED 2026-10-27** with the recommended answer to every
+decision in §12; in progress. Part of stage 1
+([`STAGE1_PLAN.md`](STAGE1_PLAN.md)); the last milestone of the stage.
 
 ## 1. Goal
 
