@@ -3,7 +3,8 @@
 **Status: APPROVED 2026-10-24** with the recommended answers to every
 question in §9. **M1, M2 and M3 complete** (2026-10-24); see
 [`M2_PLAN.md`](M2_PLAN.md) and [`M3_PLAN.md`](M3_PLAN.md); **M4 complete**
-(2026-10-26), see [`M4_PLAN.md`](M4_PLAN.md). Background and reasoning for each technology are in
+(2026-10-26), see [`M4_PLAN.md`](M4_PLAN.md). **M5 plan** written
+(2026-10-27), waiting for approval: [`M5_PLAN.md`](M5_PLAN.md). Background and reasoning for each technology are in
 [`KNOWLEDGE.md`](../KNOWLEDGE.md).
 
 ## 1. Goal

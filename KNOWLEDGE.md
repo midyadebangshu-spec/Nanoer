@@ -444,6 +444,12 @@ Since GC already rewrites data, it can **recompress** it at the same time:
 Btrfs and ZFS can only do this through a manual rewrite (defragment or
 recompress). Doing it automatically is one of Nanoer's intended advantages.
 
+**M5 proposal (measured 2026-10-27, §14):** data counts as cold once not
+written for 7 days (reads do not count: zstd 9 decompresses as fast as
+zstd 1, and access times are not written); it becomes zstd 9 in 1 MiB units
+(eight consecutive chunks of one file in a pack), 14 % smaller. zstd 19 only
+under the `max` folder policy; LZMA never automatically.
+
 ### 7.8 Small files
 
 A 300-byte file in a 4 KiB block wastes 93 %. Solutions: **inline** tiny
@@ -746,6 +752,11 @@ open file. The next chunk(s) are decompressed in the background on a thread
 pool before they are requested. Linux has its own read-ahead (default
 `read_ahead_kb` = 128 KiB); Nanoer's operates at chunk granularity on top of
 it.
+
+**Measured before M5 (§14):** the engine streams at ≈ 2,000 MB/s on one
+thread but a mount at 808 MB/s: FUSE's round trips, not decompression, set
+the speed, so the M5 plan leaves an engine read-ahead out (FUSE already
+asks for 1 MiB ahead).
 
 ---
 
@@ -1326,6 +1337,64 @@ of 16 KiB, debug build:
 
 Before M4 the same workload fails within one pass over the files.
 
+### 2026-10-27: live reads and writes on a mounted filesystem (M4)
+
+Safe space 50 MiB, release build, this VM:
+
+| | |
+|---|---|
+| 2 GiB of log text written | 32.8 s, stored in 31 MiB |
+| cold 1 MiB read at offset 1 GiB | 92 ms |
+| the whole 2 GiB streamed | 9.6 s; nanoerfs peak memory 18 MiB |
+| 30-byte edit in the middle of the file | 7 ms; seen by another process at once, kept after remount |
+| 120 s 720p video (39 MiB): seek to 1:30, play 5 s, cold | 601 ms |
+| the whole video decoded | 4.3 s |
+| `fsck --deep` afterwards | clean (16,689 chunks) |
+
+**Conclusion:** live extraction works as intended: a read decompresses only
+the chunks it touches, and memory stays within the safe space whatever the
+file size.
+
+### 2026-10-27: codecs, levels and unit size for cold data (before M5)
+
+`nanoer bench` on 512 MiB of `/usr` (22,966 files), one thread:
+
+| Codec | 128 KiB: stored | 1 MiB: stored | compress MB/s (1 MiB) | decompress MB/s (1 MiB) |
+|---|---:|---:|---:|---:|
+| lz4 0 | 50.0 % | 49.4 % | 387 | 3,171 |
+| lz4 9 | 43.3 % | 42.2 % | 26 | 3,074 |
+| zstd 1 (today, 128 KiB) | 41.1 % | 40.1 % | 270 | 1,176 |
+| zstd 3 | 39.6 % | 37.2 % | 113 | 1,047 |
+| zstd 9 | 37.6 % | 35.3 % | 43 | 1,175 |
+| zstd 19 | 35.9 % | 33.2 % | 3 | 873 |
+| lzma 1 | 36.0 % | 33.7 % | 8 | 43 |
+| lzma 6 | 34.5 % | 31.8 % | 3 | 45 |
+
+**Conclusion:** zstd 9 in 1 MiB units stores 14 % less than today's zstd 1
+in 128 KiB chunks and decompresses just as fast; zstd 19 gains two points
+more at 3 MB/s (two days per 500 GB on three cores); LZMA reads 25× slower.
+This is the basis of M5's cold form ([`docs/M5_PLAN.md`](docs/M5_PLAN.md)).
+
+### 2026-10-27: where streaming reads spend their time (before M5)
+
+Same VM, cold caches, 1 GiB files:
+
+| | MB/s |
+|---|---:|
+| zstd 1 decompression of log data alone | 4,643 |
+| the engine alone (no FUSE), sequential, 128 KiB or 1 MiB requests | ≈ 2,000 |
+| mounted, log data, `dd` to `/dev/null` | 808 |
+| mounted, incompressible data (stored raw) | 468 |
+| mounted, log data, `cat \| sha256sum` | 234 |
+| `sha256sum` alone, from memory | 310 |
+
+**Conclusion:** decompression is not the bottleneck: FUSE's request round
+trips are (808 against 2,000 MB/s). An engine read-ahead decompressing in
+parallel would have little to gain, so M5 leaves it out; the stage 3 kernel
+driver removes the round trips. Raw data reads slower than compressible data
+because more bytes move. (An earlier "213 MB/s streaming" figure was
+`sha256sum`'s speed, not Nanoer's.)
+
 ### 2026-10-24: what M4's techniques could save on `/usr` (before M4)
 
 All regular files under `/usr` on the development VM (Ubuntu 24.04 with
@@ -1455,6 +1524,7 @@ rejected.
 | 2026-10-26 | BLAKE3's CPU detection done once under a thread-safe static in our wrapper | the vendored library initialises a plain global lazily (a data race when threads hash at once); never edit `third_party` | locking every hash; patching the library |
 | 2026-10-26 | Targets the dedup index cannot hold are left out, not refused | the index is a hint; a damaged or foreign image must not fail on it | rejecting such references as corrupt (they may be valid) |
 | 2026-10-26 | `no_dedup` as a compat feature bit | a preference that an older reader may ignore safely (it does not dedup anyway) | an incompat bit; a separate settings area |
+| 2026-10-27 | M5 proposed without an engine read-ahead (pending approval) | measured: the engine streams at 2,000 MB/s, a mount at 808 MB/s, so FUSE sets the speed | parallel prefetch into the safe space (STAGE1_PLAN's original M5 item) |
 
 ---
 
