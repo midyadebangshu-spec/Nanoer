@@ -6,8 +6,8 @@ recovery tool) must be writable from this document alone, without reading
 any code. When the code and this document disagree, one of them is a bug.
 
 Status: **1.0 draft**. It defines the store geometry, superblocks, segments,
-records, data chunks, metadata transactions, checkpoints, segment seals, how
-the log is read back, and how segments are reused. Until Nanoer 1.0 is
+records, data chunks, metadata transactions, checkpoints, the metadata tree,
+segment seals, how the log is read back, and how segments are reused. Until Nanoer 1.0 is
 released, the format may still change without a version bump.
 
 ## 1. Conventions
@@ -124,11 +124,15 @@ error (old readers ignore the field), but writers preserve it.
 | compat | 0 | `no_dedup` | a preference: writers do not deduplicate new data (`mkfs.nanoer --no-dedup`) |
 | incompat | 0 | `shared_records` | a data chunk record may have several references (dedup) or hold several small files (a pack); the log may contain SetChunkRef (§8) and checkpoints use version 2 (§9) |
 | incompat | 1 | `cold_data` | extended references may carry the `cold` flag (§8); only with `shared_records` (ignored without it) |
+| incompat | 2 | `metadata_tree` | the metadata is a B+tree of nodes in the log (§9.2): checkpoints use version 3 and the log holds tree node records (type 5); extended references may carry `owner` (§8); only with `shared_records` |
 
-`mkfs` sets `shared_records` and `cold_data` on every new filesystem.
-Without them a filesystem is exactly as earlier drafts of 1.0 wrote it, and
-stays so. A filesystem rescued from a version 2 checkpoint (no valid
-superblock left) gets both.
+`mkfs` sets `shared_records`, `cold_data` and `metadata_tree` on every new
+filesystem. Without them a filesystem is exactly as earlier drafts of 1.0
+wrote it, and stays so. A filesystem rescued from a version 2 checkpoint (no
+valid superblock left) gets the first two; from a version 3 checkpoint, all
+three. A filesystem without `metadata_tree` (made before M6) is read by
+loading its whole checkpoint into memory, as before; writers mount it
+read-only until it is upgraded.
 
 ## 4. Segments
 
@@ -205,6 +209,7 @@ intact, the filesystem is corrupt: never return its data.
 | 2 | metadata transaction | §8 |
 | 3 | checkpoint part | §9 |
 | 4 | segment seal | §10 |
+| 5 | tree node | §9.2; only with `metadata_tree` |
 
 An unknown record type in the log makes the filesystem unreadable.
 
@@ -325,7 +330,10 @@ flag 1 is set:
 | 1 | `hash` | `key`: the first 8 bytes of the chunk data's BLAKE3, little-endian, never 0 (the dedup key) |
 | 2 | `share` | the record already has a reference; this is one more (dedup). Not with `packed` |
 | 3 | `cold` | the chunk's data has been recompressed in its cold form (§8, *cold data*); only with `cold_data`, else the log is damaged |
-| 4+ | — | reserved; a set unknown flag means the log is damaged |
+| 4 | `owner` | then `ino`, `index` (varint): the chunk the record's header names (see below); only with `share`, not with `packed`, and only with `metadata_tree` |
+| 5+ | — | reserved; a set unknown flag means the log is damaged |
+
+The fields come in flag order: `piece`, `key`, then `ino` and `index`.
 
 **Space and references** (with `shared_records`). A record's space
 (`stored_size`) counts once, however many chunks refer to it. A reader
@@ -345,6 +353,22 @@ than one reference:
 
 Without `shared_records`, every chunk claims space of its own, and a
 record referred to twice is damage.
+
+**Back-references** (with `metadata_tree`). The tree (§9.2) lists the
+users of every pack and of every record that has been shared, in a *refs*
+item; any other record has exactly one user, the chunk its header names
+(`inode`, `file_offset / chunk_size`). Garbage collection, which finds
+records by scanning segments, uses the one or the other to find who
+refers to a record. So:
+
+- the first SetChunkRef with `share` to a record without a refs item
+  carries `owner`, the chunk that refers to it now (whatever its header
+  says); the refs item is created with that user and the new one;
+- once created, a refs item stays as long as the record has a reference,
+  even one (a *sticky* item): the remaining user need not be the one the
+  header names;
+- a copy of a record without a refs item (garbage collection) names its
+  one user in its header.
 
 **Cold data** (with `cold_data`). A writer may rewrite data that has stopped
 changing in a denser form, and marks every reference to the new record
@@ -383,10 +407,17 @@ Rules (a violation means the log is damaged):
 - After an inode is created, the allocation counter is at least its id + 1;
   inode numbers are never reused while that inode exists.
 
-## 9. Checkpoints (type 3)
+## 9. Checkpoints (type 3) and the metadata tree (type 5)
 
-A checkpoint is a complete snapshot of the metadata, so mounting does not
-have to replay the whole history. A snapshot can be large, so it is split
+A checkpoint is the state of the metadata as of one transaction, so
+mounting does not have to replay the whole history. Without
+`metadata_tree` it is a complete snapshot (versions 1 and 2); with it, the
+metadata lives in a B+tree whose nodes are records in the log, and the
+checkpoint names the tree's root (version 3, §9.2).
+
+### 9.1 Checkpoint records
+
+The checkpoint's stream can be large (version 1 and 2), so it is split
 into **parts**, written one after another in log order (possibly across
 segments). The superblock's `checkpoint_offset` points at part 0.
 
@@ -429,6 +460,84 @@ single reference, or references to one record that disagree on
 reader must also check that the root exists and is a directory, that every
 entry resolves, and that no id reaches `next_inode`.
 
+### 9.2 The metadata tree (with `metadata_tree`)
+
+**Stream, version 3.**
+
+```
+"NNRCKPT3"                         8 bytes
+last_txid, next_inode              varint
+root_offset, root_size             varint: the root node's record (0, 0: an empty tree)
+node_bytes                         varint: stored_size of every node record in the tree
+files, directories, other_inodes   varint: inodes by type
+logical_bytes                      varint: sum of the regular files' sizes
+segment_count                      varint
+  index, seq, live_bytes           varint, per segment in use
+```
+
+`live_bytes` of a segment counts the data records referred to (§8) and the
+tree node records the tree holds, each once. A writer writes the tree's
+changed nodes before the checkpoint that names them; all of them are in
+the log before the checkpoint's first part.
+
+**Node records (type 5).** Type-specific header (48 bytes), from record
+offset 32:
+
+| Offset | Size | Field | Meaning |
+|---:|---:|---|---|
+| 32 | 1 | `codec` | §7 |
+| 33 | 1 | `level` | 0: a leaf |
+| 34 | 2 | reserved | |
+| 36 | 4 | `count` | items (leaf) or children (inner node) |
+| 40 | 4 | `uncompressed_size` | of the node encoding, at most 64 MiB |
+| 44 | 4 | reserved | |
+| 48 | 8 | `xxh3` | XXH3-64 of the node encoding |
+| 56 | 17 | `first` | the node's first key (below) |
+| 73 | 7 | reserved | |
+
+The payload is the node encoding, compressed with `codec` (the engine uses
+zstd level 1; nodes are 16 KiB uncompressed, at most). `level`, `count`
+and `first` repeat what the node holds, so garbage collection can find a
+node in the tree (from its first key, down to its level) by scanning
+segments alone. `fsck` checks them against the node.
+
+**Node encoding.** `level` (u8), `count` (varint), then `count` keys in
+strictly increasing order, then for a leaf `count` values (`bytes`, at
+most 16 MiB each), for an inner node `count` children (`offset`,
+`stored_size` varint: a node record; neither 0). A key is 17 bytes:
+`object` (u64), `kind` (u8), `offset` (u64), little-endian, ordered by
+`object`, then `kind`, then `offset`. An inner node's keys are its
+children's first keys; each child's level is one less than its parent's;
+leaves are at level 0. Copy on write: a changed node is written as a new
+record and its parent changed to point at it, up to a new root; the old
+records become dead space.
+
+**Items.** Every key in a leaf is an item:
+
+| Kind | Object | Offset | Value |
+|---:|---|---|---|
+| 1 inode | inode | 0 | attributes (§8) |
+| 2 counts | inode | 0 | `entries`, `data_bytes` (varint): a directory's entries; a file's chunks' `size` summed. Absent when both are 0 |
+| 3 xattr | inode | XXH3-64 of the name | `n` (varint, at least 1), then `n` × (name bytes(255), value bytes(65536)): the xattrs whose names have that hash |
+| 4 entry | directory | XXH3-64 of the name | `n` (varint, at least 1), then `n` × (name bytes(255), `ino` varint): the entries whose names have that hash |
+| 5 chunk | inode | chunk index | an extended reference (§8) without `share` or `owner` |
+| 6 orphan | 0 | inode | empty: an inode other than the root with `nlink` 0, freed once nothing has it open |
+| 7 refs | 2^63 + record offset | 0 | `count`, `n` (varint, `n` = `count`), then `n` × (`ino`, `index` varint): the record's users (§8, *back-references*) |
+
+Every item of an inode follows its inode item (they share `object`, and
+kind 1 sorts first). `fsck` checks that names hash to their key, that no
+name appears twice, that a file's chunk items agree with the refs items
+(every pack and every refs item has exactly its users), and that the
+counters and `live_bytes` match the items. An orphan item exists exactly
+for each inode with `nlink` 0 (not the root).
+
+Applying an operation (§8) changes the items: PutInode writes the inode
+item (and the orphan item); DeleteInode removes every item of the inode;
+SetEntry and RemoveEntry change the entry item of the name's hash and the
+directory's `entries` count; SetChunk, SetChunkRef, RemoveChunk and
+TruncateChunks the chunk items, `data_bytes`, refs items and `live_bytes`;
+SetXattr and RemoveXattr the xattr item of the name's hash.
+
 ## 10. Segment seals (type 4), reading the log, and reusing segments
 
 ### 10.1 Seals
@@ -457,6 +566,7 @@ seal always fits.
      operations in order;
    - checkpoint part: skip (a later checkpoint the superblock never pointed
      to; the transactions around it give the same state);
+   - tree node: skip (a checkpoint after it names it, if any);
    - seal: if segment `next_index` has an intact header with sequence number
      `next_seq`, continue at its first record; otherwise the log ends at the
      seal itself.
@@ -531,6 +641,8 @@ slot points to, should the newest superblock write be torn. Therefore:
 `mkfs` writes segment 0 (sequence number 1) holding a checkpoint of the
 empty filesystem: the root directory (inode 1, a directory with mode 0755,
 `nlink` 2, `parent` 1), `next_inode` 2, `last_txid` 0, and segment 0 in use.
+With `metadata_tree`, the root's inode item is the one leaf of the tree,
+written just before the checkpoint.
 Both superblocks point at it, with `next_segment_seq` 2. Every filesystem
 therefore always has a checkpoint.
 
@@ -543,3 +655,4 @@ therefore always has a checkpoint.
 | 1.0 (draft, M3) | transaction `durable_back` (was reserved, so older images read as "unknown"); superblock `state` flags (was reserved); damage detection, contradictory transactions, checkpoint fallback and rescue (§10.2) |
 | 1.0 (draft, M4) | `shared_records` feature: SetChunkRef, shared records and packs, reference counting, checkpoint version 2; data chunk `pack` flag; `no_dedup` compat preference; dedup shares only records whose `blake3` matches |
 | 1.0 (draft, M5) | `cold_data` feature: reference flag `cold`, cold records; the `user.nanoer.policy` attribute |
+| 1.0 (draft, M6) | `metadata_tree` feature: the metadata as a B+tree of node records (type 5), checkpoint version 3, back-references (refs items) and the reference flag `owner` |

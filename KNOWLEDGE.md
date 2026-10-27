@@ -443,6 +443,81 @@ so the tree is tested in memory and the filesystem stores nodes in its log.
   the cache budget; damaged nodes. Two deliberate bugs (a merge losing an
   item, a flush not releasing what it replaced) were each caught.
 
+**As built (M6 step 2): the filesystem's metadata on the tree**
+(`src/core/metadata.cpp`, format: `docs/format.md` §9.2).
+
+- **Items.** Every inode, directory entry, chunk reference and xattr is
+  an item; an inode's items share its number as `object`, so one scan
+  reads a file's chunks or a directory's entries in order. Entries and
+  xattrs are filed by XXH3-64 of the name (names that collide share one
+  item), so a lookup is one key. A *counts* item per inode keeps what used
+  to be computed from the in-memory maps (entries in a directory, data
+  bytes in a file); *orphan* items list unlinked inodes still open; global
+  counters (files, directories, logical bytes, node bytes) live in the
+  checkpoint, so statistics need no walk.
+- **Back-references.** GC finds records by scanning segments and must
+  learn who uses each. A record with one user names it in its header
+  (inode, file offset), as since M1; only packs and shared records get a
+  *refs* item listing their users. The catch: when a dedup share makes a
+  plain record shared, its header names the original writer, which may
+  since have moved on, so the share carries the record's current user
+  (the reference flag `owner`), and the refs item then stays as long as
+  the record is used, even down to one user (*sticky*): that last user need
+  not be the one the header names. GC copies of a single-user record
+  rewrite the header's owner to its user; tiering does the same for the
+  single records it writes.
+- **Checkpoints** write the tree's changed nodes (as tree node records,
+  zstd 1), then a small record with the root, the counters and the segment
+  table: a few hundred bytes, against 122 MiB for 1M files before (§14).
+  A checkpoint also comes when changed nodes reach 1/32 of the store
+  (256 KiB–32 MiB), so dirty nodes never pile up in memory.
+- **Space** of nodes is counted in their segments' live bytes like data;
+  a node replaced since the last flush still counts until the flush
+  releases it (the previous tree must stay whole until then). `nanoer
+  stats` reports nodes separately (`metadata_disk_bytes`); its
+  `live_bytes` is data only.
+- **The filesystem layer** keeps only attributes it changed since the last
+  commit in memory (`attrs_`); everything else is read through the tree
+  and its cache (64 MiB).
+- **GC** scans each victim's record *headers* (no payloads: faster, and
+  enough to find users and nodes). A damaged payload is found when the
+  record is read to be copied, and left in place, as before. A damaged
+  *header* ends the scan early; since every victim is sealed, a scan that
+  does not reach the seal has missed records, so that segment is not
+  collected (it would lose them) and the damage is reported. This was a
+  bug in the first port, caught by the existing damage test: scanning
+  whole records stopped silently at the first bad one. Nodes in a victim
+  are marked dirty (`relocate`) and move at the next checkpoint;
+  `relocate` reports only a change, else a victim holding only nodes
+  looped forever (caught by the GC tests hanging). Open: in the GC churn test
+  (160 MiB rewritten over 6–7 MiB live), write amplification rose from 2.1
+  to 3.0 with the tree; to be explained with step 5's measurements.
+- **The dedup index** is no longer in the checkpoint: it starts empty at
+  mount and is filled from the chunk items in the background, 4,096 items
+  per step under the shared lock, inserted under the exclusive lock only if
+  the chunk is unchanged, in 200 ms slices per background tick. It has a
+  memory limit (128 MiB, ≈ 5M chunks); beyond it new keys are left out
+  (duplicates missed, never wrong). Until it is complete, duplicates of
+  older data are missed.
+- **`fsck`** loads the whole tree into the in-memory form of M2–M5
+  (`to_legacy`) and runs the existing checks on it; a repair writes a new
+  tree with everything (`from_legacy`). Memory is proportional to the
+  filesystem, offline only. This departs from the plan's risk table (which
+  said fsck streams the tree in key order): it keeps every existing check
+  and repair working unchanged for now; streaming, if 1M-file
+  measurements show it is needed, comes with step 3's tree checks.
+- **Filesystems from before M6** (no `metadata_tree`) are replayed as
+  before into the in-memory form, converted to a tree in memory, and
+  mounted read-only until upgraded; their checkpoints stay version 1 or 2.
+- **Tests:** the tree metadata against the M2–M5 implementation as an
+  oracle (`tests/unit/metadata_test.cpp`): random operations of every
+  kind (files, directories, renames, unlinks, orphans, dedup shares,
+  packs, xattrs) on both, compared item by item, through checkpoints, with
+  512-byte nodes for several levels; back-references checked against the
+  chunks; a deliberate bug (truncation keeping one chunk) was caught. All
+  earlier tests (crash points, the filesystem model, GC, tiering, fsck)
+  run on the new format.
+
 ### 7.6 Garbage collection (GC) and compaction
 
 Overwrites and deletes leave **dead** chunks inside segments. GC picks
@@ -1842,6 +1917,10 @@ rejected.
 | 2026-10-27 | Cache shard chosen by a full 64-bit mix of the key | the old hash used 2 of 16 shards (a bug since M2) | — |
 | 2026-10-27 | Tree nodes of 16 KiB compressed with zstd 1, confirmed | measured (§14): half the size of raw nodes; larger nodes save under 3 % more and cost more per cache miss | 4 or 8 KiB (5–15 % larger, shallower trees lost), 32–64 KiB (slower misses), raw (twice the size) |
 | 2026-10-27 | M6 plan approved with the recommended answers: one CoW B+tree keyed (object, kind, offset); 16 KiB nodes compressed with zstd 1 (to be confirmed by measurement); directory entries by 64-bit name hash; dedup index bounded in RAM (128 MiB) and rebuilt in the background after mount; back-references for packs and shared records; `nanoer upgrade` required to write M2–M5 filesystems; format 1.0 at the end of M6; discard on by default; the full benchmark set on this VM; a 64 MiB metadata cache | user approval of `docs/M6_PLAN.md` | see plan §12 |
+| 2026-10-27 | Back-references only in refs items for packs and records once shared; a share that makes a record shared carries its current user (`owner` flag); refs items stay down to one user | GC must find every user of a record from a segment scan; a plain record's header already names its one user, so most records need nothing more | refs items for every record (an item per chunk more); recomputing users from a full walk |
+| 2026-10-27 | GC reads record headers only, and leaves a segment whose scan stops before its seal | a damaged header hides the records after it: collecting the segment would lose them (a bug of the first port, caught by the damage test) | scanning whole records (slower, and stopped silently at damage) |
+| 2026-10-27 | The dedup index rebuilt after mount in steps (4,096 items, 200 ms slices), capped at 128 MiB (new keys left out when full) | no index in the checkpoint; mount stays fast; RAM bounded | storing the index in the tree (a write per chunk); rebuilding it during mount (slow mounts) |
+| 2026-10-27 | `fsck` materializes the tree into the M2–M5 in-memory form and repairs by writing a whole new tree | every check and repair of M3–M5 keeps working; offline only; memory proportional to the filesystem | streaming the tree in key order (the plan's risk table; later, if 1M-file measurements need it) |
 | 2026-10-27 | M5 proposed without an engine read-ahead (pending approval) | measured: the engine streams at 2,000 MB/s, a mount at 808 MB/s, so FUSE sets the speed | parallel prefetch into the safe space (STAGE1_PLAN's original M5 item) |
 
 ---

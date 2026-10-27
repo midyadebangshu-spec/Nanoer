@@ -128,6 +128,7 @@ ChunkRef decode_ref_ex(Decoder& in, bool& share, std::optional<ChunkUser>* owner
   share = flags & ref_flags::share;
   r.cold = flags & ref_flags::cold;
   if (flags & ref_flags::owner) {
+    if (!share || r.packed) corrupt("an owner without share");
     ChunkUser u;
     u.ino = in.varint();
     u.index = in.varint();

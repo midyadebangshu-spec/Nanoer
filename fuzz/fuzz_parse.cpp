@@ -1,6 +1,6 @@
 // Damaged or hostile on-disk structures: superblocks, segment headers,
-// records, checkpoint snapshots and metadata operations must be rejected
-// cleanly, never crash.
+// records, checkpoint snapshots, tree nodes and metadata operations must be
+// rejected cleanly, never crash.
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -9,6 +9,7 @@
 #include "nanoer/error.h"
 #include "nanoer/format.h"
 #include "nanoer/io.h"
+#include "nanoer/legacy_metadata.h"
 #include "nanoer/metadata.h"
 #include "nanoer/record.h"
 #include "nanoer/segment.h"
@@ -48,16 +49,24 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
         if (e.code() != nanoer::Errc::corrupt) __builtin_trap();
       }
     }
+    if (record->header.type == nanoer::RecordType::tree_node) {
+      try {
+        (void)nanoer::parse_tree_node(*record);
+        (void)nanoer::BTree::decode(nanoer::decode_tree_node(*record));
+      } catch (const nanoer::Error& e) {
+        if (e.code() != nanoer::Errc::corrupt) __builtin_trap();
+      }
+    }
     offset += record->stored_size();
   }
 
-  // A checkpoint snapshot, with and without shared records. One that is
-  // accepted must encode to a snapshot that decodes to the same state.
+  // A snapshot from before M6, with and without shared records. One that
+  // is accepted must encode to a snapshot that decodes to the same state.
   for (bool shared : {false, true}) {
     try {
-      nanoer::Metadata m = nanoer::Metadata::decode_checkpoint(input, nanoer::kDataStart, 20, shared);
+      nanoer::LegacyMetadata m = nanoer::LegacyMetadata::decode_checkpoint(input, nanoer::kDataStart, 20, shared);
       nanoer::Bytes again = m.encode_checkpoint();
-      if (!(nanoer::Metadata::decode_checkpoint(again, nanoer::kDataStart, 20, shared) == m)) {
+      if (!(nanoer::LegacyMetadata::decode_checkpoint(again, nanoer::kDataStart, 20, shared) == m)) {
         __builtin_trap();
       }
       // Then the input, read as operations, applied to it.
@@ -66,6 +75,40 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
     } catch (const nanoer::Error& e) {
       if (e.code() != nanoer::Errc::corrupt) __builtin_trap();
     }
+  }
+
+  // A tree node.
+  try {
+    (void)nanoer::BTree::decode(input);
+  } catch (const nanoer::Error& e) {
+    if (e.code() != nanoer::Errc::corrupt) __builtin_trap();
+  }
+
+  // A tree checkpoint (its root is read from memory, so a valid one is
+  // rare), and the input as operations applied to a small tree.
+  nanoer::Metadata::Options options;
+  options.tree = {.node_bytes = 512, .cache_bytes = 1 << 20};
+  options.account_nodes = false;
+  auto io = std::make_shared<nanoer::MemNodeIO>();
+  try {
+    nanoer::Metadata m = nanoer::Metadata::decode_checkpoint(input, nanoer::kDataStart, 20, options, io);
+    (void)m.attrs(nanoer::kRootInode);
+  } catch (const nanoer::Error& e) {
+    if (e.code() != nanoer::Errc::corrupt) __builtin_trap();
+  }
+  try {
+    nanoer::Metadata m = nanoer::Metadata::empty(nanoer::kDataStart, 20, options, io, 0, 0, 1);
+    for (std::uint64_t i = 0; i < 16; ++i) m.segments[i] = {i + 1, 0};
+    nanoer::Decoder ops(input);
+    while (!ops.done()) m.apply(nanoer::decode_op(ops));
+    // Whatever was accepted reads back, and survives a checkpoint.
+    m.flush();
+    nanoer::Metadata back =
+        nanoer::Metadata::decode_checkpoint(m.encode_checkpoint(), nanoer::kDataStart, 20, options, io);
+    if (!back.same_as(m)) __builtin_trap();
+    (void)back.to_legacy();
+  } catch (const nanoer::Error& e) {
+    if (e.code() != nanoer::Errc::corrupt) __builtin_trap();
   }
   return 0;
 }
