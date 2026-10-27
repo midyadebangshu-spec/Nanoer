@@ -397,7 +397,7 @@ ReplayResult replay(Store& store, const Superblock& sb, std::uint64_t stop_befor
   std::optional<Metadata> snapshot;
   try {
     snapshot = Metadata::decode_checkpoint(stream, sb.data_start, sb.segment_shift,
-                                           has_shared_records(sb));
+                                           has_shared_records(sb), has_cold_data(sb));
   } catch (const Error& e) {
     throw CheckpointError(std::string("log: checkpoint cannot be decoded: ") + e.what());
   }

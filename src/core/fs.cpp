@@ -71,7 +71,9 @@ Filesystem::Filesystem(Store& store, const Superblock& sb, ReplayResult replayed
       replayed_transactions_(replayed.transactions),
       checkpoint_bytes_(replayed.checkpoint_bytes),
       meta_(std::move(replayed.meta)),
-      cache_(options.safe_space) {
+      // Shards of at least 4 MiB, so that each holds several cold units.
+      cache_(options.safe_space,
+             static_cast<unsigned>(std::clamp<std::uint64_t>(options.safe_space / (4 << 20), 1, 16))) {
   last_commit_ns_ = last_checkpoint_ns_ = last_change_ns_ = now();
 }
 
@@ -207,6 +209,11 @@ void Filesystem::background() {
       maybe_checkpoint();
     } catch (const std::exception& e) {
       log_error("background commit failed", e);
+    }
+    try {
+      background_tier();
+    } catch (const std::exception& e) {
+      log_error("recompressing cold data failed", e);
     }
     try {
       background_gc();
@@ -493,6 +500,7 @@ void Filesystem::commit() {
       std::optional<std::size_t> same_as;  // an earlier job in this commit
       bool packed = false;                 // stored as a piece of a pack
       ChunkRef ref;
+      StorageForm form{};                  // the file's policy
     };
     const std::uint64_t cs = sb_.chunk_size();
     std::vector<Job> jobs;
@@ -506,6 +514,7 @@ void Filesystem::commit() {
         // the bytes in between are zeros.
         data.resize(static_cast<std::size_t>(std::min(cs, file->size - start)), 0);
         jobs.push_back({ino, index, &data, all_zero(data), {}});
+        jobs.back().form = hot_form(policy_of(*file), sb_);
       }
     }
     auto parallel = [&](std::size_t n, const std::function<void(std::size_t)>& f) {
@@ -543,6 +552,7 @@ void Filesystem::commit() {
       std::vector<std::size_t> members;
       Bytes data;
       EncodedChunk encoded;
+      StorageForm form{};
     };
     std::vector<Pack> packs;
     if (has_shared_records(sb_)) {
@@ -552,6 +562,7 @@ void Filesystem::commit() {
       for (std::size_t i = 0; i < jobs.size(); ++i) {
         const Job& job = jobs[i];
         if (job.hole || job.duplicate || job.same_as || job.index != 0) continue;
+        if (job.form.codec == CodecId::none) continue;  // stored raw: nothing to gain
         const Inode* file = meta_.find(job.ino);
         if (file->size > limit || file->size != job.data->size()) continue;
         small.push_back(i);
@@ -572,9 +583,17 @@ void Filesystem::commit() {
                                   : std::make_tuple(0, w->second.first, w->second.second, jobs[i].ino);
         };
         std::sort(small.begin(), small.end(), [&](std::size_t a, std::size_t b) { return order(a) < order(b); });
+        // Files of one policy (one form) in a pack.
+        std::map<std::pair<CodecId, int>, std::size_t> open;
         for (std::size_t i : small) {
-          if (packs.empty() || packs.back().data.size() + jobs[i].data->size() > kPackSize) packs.emplace_back();
-          Pack& p = packs.back();
+          std::pair<CodecId, int> form{jobs[i].form.codec, jobs[i].form.level};
+          auto o = open.find(form);
+          if (o == open.end() || packs[o->second].data.size() + jobs[i].data->size() > kPackSize) {
+            packs.emplace_back();
+            packs.back().form = jobs[i].form;
+            o = open.insert_or_assign(form, packs.size() - 1).first;
+          }
+          Pack& p = packs[o->second];
           jobs[i].ref.piece = static_cast<std::uint32_t>(p.data.size());
           p.data.insert(p.data.end(), jobs[i].data->begin(), jobs[i].data->end());
           p.members.push_back(i);
@@ -589,11 +608,11 @@ void Filesystem::commit() {
     in_parallel([&](std::size_t i) {
       Job& job = jobs[i];
       if (!job.hole && !job.duplicate && !job.same_as && !job.packed) {
-        job.encoded = encode_chunk(*job.data, sb_.default_codec, sb_.default_level);
+        job.encoded = encode_chunk(*job.data, job.form.codec, job.form.level);
       }
     });
     parallel(packs.size(), [&](std::size_t i) {
-      packs[i].encoded = encode_chunk(packs[i].data, sb_.default_codec, sb_.default_level);
+      packs[i].encoded = encode_chunk(packs[i].data, packs[i].form.codec, packs[i].form.level);
     });
     for (Pack& p : packs) {
       ChunkRef pack = journal_->append_chunk(p.encoded, 0, 0, std::nullopt, true);
@@ -615,7 +634,7 @@ void Filesystem::commit() {
         std::optional<DedupTarget> t = meta_.dedup.find(job.duplicate->hash);
         if (t != DedupTarget{job.duplicate->offset, job.duplicate->packed, job.duplicate->piece}) {
           job.duplicate.reset();
-          job.encoded = encode_chunk(*job.data, sb_.default_codec, sb_.default_level);
+          job.encoded = encode_chunk(*job.data, job.form.codec, job.form.level);
         }
       }
       if (job.hole) {
@@ -845,6 +864,10 @@ Attr Filesystem::create(InodeId parent, std::string_view name, std::uint32_t mod
   a.parent = is_dir ? parent : 0;
   a.symlink = std::string(target);
   record(op::PutInode{a});
+  // A folder's policy is passed on to what is created in it.
+  if (auto policy = dir.xattrs.find(kPolicyXattr); policy != dir.xattrs.end() && !S_ISLNK(mode)) {
+    record(op::SetXattr{a.id, policy->first, policy->second});
+  }
   record(op::SetEntry{parent, std::string(name), a.id});
   if (is_dir) ++dir.nlink;
   touch(dir, true);
@@ -1219,7 +1242,12 @@ void Filesystem::setxattr(InodeId ino, std::string_view name, ByteView value, in
   if (name.empty()) throw_posix(EINVAL);
   if (name.size() > kMaxXattrNameLength) throw_posix(ERANGE);
   if (value.size() > kMaxXattrValueSize) throw_posix(E2BIG);
-  if (name.starts_with(kNanoerXattrPrefix)) throw_posix(EPERM);  // reserved for Nanoer
+  if (name == kPolicyXattr) {
+    std::string_view v(reinterpret_cast<const char*>(value.data()), value.size());
+    if (!parse_policy(v)) throw_posix(EINVAL);
+  } else if (name.starts_with(kNanoerXattrPrefix)) {
+    throw_posix(EPERM);  // reserved for Nanoer
+  }
   bool exists = i.xattrs.contains(name);
   if ((flags & XATTR_CREATE) && exists) throw_posix(EEXIST);
   if ((flags & XATTR_REPLACE) && !exists) throw_posix(ENODATA);
@@ -1290,6 +1318,8 @@ FsInfo Filesystem::info() {
   info.checkpoint_fallback = checkpoint_fallback_;
   info.segment_bytes = sb_.segment_size() - kSegmentHeaderSize - kSealRecordSize;
   info.gc = gc_stats_;
+  info.tier = tier_stats_;
+  info.cold_data = has_cold_data(sb_) && options_.cold_after_s >= 0 && !read_only_;
   info.dedup = dedup_ && !read_only_;
   info.dedup_entries = meta_.dedup.size();
   info.dedup_index_bytes = meta_.dedup.memory_bytes();

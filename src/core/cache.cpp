@@ -2,8 +2,8 @@
 
 namespace nanoer {
 
-ChunkCache::ChunkCache(std::uint64_t budget_bytes, unsigned shards)
-    : budget_(budget_bytes), shard_budget_(budget_bytes / (shards ? shards : 1)) {
+ChunkCache::ChunkCache(std::uint64_t budget_bytes, unsigned shards, bool two_q)
+    : budget_(budget_bytes), shard_budget_(budget_bytes / (shards ? shards : 1)), two_q_(two_q) {
   for (unsigned i = 0; i < (shards ? shards : 1); ++i) shards_.push_back(std::make_unique<Shard>());
 }
 
@@ -16,8 +16,18 @@ std::shared_ptr<const Bytes> ChunkCache::get(const Key& key) {
   std::lock_guard lock(s.mutex);
   auto it = s.index.find(key);
   if (it == s.index.end()) {
-    ++misses_;
-    return nullptr;
+    auto i = s.in_index.find(key);
+    if (i == s.in_index.end()) {
+      ++misses_;
+      return nullptr;
+    }
+    // 2Q: asked for again, so it is not a scan's: into the LRU.
+    ++hits_;
+    s.in_bytes -= i->second->second->size();
+    s.lru.splice(s.lru.begin(), s.in, i->second);
+    s.index.emplace(key, s.lru.begin());
+    s.in_index.erase(i);
+    return s.lru.front().second;
   }
   s.lru.splice(s.lru.begin(), s.lru, it->second);
   ++hits_;
@@ -33,10 +43,36 @@ void ChunkCache::put(const Key& key, std::shared_ptr<const Bytes> data) {
     s.lru.erase(it->second);
     s.index.erase(it);
   }
+  if (auto it = s.in_index.find(key); it != s.in_index.end()) {
+    s.bytes -= it->second->second->size();
+    s.in_bytes -= it->second->second->size();
+    s.in.erase(it->second);
+    s.in_index.erase(it);
+  }
   s.bytes += data->size();
-  s.lru.emplace_front(key, std::move(data));
-  s.index.emplace(key, s.lru.begin());
+  if (two_q_) {
+    s.in_bytes += data->size();
+    s.in.emplace_front(key, std::move(data));
+    s.in_index.emplace(key, s.in.begin());
+  } else {
+    s.lru.emplace_front(key, std::move(data));
+    s.index.emplace(key, s.lru.begin());
+  }
+  evict(s);
+}
+
+void ChunkCache::evict(Shard& s) {
   while (s.bytes > shard_budget_) {
+    // 2Q: the FIFO of chunks seen once gives way first, down to a quarter
+    // of the budget (but the newest stays, however large).
+    if (two_q_ && !s.in.empty() && ((s.in_bytes > shard_budget_ / 4 && s.in.size() > 1) || s.lru.empty())) {
+      auto& [old_key, old_data] = s.in.back();
+      s.bytes -= old_data->size();
+      s.in_bytes -= old_data->size();
+      s.in_index.erase(old_key);
+      s.in.pop_back();
+      continue;
+    }
     auto& [old_key, old_data] = s.lru.back();
     s.bytes -= old_data->size();
     s.index.erase(old_key);

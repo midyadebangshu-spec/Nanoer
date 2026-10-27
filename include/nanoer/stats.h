@@ -33,6 +33,8 @@ struct SpaceStats {
   std::uint64_t shared_records = 0;  // with data referred to more than once (dedup)
   std::uint64_t packs = 0;
   std::uint64_t packed_files = 0;  // chunks that are pieces of a pack
+  std::uint64_t cold_bytes = 0;         // referenced data in its cold form (once per reference)
+  std::uint64_t cold_stored_bytes = 0;  // what the records holding it take
 
   // Space.
   std::uint64_t segment_bytes = 0;  // data a segment holds
@@ -49,6 +51,12 @@ struct SpaceStats {
   std::uint64_t gc_packs_repacked = 0;
   std::uint64_t gc_damaged = 0;
 
+  // Cold data recompressed, since mounting.
+  std::uint64_t tier_chunks = 0;
+  std::uint64_t tier_stored_before = 0;
+  std::uint64_t tier_stored_after = 0;
+  std::uint64_t tier_damaged = 0;
+
   // Dedup and memory.
   bool dedup = false;
   std::uint64_t dedup_entries = 0;
@@ -62,6 +70,13 @@ struct SpaceStats {
     std::uint64_t stored_bytes = 0;
   };
   std::map<std::string, Codec> by_codec;
+
+  // Files and their logical size by folder policy (user.nanoer.policy).
+  struct PolicyUse {
+    std::uint64_t files = 0;
+    std::uint64_t logical_bytes = 0;
+  };
+  std::map<std::string, PolicyUse> by_policy;
 
   // What each technique saved, in bytes of logical size.
   std::uint64_t saved_by_holes() const { return logical_bytes - std::min(logical_bytes, referenced_bytes); }

@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdio>
 #include <map>
+#include <set>
 
 #include "nanoer/fs.h"
 #include "nanoer/io.h"
@@ -73,7 +74,7 @@ Filesystem::GcNeed Filesystem::gc_need() const {
   return (used - std::min(used, live)) * 100 > used * kGcIdleDeadPercent ? GcNeed::idle : GcNeed::none;
 }
 
-Filesystem::GcPlan Filesystem::gc_plan(const GcPolicy& policy, bool urgent) const {
+Filesystem::GcPlan Filesystem::gc_plan(const GcPolicy& policy, bool urgent, bool divert) const {
   GcPlan plan;
   std::uint64_t usable = sb_.segment_size() - kSegmentHeaderSize - kSealRecordSize;
   // No more than the copies have room for: a victim half copied frees nothing.
@@ -86,22 +87,44 @@ Filesystem::GcPlan Filesystem::gc_plan(const GcPolicy& policy, bool urgent) cons
     planned += v.live_bytes;
   }
   if (plan.victims.empty()) return plan;
-  plan.codec = sb_.default_codec;
-  plan.level = sb_.default_level;
   std::map<std::uint64_t, std::uint64_t> seq_of;
   for (const GcVictim& v : plan.victims) seq_of.emplace(v.index, v.seq);
 
+  // Data of cold files that is not cold yet is recompressed instead of
+  // copied as it is, so that it is not rewritten twice (not when space is
+  // urgent: tiering waits for spare room).
+  const bool tiering = divert && !urgent && cold_enabled() && options_.cold_after_s >= 0;
+  const std::int64_t t = now();
+  std::set<InodeId> cold_files;
   // Everything that refers into the victims, by record.
   std::map<std::uint64_t, GcItem> items;
   for (const auto& [id, inode] : meta_.inodes) {
+    std::optional<std::optional<StorageForm>> cold;  // worked out once per file
     for (const auto& [index, ref] : inode.chunks) {
       auto victim = seq_of.find(meta_.segment_of(ref.offset));
       if (victim == seq_of.end()) continue;
+      if (tiering && !ref.cold && !ref.packed && meta_.references(ref) == 1 &&
+          !tier_skip_.contains({ref.offset, victim->second})) {
+        if (!cold) cold = cold_now(inode, t, std::nullopt);
+        if (*cold) {
+          cold_files.insert(id);
+          continue;
+        }
+      }
       std::uint64_t limit = sb_.segment_offset(victim->first) + sb_.segment_size();
-      GcItem& item =
-          items.try_emplace(ref.offset, GcItem{ref.offset, victim->second, limit, ref.stored_size, {}}).first->second;
-      item.users.push_back({id, index, ref});
+      auto [it, first] = items.try_emplace(ref.offset, GcItem{ref.offset, victim->second, limit, ref.stored_size, {}});
+      if (first) {
+        // A pack built again keeps its form: its users' policy, cold or not.
+        Policy p = policy_of(inode);
+        std::optional<StorageForm> form = ref.cold ? cold_form(p) : std::nullopt;
+        it->second.form = form ? *form : hot_form(p, sb_);
+      }
+      it->second.users.push_back({id, index, ref});
     }
+  }
+  if (!cold_files.empty()) {
+    plan.cold_files.assign(cold_files.begin(), cold_files.end());
+    return plan;
   }
   std::uint64_t taken = 0;
   for (auto& [offset, item] : items) {
@@ -144,7 +167,7 @@ std::vector<Filesystem::GcRead> Filesystem::gc_read(const GcPlan& plan) {
               read.pieces.emplace(piece, static_cast<std::uint32_t>(fresh.size()));
               fresh.insert(fresh.end(), old.begin() + piece, old.begin() + piece + size);
             }
-            read.repacked = encode_chunk(fresh, plan.codec, plan.level);
+            read.repacked = encode_chunk(fresh, item.form.codec, item.form.level);
           }
         }
       }
@@ -237,6 +260,10 @@ bool Filesystem::gc_apply(const GcPlan& plan, std::vector<GcRead>& reads, bool u
 
 bool Filesystem::gc_step_locked(const GcPolicy& policy, bool urgent) {
   GcPlan plan = gc_plan(policy, urgent);
+  if (!plan.cold_files.empty()) {
+    if (tier_files_locked(plan.cold_files) > 0) return true;
+    plan = gc_plan(policy, urgent, false);  // no room to recompress: copy
+  }
   if (plan.items.empty()) return false;
   std::vector<GcRead> reads = gc_read(plan);
   return gc_apply(plan, reads, urgent);
@@ -269,6 +296,15 @@ void Filesystem::background_gc() {
       std::shared_lock lock(mutex_);
       if (gc_need() == GcNeed::none) break;
       plan = gc_plan(policy, false);
+    }
+    if (!plan.cold_files.empty()) {
+      std::unique_lock lock(mutex_);
+      if (tier_files_locked(plan.cold_files) > 0) continue;
+      plan = gc_plan(policy, false, false);
+      if (plan.items.empty()) break;
+      std::vector<GcRead> reads = gc_read(plan);
+      if (!gc_apply(plan, reads, false)) break;
+      continue;
     }
     if (plan.items.empty()) break;
     std::vector<GcRead> reads = gc_read(plan);

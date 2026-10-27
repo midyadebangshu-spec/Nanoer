@@ -2,15 +2,20 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <iomanip>
 #include <iostream>
+#include <optional>
 #include <set>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <sys/xattr.h>
@@ -49,6 +54,13 @@ void usage(std::ostream& out) {
          "  gc [options] TARGET       compact the filesystem (it must not be mounted): copy the\n"
          "                            live data out of mostly empty segments and free them\n"
          "      --max-full PERCENT      collect segments at most this full (default 90)\n"
+         "  tier [--age AGE] TARGET   recompress cold data now (it must not be mounted): data\n"
+         "                            of files unchanged for AGE (default 7d; 0: everything)\n"
+         "                            in its cold form, which is smaller and reads as fast\n"
+         "  policy [-r] PATH [POLICY] show or set how a folder's (or file's) data is stored,\n"
+         "                            on a mounted filesystem: none, fast, balanced (the\n"
+         "                            default) or max. New files and folders inherit it\n"
+         "      -r, --recursive         also set it on everything already inside\n"
          "  stats [--codecs] TARGET   where the space goes: what holes, dedup and compression\n"
          "                            saved; segments, GC, memory. TARGET: an image or device\n"
          "                            (not mounted), or the mount point of a mounted filesystem\n"
@@ -60,12 +72,13 @@ void usage(std::ostream& out) {
          "Also installed as fsck.nanoer, for fsck -t nanoer and boot-time checks.\n";
 }
 
-std::string features(std::uint64_t f, std::uint64_t named = 0, const char* name = nullptr) {
+std::string features(std::uint64_t f, std::initializer_list<std::pair<std::uint64_t, const char*>> names = {}) {
   if (f == 0) return "none";
   std::string out;
-  if (f & named) {
-    out = name;
-    f &= ~named;
+  for (const auto& [bit, name] : names) {
+    if (!(f & bit)) continue;
+    out += (out.empty() ? "" : " + ") + std::string(name);
+    f &= ~bit;
   }
   if (f) {
     char buf[32];
@@ -116,9 +129,10 @@ int cmd_info(const std::vector<std::string_view>& args) {
             << "  chunk size:      " << format_size(sb.chunk_size()) << "\n"
             << "  new data:        " << codec_name(sb.default_codec) << " level "
             << int{sb.default_level} << "\n"
-            << "  features:        compat " << features(sb.features_compat, compat_features::no_dedup, "no-dedup")
+            << "  features:        compat " << features(sb.features_compat, {{compat_features::no_dedup, "no-dedup"}})
             << ", ro_compat "
-            << features(sb.features_ro_compat) << ", incompat " << features(sb.features_incompat, incompat_features::shared_records, "shared-records")
+            << features(sb.features_ro_compat) << ", incompat " << features(sb.features_incompat, {{incompat_features::shared_records, "shared-records"},
+                                                                      {incompat_features::cold_data, "cold-data"}})
             << (loaded.read_only ? " (read-only for this version)" : "") << "\n"
             << "  state:           "
             << (sb.state & state_flags::errors ? "damage was found; run nanoer fsck" : "clean") << "\n"
@@ -263,6 +277,98 @@ int cmd_gc(const std::vector<std::string_view>& args) {
   return 0;
 }
 
+int cmd_policy(const std::vector<std::string_view>& args) {
+  bool recursive = false;
+  std::vector<std::string> positional;
+  for (std::string_view a : args) {
+    if (a == "-r" || a == "--recursive") {
+      recursive = true;
+    } else if (!a.empty() && a[0] == '-') {
+      return fail(kProgram, "unknown policy option " + std::string(a));
+    } else {
+      positional.emplace_back(a);
+    }
+  }
+  if (positional.empty() || positional.size() > 2) return fail(kProgram, "policy needs PATH [POLICY]");
+  const std::string& path = positional[0];
+  if (positional.size() == 1) {
+    if (recursive) return fail(kProgram, "--recursive needs a POLICY to set");
+    char buf[64];
+    ssize_t n = getxattr(path.c_str(), kPolicyXattr, buf, sizeof buf);
+    if (n < 0 && errno == ENODATA) {
+      std::cout << path << ": balanced (the default)\n";
+      return 0;
+    }
+    if (n < 0) return fail(kProgram, path + ": " + std::strerror(errno));
+    std::cout << path << ": " << std::string_view(buf, static_cast<std::size_t>(n)) << "\n";
+    return 0;
+  }
+  const std::string& value = positional[1];
+  if (!parse_policy(value)) return fail(kProgram, "unknown policy " + value + " (none, fast, balanced or max)");
+  std::uint64_t count = 0;
+  auto set = [&](const std::string& p) {
+    if (setxattr(p.c_str(), kPolicyXattr, value.data(), value.size(), 0) != 0) {
+      if (errno == ENOTSUP || errno == EPERM) {
+        throw Error(Errc::invalid_argument, p + ": not on a Nanoer filesystem (or too old a one)");
+      }
+      throw Error(Errc::posix, p + ": " + std::strerror(errno));
+    }
+    ++count;
+  };
+  set(path);
+  if (recursive && std::filesystem::is_directory(path)) {
+    for (const auto& e : std::filesystem::recursive_directory_iterator(path)) {
+      // (Symlinks hold no data, and other files no extended attributes.)
+      if (e.is_symlink() || !(e.is_regular_file() || e.is_directory())) continue;
+      set(e.path().string());
+    }
+  }
+  std::cout << path << ": " << value;
+  if (recursive) std::cout << " (" << count << " files and folders)";
+  std::cout << "\n";
+  return 0;
+}
+
+int cmd_tier(const std::vector<std::string_view>& args) {
+  std::optional<std::int64_t> age;
+  std::string target;
+  for (std::size_t i = 0; i < args.size(); ++i) {
+    if (args[i] == "--age" && i + 1 < args.size()) {
+      age = parse_duration(args[++i]);
+      if (!age || *age < 0) return fail(kProgram, "--age needs a duration such as 7d, 12h or 0");
+    } else if (!args[i].empty() && args[i][0] == '-') {
+      return fail(kProgram, "unknown tier option " + std::string(args[i]));
+    } else {
+      target = std::string(args[i]);
+    }
+  }
+  if (target.empty()) return fail(kProgram, "tier needs a TARGET");
+  auto store = FileStore::open(target, FileStore::Mode::read_write);
+  Filesystem::Options options;
+  options.start_threads = false;
+  auto fs = Filesystem::mount(*store, options);
+  if (fs->read_only()) return fail(kProgram, "the filesystem can only be mounted read-only; run nanoer fsck");
+  fs->start();  // compression threads
+  FsInfo before = fs->info();
+  auto t0 = std::chrono::steady_clock::now();
+  std::uint64_t chunks = fs->recompress_cold(age);
+  double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  FsInfo after = fs->info();
+  fs->unmount();
+  const TierStats& t = after.tier;
+  std::cout << target << ": " << chunks << " chunks made cold in " << std::fixed << std::setprecision(1) << seconds
+            << " s: " << t.units << " cold units, " << t.singles << " single records, " << t.packs
+            << " packs, " << t.in_place << " left as they were (no smaller)\n"
+            << "  rewritten: " << format_size(t.stored_before) << " -> " << format_size(t.stored_after)
+            << "; stored data " << format_size(before.stored_bytes) << " -> " << format_size(after.stored_bytes)
+            << " (" << format_size(t.bytes_read) << " examined)\n";
+  if (t.damaged) {
+    std::cout << t.damaged << " damaged records were left in place; run nanoer fsck\n";
+    return 1;
+  }
+  return 0;
+}
+
 // ---- stats -----------------------------------------------------------------
 
 void print_stats(const std::string& target, const SpaceStats& s) {
@@ -286,6 +392,11 @@ void print_stats(const std::string& target, const SpaceStats& s) {
   if (s.pack_dead_bytes) std::cout << "  dead in packs:     +" << format_size(s.pack_dead_bytes) << "\n";
   std::cout << "  stored:            " << format_size(s.stored_bytes) << " (" << pct(s.stored_bytes, s.logical_bytes)
             << " of logical) in " << s.records << " records\n";
+  std::cout << "  cold:              " << format_size(s.cold_bytes) << " of data in its cold form, stored in "
+            << format_size(s.cold_stored_bytes) << "\n";
+  for (const auto& [policy, p] : s.by_policy) {
+    std::cout << "    policy " << policy << ": " << p.files << " files, " << format_size(p.logical_bytes) << "\n";
+  }
   for (const auto& [codec, c] : s.by_codec) {
     std::cout << "    " << codec << ": " << c.records << " records, " << format_size(c.data_bytes) << " stored as "
               << format_size(c.stored_bytes) << " (" << pct(c.stored_bytes, c.data_bytes) << ")\n";
@@ -301,6 +412,9 @@ void print_stats(const std::string& target, const SpaceStats& s) {
             << s.gc_records_copied << " records, " << s.gc_segments_emptied << " segments emptied, "
             << s.gc_packs_repacked << " packs repacked";
   if (s.gc_damaged) std::cout << ", " << s.gc_damaged << " damaged records left in place (run nanoer fsck)";
+  std::cout << "\nCold data recompressed since mounting: " << s.tier_chunks << " chunks, "
+            << format_size(s.tier_stored_before) << " rewritten as " << format_size(s.tier_stored_after);
+  if (s.tier_damaged) std::cout << ", " << s.tier_damaged << " damaged records left in place (run nanoer fsck)";
   std::cout << "\nDedup: " << (s.dedup ? "on" : "off") << ", " << s.dedup_entries << " contents indexed ("
             << format_size(s.dedup_index_bytes) << ")\n"
             << "Metadata in memory: about " << format_size(s.metadata_bytes) << "\n";
@@ -511,6 +625,8 @@ int main(int argc, char** argv) {
     if (command == "fsck") return cmd_fsck(args);
     if (command == "gc") return cmd_gc(args);
     if (command == "stats") return cmd_stats(args);
+    if (command == "tier") return cmd_tier(args);
+    if (command == "policy") return cmd_policy(args);
     if (command == "version") {
       std::cout << "nanoer " NANOER_VERSION " (format " << kVersionMajor << "." << kVersionMinor << ")\n";
       return 0;

@@ -41,6 +41,7 @@ struct ChunkRef {
   std::uint32_t piece = 0;  // packs: where this chunk's bytes start in the pack
   bool packed = false;      // the record is a pack of several small files' data
   std::uint64_t hash = 0;   // dedup key of the data (hash_key()); 0: none
+  bool cold = false;        // with cold data: recompressed in its cold form (tier.cpp)
   bool operator==(const ChunkRef&) const = default;
 };
 
@@ -117,12 +118,18 @@ class Metadata {
   // `shared_records`: the filesystem has that feature (records may be shared
   // or be packs); otherwise SetChunkRef is invalid and checkpoints use the
   // version 1 encoding.
-  Metadata(std::uint64_t data_start, unsigned segment_shift, bool shared_records = false)
-      : data_start_(data_start), segment_shift_(segment_shift), shared_records_(shared_records) {}
+  // `cold_data`: references may be marked cold.
+  Metadata(std::uint64_t data_start, unsigned segment_shift, bool shared_records = false,
+           bool cold_data = false)
+      : data_start_(data_start),
+        segment_shift_(segment_shift),
+        shared_records_(shared_records),
+        cold_data_(shared_records && cold_data) {}
 
   // A new filesystem: just the root directory.
   static Metadata empty(std::uint64_t data_start, unsigned segment_shift, std::uint32_t uid,
-                        std::uint32_t gid, std::int64_t now_ns, bool shared_records = false);
+                        std::uint32_t gid, std::int64_t now_ns, bool shared_records = false,
+                        bool cold_data = false);
 
   // Applies one change. Throws Error(corrupt) if it does not fit the current
   // state (during replay that means the log is damaged).
@@ -138,13 +145,15 @@ class Metadata {
   // A complete snapshot, for checkpoints (docs/format.md §9).
   Bytes encode_checkpoint() const;
   static Metadata decode_checkpoint(ByteView data, std::uint64_t data_start,
-                                    unsigned segment_shift, bool shared_records = false);
+                                    unsigned segment_shift, bool shared_records = false,
+                                    bool cold_data = false);
 
   // Whether a snapshot stream (or its first bytes) uses the version 2
   // encoding, which only filesystems with shared records write.
   static bool is_v2_checkpoint(ByteView stream_start);
 
   bool shared_records() const { return shared_records_; }
+  bool cold_data() const { return cold_data_; }
   // References to the record at `ref.offset` (1 unless listed in `shared`).
   std::uint32_t references(const ChunkRef& ref) const;
 
@@ -172,6 +181,7 @@ class Metadata {
   std::uint64_t data_start_;
   unsigned segment_shift_;
   bool shared_records_;
+  bool cold_data_;
 };
 
 }  // namespace nanoer

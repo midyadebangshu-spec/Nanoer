@@ -123,9 +123,12 @@ error (old readers ignore the field), but writers preserve it.
 |---|---:|---|---|
 | compat | 0 | `no_dedup` | a preference: writers do not deduplicate new data (`mkfs.nanoer --no-dedup`) |
 | incompat | 0 | `shared_records` | a data chunk record may have several references (dedup) or hold several small files (a pack); the log may contain SetChunkRef (§8) and checkpoints use version 2 (§9) |
+| incompat | 1 | `cold_data` | extended references may carry the `cold` flag (§8); only with `shared_records` (ignored without it) |
 
-`mkfs` sets `shared_records` on every new filesystem. Without it a
-filesystem is exactly as earlier drafts of 1.0 wrote it, and stays so.
+`mkfs` sets `shared_records` and `cold_data` on every new filesystem.
+Without them a filesystem is exactly as earlier drafts of 1.0 wrote it, and
+stays so. A filesystem rescued from a version 2 checkpoint (no valid
+superblock left) gets both.
 
 ## 4. Segments
 
@@ -321,7 +324,8 @@ flag 1 is set:
 | 0 | `packed` | the record is a pack; this chunk is the `size` bytes at `piece` in its uncompressed data |
 | 1 | `hash` | `key`: the first 8 bytes of the chunk data's BLAKE3, little-endian, never 0 (the dedup key) |
 | 2 | `share` | the record already has a reference; this is one more (dedup). Not with `packed` |
-| 3+ | — | reserved; a set unknown flag means the log is damaged |
+| 3 | `cold` | the chunk's data has been recompressed in its cold form (§8, *cold data*); only with `cold_data`, else the log is damaged |
+| 4+ | — | reserved; a set unknown flag means the log is damaged |
 
 **Space and references** (with `shared_records`). A record's space
 (`stored_size`) counts once, however many chunks refer to it. A reader
@@ -341,6 +345,29 @@ than one reference:
 
 Without `shared_records`, every chunk claims space of its own, and a
 record referred to twice is damage.
+
+**Cold data** (with `cold_data`). A writer may rewrite data that has stopped
+changing in a denser form, and marks every reference to the new record
+`cold`, so that it is not examined again. The flag changes nothing in how
+the reference is read or counted. A cold record is either
+
+- a *cold unit*: a pack (`pack` flag) whose pieces are consecutive chunks
+  of one file, back to back from piece 0, in chunk order; or a pack of
+  small files recompressed with its pieces in the same order; or
+- a single chunk rewritten with another codec or level, with the same
+  `inode`, `file_offset` and `blake3` header fields as before.
+
+A reference may also be marked `cold` in place (a SetChunkRef naming the
+record it already refers to, which releases and claims the same space)
+when recompressing would not have made it smaller. Readers need not tell
+these apart.
+
+**Policies.** The extended attribute `user.nanoer.policy` on a file or
+directory, with the value `none`, `fast`, `balanced` or `max` (exactly
+these bytes), says how its data is to be stored (docs/M5_PLAN.md §4). A
+new file or directory receives a copy of its parent's. No other name
+beginning `user.nanoer.` is stored. The attribute changes nothing for
+readers.
 
 Rules (a violation means the log is damaged):
 
@@ -513,3 +540,4 @@ therefore always has a checkpoint.
 | 1.0 (draft, M2) | metadata transactions, checkpoints, segment seals, log replay, segment reuse; mkfs writes an initial checkpoint |
 | 1.0 (draft, M3) | transaction `durable_back` (was reserved, so older images read as "unknown"); superblock `state` flags (was reserved); damage detection, contradictory transactions, checkpoint fallback and rescue (§10.2) |
 | 1.0 (draft, M4) | `shared_records` feature: SetChunkRef, shared records and packs, reference counting, checkpoint version 2; data chunk `pack` flag; `no_dedup` compat preference; dedup shares only records whose `blake3` matches |
+| 1.0 (draft, M5) | `cold_data` feature: reference flag `cold`, cold units; the `user.nanoer.policy` attribute |

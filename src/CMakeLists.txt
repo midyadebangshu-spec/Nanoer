@@ -9,6 +9,8 @@ add_library(nanoer_core STATIC
   core/format.cpp
   core/fs.cpp
   core/gc.cpp
+  core/policy.cpp
+  core/tier.cpp
   core/io.cpp
   core/journal.cpp
   core/metadata.cpp

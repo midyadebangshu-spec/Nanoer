@@ -23,6 +23,7 @@ struct FormatOptions {
   // Shared records (dedup, small-file packs). Off only to make a filesystem
   // as M3 made them, for compatibility tests.
   bool shared_records = true;
+  bool cold_data = true;  // cold data recompression (needs shared_records)
   bool dedup = true;  // false: the no_dedup preference
 };
 

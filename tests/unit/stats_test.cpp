@@ -87,6 +87,7 @@ TEST(Stats, TheFiguresAddUp) {
   EXPECT_EQ(served.stored_bytes, s.stored_bytes);
   EXPECT_TRUE(served.by_codec.empty());  // not over the mount: too slow
   // The prefix is Nanoer's own.
-  EXPECT_THROW(fs->setxattr(kRootInode, "user.nanoer.policy", as_bytes("max"), 0), Error);
+  EXPECT_THROW(fs->setxattr(kRootInode, "user.nanoer.color", as_bytes("max"), 0), Error);
+  EXPECT_THROW(fs->setxattr(kRootInode, kStatsXattr, as_bytes("x"), 0), Error);
   EXPECT_THROW(fs->getxattr(fs->lookup(kRootInode, "text").ino, kStatsXattr), Error);
 }

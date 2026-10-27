@@ -1,8 +1,30 @@
 # M5 plan: smart features (cold data recompressed, folder policies)
 
-**Status: PROPOSED, waiting for approval.** Part of stage 1
-([`STAGE1_PLAN.md`](STAGE1_PLAN.md)). No M5 code is written until this plan
-is approved.
+**Status: APPROVED 2026-10-27** with the recommended answer to every
+decision in §11; built. Part of stage 1 ([`STAGE1_PLAN.md`](STAGE1_PLAN.md)).
+
+**Where the build differs from this plan** (each smaller than a change of
+scope; listed here and in `KNOWLEDGE.md`):
+
+1. **Cold units stay in the dedup index** (§3 said they would not): the
+   index now holds piece offsets beyond 64 KiB in 4 KiB units, so a copy of
+   cold data is still stored once. No format change (the index is in
+   memory).
+2. **Cold means unchanged by change time** (and mtime, if later), not by
+   mtime alone: `tar` and `cp -p` copy mtimes, so unpacked archives would
+   look years old.
+3. **Nothing is rewritten that would not shrink by 3 %**: such data (media,
+   dense data) is only marked cold, in place.
+4. **Shared (deduplicated) data is recompressed too**, once for all its
+   users, when every one of them is cold; the plan did not say.
+5. **A new mount option, `-o idle=SECONDS`**, for background work (it was
+   GC's fixed setting): the integration tests recompress under load with
+   `cold_after=0,idle=0`.
+6. **The scan benchmark found a bug from M2** (the cache used 2 of its 16
+   shards, an eighth of the safe space); fixed before deciding on 2Q. 2Q
+   paid (§6's rule) and replaced the LRU.
+7. **Rebuilding lost superblocks** guessed the wrong chunk size when data
+   was in packs or shared (found by the cold-data `fsck` test); fixed.
 
 ## 1. Goal
 

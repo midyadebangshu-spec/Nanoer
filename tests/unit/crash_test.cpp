@@ -175,8 +175,13 @@ std::string dump(Filesystem& fs) {
 // Large enough to fill segments many times over in a small store, so seals,
 // checkpoints and segment reuse all happen. With `gc`, files are also
 // copied (so deduplicated), and garbage collection runs after some syncs
-// (it changes nothing visible). Throws on the first error.
-void workload(Filesystem& fs, const std::function<void()>& synced, bool gc = false) {
+// (it changes nothing visible); with `tier`, cold data is recompressed too,
+// by itself and by GC (the filesystem must count files as cold at once).
+// Throws on the first error.
+enum class Extra { none, gc, tier };
+
+void workload(Filesystem& fs, const std::function<void()>& synced, Extra extra = Extra::none) {
+  const bool gc = extra != Extra::none;
   std::mt19937_64 rng(42);
   auto pick = [&](std::uint64_t n) { return rng() % n; };
   std::vector<std::string> names = {"a", "b", "c", "d", "e", "f"};
@@ -197,6 +202,13 @@ void workload(Filesystem& fs, const std::function<void()>& synced, bool gc = fal
         Bytes data(1 + pick(120000));
         bool noisy = pick(4) != 0;  // mostly incompressible, so segments fill up
         for (auto& b : data) b = noisy ? static_cast<std::uint8_t>(rng()) : static_cast<std::uint8_t>('a' + step % 5);
+        if (!noisy && extra == Extra::tier) {
+          // Text: what a higher level and larger units gain from.
+          static const char* const words[] = {"error ", "warning ", "request ", "from ", "user ", "id=", "\n", "ok "};
+          std::string text;
+          while (text.size() < data.size()) text += words[pick(8)] + std::to_string(pick(1000));
+          std::copy(text.begin(), text.begin() + static_cast<std::ptrdiff_t>(data.size()), data.begin());
+        }
         fs.write(f, pick(80000), data);
       } else if (op == 4) {
         // (One pick per statement: the order arguments are evaluated in is
@@ -247,6 +259,7 @@ void workload(Filesystem& fs, const std::function<void()>& synced, bool gc = fal
       fs.sync();
       synced();
       if (gc && step % 24 == 23) fs.collect_garbage(0.97);
+      if (extra == Extra::tier && step % 24 == 11) fs.recompress_cold(0);
     }
   }
 }
@@ -263,17 +276,28 @@ Bytes fresh_image() {
   return store.image();
 }
 
-Recording record_workload(bool gc = false) {
+Recording record_workload(Extra extra = Extra::none) {
+  const bool gc = extra != Extra::none;
   Recording r;
   r.store = std::make_unique<RecordingStore>(fresh_image());
-  auto fs = Filesystem::mount(*r.store, options());
+  Filesystem::Options o = options();
+  if (extra == Extra::tier) o.cold_after_s = 0;
+  auto fs = Filesystem::mount(*r.store, o);
   r.states.push_back(dump(*fs));
   r.synced_after.push_back(r.store->events().size());
   workload(*fs, [&] {
     r.states.push_back(dump(*fs));
     r.synced_after.push_back(r.store->events().size());
-  }, gc);
+  }, extra);
   FsInfo info = fs->info();
+  if (extra == Extra::tier) {
+    std::cout << "[ crash ] recompressed " << info.tier.chunks << " chunks: " << info.tier.units << " units, "
+              << info.tier.singles << " single, " << info.tier.packs << " packs, " << info.tier.in_place
+              << " in place\n";
+    EXPECT_GT(info.tier.units, 10u) << "the workload must make cold units";
+    EXPECT_GT(info.tier.singles, 5u);
+    EXPECT_GT(info.tier.in_place, 10u);
+  }
   if (gc) {
     std::cout << "[ crash ] GC copied " << info.gc.records_copied << " records, emptied "
               << info.gc.segments_emptied << " segments; " << info.dedup_hits << " chunks deduplicated\n";
@@ -401,7 +425,9 @@ void explore(const Recording& r) {
 
 TEST(Crash, EveryCrashPointRecoversARealState) { explore(record_workload()); }
 
-TEST(Crash, GarbageCollectionIsCrashSafe) { explore(record_workload(true)); }
+TEST(Crash, GarbageCollectionIsCrashSafe) { explore(record_workload(Extra::gc)); }
+
+TEST(Crash, RecompressingColdDataIsCrashSafe) { explore(record_workload(Extra::tier)); }
 
 TEST(Crash, CrashesDuringMountAreSafeToo) {
   Recording r = record_workload();

@@ -38,7 +38,7 @@ struct Base {
 
 const Base& base() {
   static const Base b = [] {
-    MemStore store(min_store_size(20) + (1 << 20));  // 5 segments of 1 MiB
+    MemStore store(min_store_size(20) + (8 << 20));  // 12 segments of 1 MiB: room to recompress
     make_filesystem(store, {.segment_shift = 20, .chunk_shift = 12});
     {
       auto fs = Filesystem::mount(store, options());
@@ -64,6 +64,9 @@ const Base& base() {
       Bytes copy(fs->getattr(f5).size);
       fs->read(f5, 0, copy);
       fs->write(fs->mknod(kRootInode, "copy", S_IFREG | 0644, 0, {}).ino, 0, copy);
+      // Cold data: units, shared records recompressed, the pack again.
+      fs->recompress_cold(0);
+      fs->write(fs->lookup(kRootInode, "f0").ino, 5000, as_bytes("changed after going cold"));
     }  // unmount: checkpoint
     {
       // A little log after the checkpoint, as after a crash.

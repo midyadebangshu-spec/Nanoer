@@ -32,7 +32,8 @@ constexpr std::uint64_t packed = 0x1;  // followed by the piece offset
 constexpr std::uint64_t hash = 0x2;    // followed by the 8-byte dedup key
 constexpr std::uint64_t share = 0x4;   // set_chunk_ref: a reference to an existing record;
                                        // checkpoint: the record has several references
-constexpr std::uint64_t known = packed | hash | share;
+constexpr std::uint64_t cold = 0x8;    // recompressed in its cold form (cold data only)
+constexpr std::uint64_t known = packed | hash | share | cold;
 }  // namespace ref_flags
 
 constexpr char kCheckpointMagic[8] = {'N', 'N', 'R', 'C', 'K', 'P', 'T', '1'};
@@ -104,7 +105,7 @@ ChunkRef decode_ref(Decoder& in) {
 // The extended form: flags, the three fields above, then what the flags say.
 void encode_ref_ex(Encoder& out, const ChunkRef& r, bool share) {
   std::uint64_t flags = (r.packed ? ref_flags::packed : 0) | (r.hash ? ref_flags::hash : 0) |
-                        (share ? ref_flags::share : 0);
+                        (share ? ref_flags::share : 0) | (r.cold ? ref_flags::cold : 0);
   out.varint(flags);
   encode_ref(out, r);
   if (r.packed) out.varint(r.piece);
@@ -128,6 +129,7 @@ ChunkRef decode_ref_ex(Decoder& in, bool& share) {
     if (r.hash == 0) corrupt("zero dedup key");
   }
   share = flags & ref_flags::share;
+  r.cold = flags & ref_flags::cold;
   return r;
 }
 
@@ -253,8 +255,9 @@ Op decode_op(Decoder& in) {
 // ---- Metadata --------------------------------------------------------------
 
 Metadata Metadata::empty(std::uint64_t data_start, unsigned segment_shift, std::uint32_t uid,
-                         std::uint32_t gid, std::int64_t now_ns, bool shared_records) {
-  Metadata m(data_start, segment_shift, shared_records);
+                         std::uint32_t gid, std::int64_t now_ns, bool shared_records,
+                         bool cold_data) {
+  Metadata m(data_start, segment_shift, shared_records, cold_data);
   Inode root;
   root.id = kRootInode;
   root.mode = S_IFDIR | 0755;
@@ -308,6 +311,7 @@ void Metadata::add_ref(const ChunkRef& ref, bool share) {
   if ((ref.packed || share || ref.hash) && !shared_records_) {
     corrupt("shared records on a filesystem without that feature");
   }
+  if (ref.cold && !cold_data_) corrupt("cold data on a filesystem without that feature");
   if (ref.packed) {
     if (share) corrupt("a pack piece marked as shared");
     auto [it, first] = shared.try_emplace(ref.offset, 0);
@@ -390,7 +394,7 @@ void Metadata::apply(const Op& op) {
             dir.entries.erase(it);
           },
           [&](const op::SetChunk& o) {
-            if (o.ref.packed || o.ref.piece || o.ref.hash) corrupt("extended chunk fields in SetChunk");
+            if (o.ref.packed || o.ref.piece || o.ref.hash || o.ref.cold) corrupt("extended chunk fields in SetChunk");
             Inode& file = need_file(o.ino);
             auto [it, inserted] = file.chunks.try_emplace(o.index, o.ref);
             add_ref(o.ref, false);
@@ -486,13 +490,13 @@ Bytes Metadata::encode_checkpoint() const {
 }
 
 Metadata Metadata::decode_checkpoint(ByteView data, std::uint64_t data_start,
-                                     unsigned segment_shift, bool shared_records) {
+                                     unsigned segment_shift, bool shared_records, bool cold_data) {
   Decoder in(data);
   ByteView magic = in.raw(8);
   bool v2 = std::memcmp(magic.data(), kCheckpointMagicV2, 8) == 0;
   if (!v2 && std::memcmp(magic.data(), kCheckpointMagic, 8) != 0) corrupt("not a checkpoint");
   if (v2 && !shared_records) corrupt("checkpoint with shared records on a filesystem without them");
-  Metadata m(data_start, segment_shift, shared_records);
+  Metadata m(data_start, segment_shift, shared_records, cold_data);
   m.last_txid = in.varint();
   m.next_inode = in.varint();
 
@@ -522,6 +526,7 @@ Metadata Metadata::decode_checkpoint(ByteView data, std::uint64_t data_start,
       bool share = false;
       ChunkRef ref = v2 ? decode_ref_ex(in, share) : decode_ref(in);
       if (!ref.packed && ref.piece) corrupt("a piece offset outside a pack");
+      if (ref.cold && !m.cold_data_) corrupt("cold data on a filesystem without that feature");
       if (ref.hash) m.dedup.put(ref.hash, target_of(ref));
       if (ref.packed || share) {
         auto it = counted.try_emplace(ref.offset, Counted{ref, 0}).first;

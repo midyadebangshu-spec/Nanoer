@@ -483,6 +483,10 @@ void usage(std::ostream& out) {
          "  -o commit=SECONDS    commit interval (default 5)\n"
          "  -o ro                read-only\n"
          "  -o nodedup           do not deduplicate new data\n"
+         "  -o cold_after=AGE    recompress data of files unchanged this long (7d, 12h, 30m,\n"
+         "                       90s; never: not at all). Default 7d\n"
+         "  -o idle=SECONDS      background work (garbage collection, recompressing cold\n"
+         "                       data) after this long without changes (default 10)\n"
          "  -o allow_other       let other users access the mount\n"
          "  -o OPTION            other FUSE or mount options\n"
          "  -f                   stay in the foreground\n"
@@ -541,6 +545,14 @@ int main(int argc, char** argv) {
         auto v = parse_size(opt.substr(7));
         if (!v) return false;
         options.commit_interval_s = static_cast<unsigned>(*v);
+      } else if (opt.starts_with("cold_after=")) {
+        auto v = parse_duration(opt.substr(11));
+        if (!v) return false;
+        options.cold_after_s = *v;
+      } else if (opt.starts_with("idle=")) {
+        auto v = parse_size(opt.substr(5));
+        if (!v) return false;
+        options.gc_idle_s = static_cast<unsigned>(*v);
       } else if (opt == "nodedup") {
         options.dedup = false;
       } else if (opt == "ro") {

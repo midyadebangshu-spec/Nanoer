@@ -38,6 +38,9 @@ namespace incompat_features {
 // A data chunk record may have several references (dedup) or hold several
 // small files (a pack): SetChunkRef operations, version 2 checkpoints.
 inline constexpr std::uint64_t shared_records = 0x1;
+// Chunk references may carry the `cold` flag: their data has been
+// recompressed in its cold form (docs/M5_PLAN.md §3). Only with shared_records.
+inline constexpr std::uint64_t cold_data = 0x2;
 }  // namespace incompat_features
 namespace compat_features {
 // A preference: do not deduplicate new data (mkfs.nanoer --no-dedup).
@@ -45,7 +48,8 @@ inline constexpr std::uint64_t no_dedup = 0x1;
 }  // namespace compat_features
 inline constexpr std::uint64_t kKnownCompatFeatures = compat_features::no_dedup;
 inline constexpr std::uint64_t kKnownRoCompatFeatures = 0;
-inline constexpr std::uint64_t kKnownIncompatFeatures = incompat_features::shared_records;
+inline constexpr std::uint64_t kKnownIncompatFeatures =
+    incompat_features::shared_records | incompat_features::cold_data;
 
 // Superblock state flags (not features: any version may ignore them).
 namespace state_flags {
@@ -91,6 +95,9 @@ struct Superblock {
 
 inline bool has_shared_records(const Superblock& sb) {
   return (sb.features_incompat & incompat_features::shared_records) != 0;
+}
+inline bool has_cold_data(const Superblock& sb) {
+  return has_shared_records(sb) && (sb.features_incompat & incompat_features::cold_data) != 0;
 }
 
 Bytes encode_superblock(const Superblock& sb);

@@ -68,6 +68,7 @@ class ModelTest {
     options_.safe_space = 2 << 20;
     options_.dirty_limit = 1ull << 40;   // commits only on sync (and admission)
     options_.checkpoint_bytes = 8 << 20;  // exercise checkpoints and reclaim
+    options_.cold_after_s = 0;  // every file is cold once written: GC recompresses what it moves
     fs_ = Filesystem::mount(*store_, options_);
   }
 
@@ -88,7 +89,7 @@ class ModelTest {
       else if (choice < 85) punch();
       else if (choice < 93) read_check();
       else if (choice < 97) sync();
-      else if (choice < 98) collect();
+      else if (choice < 98) pick(2) ? collect() : recompress();
       else if (choice < 99) remount();
       else crash();
       if (step % 50 == 0) compare();
@@ -345,7 +346,15 @@ class ModelTest {
     compare();
   }
 
+  // So does recompressing cold data.
+  void recompress() {
+    fs_->recompress_cold(0);
+    synced_ = model_;
+    compare();
+  }
+
   void remount() {
+    tier_ += fs_->info().tier.chunks;
     fs_.reset();
     fs_ = Filesystem::mount(*store_, options_);
     synced_ = model_;
@@ -353,6 +362,7 @@ class ModelTest {
   }
 
   void crash() {
+    tier_ += fs_->info().tier.chunks;
     fs_->abandon();
     fs_.reset();
     store_ = std::make_unique<FaultStore>(store_->crash_image({}));
@@ -402,6 +412,9 @@ class ModelTest {
   std::unique_ptr<Filesystem> fs_;
   Model model_;
   Model synced_;
+
+ public:
+  std::uint64_t tier_ = 0;  // chunks recompressed (or marked cold), over all mounts
 };
 
 }  // namespace
@@ -411,6 +424,7 @@ class FsModel : public ::testing::TestWithParam<std::uint64_t> {};
 TEST_P(FsModel, RandomOperationsMatchTheModel) {
   ModelTest test(GetParam());
   test.run(1500);
+  EXPECT_GT(test.tier_, 50u) << "cold data must be recompressed along the way";
 }
 
 INSTANTIATE_TEST_SUITE_P(Seeds, FsModel, ::testing::Values(1, 2, 3, 4));

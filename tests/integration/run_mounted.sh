@@ -13,7 +13,8 @@
 #                       must be intact
 #   command CMD...      run any command with NANOER_TEST_DIR set
 # NANOER_MKFS_OPTS replaces the default "--size 8G" (say, a small store with
-# small segments, so garbage collection runs all the time).
+# small segments, so garbage collection runs all the time). NANOER_MOUNT_OPTS
+# adds mount options (say, cold_after=0,idle=0: recompress all the time).
 # Exits 77 (skipped) when FUSE is not usable here.
 set -euo pipefail
 
@@ -51,6 +52,7 @@ trap cleanup EXIT
 mount_fs() {
   local opts=allow_other
   [ "$(id -u)" = 0 ] || opts=default_permissions  # allow_other needs root or user_allow_other
+  [ -z "${NANOER_MOUNT_OPTS:-}" ] || opts="$opts,$NANOER_MOUNT_OPTS"
   "$BIN/nanoerfs" -f -o "$opts" "$IMG" "$MNT" >>"$WORK/nanoerfs.log" 2>&1 &
   PID=$!
   for _ in $(seq 100); do
@@ -153,6 +155,15 @@ case "$MODE" in
       rm -rf "$MNT"/load-*
       echo "round $round: recovered, $(grep -c '^file' "$LOG") files written so far"
     done
+    if [[ "${NANOER_MOUNT_OPTS:-}" == *cold_after=0* ]]; then
+      # Recompressing ran too: some data is in its cold form.
+      sleep 3
+      "$BIN/nanoer" stats "$MNT" | grep "cold:" | tee "$WORK/cold.txt"
+      if grep -q "cold: *0 B" "$WORK/cold.txt"; then
+        echo "no data was recompressed"
+        exit 1
+      fi
+    fi
     ;;
   command)
     NANOER_TEST_DIR=$MNT "$@"

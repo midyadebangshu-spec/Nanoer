@@ -56,10 +56,11 @@ Superblock make_filesystem(Store& store, const FormatOptions& options) {
   // The first checkpoint: every filesystem always has one, so mounting
   // always has a starting point.
   if (options.shared_records) sb.features_incompat |= incompat_features::shared_records;
+  if (options.shared_records && options.cold_data) sb.features_incompat |= incompat_features::cold_data;
   if (!options.dedup) sb.features_compat |= compat_features::no_dedup;
   Metadata meta = Metadata::empty(sb.data_start, sb.segment_shift, options.root_uid,
                                   options.root_gid, static_cast<std::int64_t>(sb.created_ns),
-                                  options.shared_records);
+                                  options.shared_records, has_cold_data(sb));
   Journal journal(store, sb, meta, sb.next_segment_seq);
   journal.start();
   LogPosition checkpoint = journal.append_checkpoint(meta);

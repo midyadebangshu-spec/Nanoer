@@ -33,15 +33,17 @@ that a system needing 800 GB without Nanoer needs about 500 GB with it.
 
 Milestones M1 (foundation), M2 (working filesystem), M3 (crash safety,
 `fsck`) and M4 (garbage collection, dedup, small-file packing, `nanoer
-stats`) are complete; M5 (tiering, policies; plan in `docs/M5_PLAN.md`) is next, after its
-plan is approved.
+stats`) and M5 (cold data recompressed, folder policies, 2Q cache) are
+complete; M6 (on-disk metadata, migration, benchmark report) is next, after
+its plan is approved.
 
 - `include/nanoer/`: public headers. `src/core/`: the engine (`fs.cpp` is the
   POSIX layer, `journal.cpp` the log, `metadata.cpp` the operations).
   `src/fuse/`: `nanoerfs` (also `mount.nanoer`). `src/tools/`: `mkfs.nanoer`,
   `nanoer` (also `fsck.nanoer`), `nanoer-fsx`. `src/core/check.cpp`: fsck.
   `src/core/gc.cpp`: garbage collection. `src/core/dedup.cpp`: the dedup
-  index. `src/core/stats.cpp`: `nanoer stats`. Packing is in `fs.cpp`'s
+  index. `src/core/stats.cpp`: `nanoer stats`. `src/core/tier.cpp`: cold data
+  (`nanoer tier`). `src/core/policy.cpp`: folder policies (`nanoer policy`). Packing is in `fs.cpp`'s
   commit.
   `tests/unit/`: GoogleTest (`crash_test.cpp` explores every crash point).
   `tests/integration/`: tests on a real FUSE mount, including `kill -9`.

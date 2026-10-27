@@ -18,6 +18,8 @@ add_executable(nanoer_unit_tests
   unit/metadata_test.cpp
   unit/mkfs_test.cpp
   unit/pack_test.cpp
+  unit/policy_test.cpp
+  unit/tier_test.cpp
   unit/record_test.cpp
   unit/segment_test.cpp
   unit/stats_test.cpp
@@ -54,8 +56,17 @@ if(NANOER_BUILD_FUSE)
     "FSX_OPS=20000;NANOER_MKFS_OPTS=--size 40M --segment-size 1M")
   set_tests_properties(integration_kill_small PROPERTIES ENVIRONMENT
     "KILL_LOAD=fsx;KILL_LIVE_LIMIT_MB=40;NANOER_MKFS_OPTS=--size 160M --segment-size 1M")
+  # And with every file cold at once and no idle wait: cold data is
+  # recompressed while the load runs.
+  add_test(NAME integration_fsx_cold COMMAND ${RUN_MOUNTED} ${TOOLS_DIR} fsx)
+  add_test(NAME integration_kill_cold COMMAND ${RUN_MOUNTED} ${TOOLS_DIR} kill)
+  set_tests_properties(integration_fsx_cold PROPERTIES ENVIRONMENT
+    "FSX_OPS=20000;NANOER_MOUNT_OPTS=cold_after=0,idle=0;NANOER_MKFS_OPTS=--size 64M --segment-size 4M")
+  set_tests_properties(integration_kill_cold PROPERTIES ENVIRONMENT
+    "NANOER_MOUNT_OPTS=cold_after=0,idle=0")
   set_tests_properties(integration_posix integration_fsx integration_persist integration_kill
-                       integration_fsx_small integration_kill_small PROPERTIES
+                       integration_fsx_small integration_kill_small integration_fsx_cold
+                       integration_kill_cold PROPERTIES
     SKIP_RETURN_CODE 77 LABELS integration RUN_SERIAL TRUE TIMEOUT 1200)
   set_tests_properties(integration_fsx PROPERTIES ENVIRONMENT "FSX_OPS=10000")
 endif()

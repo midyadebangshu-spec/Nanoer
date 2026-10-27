@@ -3,8 +3,8 @@
 **Status: APPROVED 2026-10-24** with the recommended answers to every
 question in §9. **M1, M2 and M3 complete** (2026-10-24); see
 [`M2_PLAN.md`](M2_PLAN.md) and [`M3_PLAN.md`](M3_PLAN.md); **M4 complete**
-(2026-10-26), see [`M4_PLAN.md`](M4_PLAN.md). **M5 plan** written
-(2026-10-27), waiting for approval: [`M5_PLAN.md`](M5_PLAN.md). Background and reasoning for each technology are in
+(2026-10-26), see [`M4_PLAN.md`](M4_PLAN.md). **M5 complete**
+(2026-10-27), see [`M5_PLAN.md`](M5_PLAN.md). Background and reasoning for each technology are in
 [`KNOWLEDGE.md`](../KNOWLEDGE.md).
 
 ## 1. Goal
@@ -175,7 +175,7 @@ plan come back to you first.
 | **M2** ✅ | Working filesystem | metadata (in memory + log + checkpoint), read/write paths, safe-space cache, FUSE adapter: files, directories, symlinks, hard links, permissions, xattrs, rename, truncate, sparse files, mmap, fsync | pjdfstest, fsx, model-based tests, manual mount |
 | **M3** ✅ | Crash safety | strict write ordering, recovery/replay, `nanoer fsck` | power-cut simulation at every write point; corrupted-image fuzzing |
 | **M4** ✅ | Space efficiency | GC/compaction, dedup with refcounts, packed small files (inlining measured worse and dropped; incompressibility detection measured not worth it), `nanoer stats` | GC/dedup unit + crash tests; ratio measured on a copy of `/usr` |
-| **M5** | Smart features | hot/cold tiering in GC, per-folder policies, read-ahead, 2Q/ARC if benchmarks need it | tiering tests; sequential-read benchmarks |
+| **M5** ✅ | Smart features | cold data recompressed (also by GC), per-folder policies, 2Q (measured to pay); read-ahead measured not worth it | tiering tests; sequential-read benchmarks |
 | **M6** | Scale + benchmarks | on-disk CoW B+tree metadata, format migration, full benchmark report against ext4 and Btrfs + zstd | crash + fsx tests again; RAM use at large file counts; benchmark report |
 
 ## 7. Benchmarks

@@ -28,6 +28,8 @@ void each_field(SpaceStats& s, F&& f) {
   f("shared_records", s.shared_records);
   f("packs", s.packs);
   f("packed_files", s.packed_files);
+  f("cold_bytes", s.cold_bytes);
+  f("cold_stored_bytes", s.cold_stored_bytes);
   f("segment_bytes", s.segment_bytes);
   f("segments", s.segments);
   f("segments_in_use", s.segments_in_use);
@@ -39,6 +41,10 @@ void each_field(SpaceStats& s, F&& f) {
   f("gc_segments_emptied", s.gc_segments_emptied);
   f("gc_packs_repacked", s.gc_packs_repacked);
   f("gc_damaged", s.gc_damaged);
+  f("tier_chunks", s.tier_chunks);
+  f("tier_stored_before", s.tier_stored_before);
+  f("tier_stored_after", s.tier_stored_after);
+  f("tier_damaged", s.tier_damaged);
   f("dedup_entries", s.dedup_entries);
   f("dedup_index_bytes", s.dedup_index_bytes);
   f("metadata_bytes", s.metadata_bytes);
@@ -54,6 +60,7 @@ std::string encode_stats(const SpaceStats& stats) {
   for (const auto& [codec, c] : s.by_codec) {
     out << "codec." << codec << '=' << c.records << ',' << c.data_bytes << ',' << c.stored_bytes << '\n';
   }
+  for (const auto& [policy, p] : s.by_policy) out << "policy." << policy << '=' << p.files << ',' << p.logical_bytes << '\n';
   return out.str();
 }
 
@@ -77,6 +84,12 @@ SpaceStats decode_stats(const std::string& text) {
   });
   s.dedup = kv["dedup"] == "1";
   for (const auto& [key, value] : kv) {
+    if (key.starts_with("policy.")) {
+      auto comma = value.find(',');
+      if (comma == std::string::npos) throw Error(Errc::corrupt, "malformed statistics");
+      s.by_policy[key.substr(7)] = {number(value.substr(0, comma)), number(value.substr(comma + 1))};
+      continue;
+    }
     if (!key.starts_with("codec.")) continue;
     SpaceStats::Codec c;
     std::istringstream v(value);
@@ -105,6 +118,7 @@ SpaceStats Filesystem::space_stats_locked(bool by_codec) {
     std::uint32_t size = 0;  // not packed
     std::uint64_t refs = 0;
     std::uint64_t ref_bytes = 0;
+    bool cold = false;
     std::set<std::pair<std::uint32_t, std::uint32_t>> pieces;
   };
   std::unordered_map<std::uint64_t, Use> uses;
@@ -113,6 +127,9 @@ SpaceStats Filesystem::space_stats_locked(bool by_codec) {
     if (inode.is_regular()) {
       ++s.files;
       s.logical_bytes += inode.size;
+      SpaceStats::PolicyUse& p = s.by_policy[std::string(policy_name(policy_of(inode)))];
+      ++p.files;
+      p.logical_bytes += inode.size;
     } else if (inode.is_dir()) {
       ++s.directories;
     } else {
@@ -128,6 +145,8 @@ SpaceStats Filesystem::space_stats_locked(bool by_codec) {
       u.packed = ref.packed;
       ++u.refs;
       u.ref_bytes += ref.size;
+      u.cold |= ref.cold;
+      if (ref.cold) s.cold_bytes += ref.size;
       if (ref.packed) {
         u.pieces.emplace(ref.piece, ref.size);
         ++s.packed_files;
@@ -139,6 +158,7 @@ SpaceStats Filesystem::space_stats_locked(bool by_codec) {
   for (const auto& [offset, u] : uses) {
     ++s.records;
     s.stored_bytes += u.stored;
+    if (u.cold) s.cold_stored_bytes += u.stored;
     std::uint64_t distinct = u.size;
     std::uint64_t data = u.size;
     std::optional<DataChunkInfo> info;
@@ -184,6 +204,10 @@ SpaceStats Filesystem::space_stats_locked(bool by_codec) {
   s.gc_segments_emptied = gc_stats_.segments_emptied;
   s.gc_packs_repacked = gc_stats_.packs_repacked;
   s.gc_damaged = gc_stats_.damaged;
+  s.tier_chunks = tier_stats_.chunks;
+  s.tier_stored_before = tier_stats_.stored_before;
+  s.tier_stored_after = tier_stats_.stored_after;
+  s.tier_damaged = tier_stats_.damaged;
 
   s.dedup = dedup_ && !read_only_;
   s.dedup_entries = meta_.dedup.size();

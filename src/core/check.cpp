@@ -124,27 +124,36 @@ void rescue_superblocks(Store& store, FsckReport& report, const std::optional<Su
     sb.checkpoint_seq = c.seq;
     sb.next_segment_seq = max_seq + 1;
     if (!known) {
-      sb.features_incompat = c.shared_records ? incompat_features::shared_records : 0;
+      // What this version writes: a version 2 checkpoint may be followed by
+      // cold references.
+      sb.features_incompat =
+          c.shared_records ? incompat_features::shared_records | incompat_features::cold_data : 0;
     }
     try {
       ReplayResult r = replay(store, sb);
       // The chunk size: any chunk past the first tells it exactly.
-      std::uint64_t chunk = 0, largest = 0;
+      // Else a chunk followed by another is at most a chunk long, and
+      // usually exactly one.
+      std::uint64_t chunk = 0, largest = 0, inner = 0;
       for (const auto& [id, inode] : r.meta.inodes) {
         for (const auto& [index, ref] : inode.chunks) {
           largest = std::max<std::uint64_t>(largest, ref.size);
-          if (index == 0 || chunk) continue;
+          if (index != inode.chunks.rbegin()->first) inner = std::max<std::uint64_t>(inner, ref.size);
+          // (Not a pack's piece, and not data another file wrote first.)
+          if (index == 0 || chunk || ref.packed) continue;
           std::uint64_t seg = r.meta.segment_of(ref.offset);
           auto usage = r.meta.segments.find(seg);
           if (usage == r.meta.segments.end()) continue;
           auto h = try_read_record_header(store, ref.offset, sb.segment_offset(seg) + sb.segment_size(),
                                           usage->second.seq);
           if (h && h->header.type == RecordType::data_chunk) {
-            chunk = parse_data_chunk(*h).file_offset / index;
+            DataChunkInfo info = parse_data_chunk(*h);
+            if (info.inode == id && !info.pack && info.file_offset % index == 0) chunk = info.file_offset / index;
           }
         }
       }
       if (!known) {
+        if (!chunk && inner) chunk = std::bit_ceil(inner);
         if (!chunk) chunk = std::max<std::uint64_t>(std::uint64_t{1} << kDefaultChunkShift, std::bit_ceil(largest));
         sb.chunk_shift = static_cast<std::uint8_t>(std::countr_zero(chunk));
         if (sb.chunk_shift >= sb.segment_shift) sb.chunk_shift = static_cast<std::uint8_t>(sb.segment_shift - 1);

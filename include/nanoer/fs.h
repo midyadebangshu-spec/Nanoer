@@ -29,8 +29,10 @@
 #include "nanoer/gc.h"
 #include "nanoer/journal.h"
 #include "nanoer/metadata.h"
+#include "nanoer/policy.h"
 #include "nanoer/stats.h"
 #include "nanoer/thread_pool.h"
+#include "nanoer/tier.h"
 
 namespace nanoer {
 
@@ -97,6 +99,8 @@ struct FsInfo {
   std::uint64_t segments_free = 0;
   std::uint64_t segment_bytes = 0;  // data a segment holds
   GcStats gc;                       // since mounting
+  TierStats tier;                   // since mounting
+  bool cold_data = false;           // cold data is recompressed (the feature, and not turned off)
   bool dedup = false;               // new data is deduplicated
   std::uint64_t dedup_entries = 0;  // contents in the dedup index
   std::uint64_t dedup_index_bytes = 0;
@@ -127,6 +131,10 @@ class Filesystem {
     unsigned checkpoint_interval_s = 300;    // ... or this long, if anything was written
     unsigned threads = 0;                    // compression threads; 0: one per CPU
     unsigned gc_idle_s = 10;                 // background GC after this long without changes
+    // Data of files unchanged this long (seconds) is recompressed in its
+    // cold form, in the background when idle; -1: never. The default
+    // policy's setting; `max` folders use at most a day.
+    std::int64_t cold_after_s = 7 * 24 * 60 * 60;
     bool dedup = true;  // store identical chunks once (needs shared records, and no no_dedup preference)
     bool read_only = false;
     bool count_lookups = true;  // FUSE lookup counting (in-process users turn it off)
@@ -189,6 +197,10 @@ class Filesystem {
   // Returns how many more segments are free than before. It also runs by
   // itself: in the background, and before any ENOSPC.
   std::uint64_t collect_garbage(double max_utilization = 0.9);
+  // Recompresses all cold data now (nanoer tier), as files unchanged for
+  // `cold_after_s` (default: the mount's setting) count as cold, then writes
+  // the checkpoints that free the old copies. Returns chunks made cold.
+  std::uint64_t recompress_cold(std::optional<std::int64_t> cold_after_s = std::nullopt);
   bool read_only() const { return read_only_; }
   std::uint32_t chunk_size() const { return sb_.chunk_size(); }
   const Superblock& superblock() const { return sb_; }
@@ -244,12 +256,14 @@ class Filesystem {
     std::uint64_t limit;  // where its segment ends
     std::uint32_t stored_size;
     std::vector<User> users;
+    StorageForm form{};  // packs built again: their users' policy (cold form if cold)
   };
   struct GcPlan {
     std::vector<GcVictim> victims;
     std::vector<GcItem> items;  // in offset order
-    CodecId codec{};            // for packs built again
-    int level = 0;
+    // Not copied: cold files whose data in the victims is not cold yet. It
+    // is recompressed instead (a tiering step), not copied first.
+    std::vector<InodeId> cold_files;
   };
   struct GcRead {
     std::optional<Record> record;  // the record to copy, intact
@@ -260,12 +274,65 @@ class Filesystem {
   };
   enum class GcNeed { none, idle, low_space };
   GcNeed gc_need() const;  // shared lock is enough
-  GcPlan gc_plan(const GcPolicy& policy, bool urgent) const;  // shared lock is enough
+  // `divert`: leave cold files' data that is not cold yet to tiering.
+  GcPlan gc_plan(const GcPolicy& policy, bool urgent, bool divert = true) const;  // shared lock is enough
   std::vector<GcRead> gc_read(const GcPlan& plan);  // no lock needed
   bool gc_apply(const GcPlan& plan, std::vector<GcRead>& reads, bool urgent);
   bool gc_step_locked(const GcPolicy& policy, bool urgent);
   void gc_checkpoints(bool low_space);
   void background_gc();
+
+  // Cold data (tier.cpp). A pass first lists the candidate files (and the
+  // packs and shared records whose users are all cold); each step then
+  // takes some of them (shared lock), reads and recompresses their data (no
+  // lock), and re-points the chunks that still refer to what it read
+  // (unique lock), like a GC step.
+  struct TierMember {
+    InodeId ino;
+    std::uint64_t index;
+    ChunkRef ref;
+    std::uint64_t seq;    // of the record's segment, when planned
+    std::uint64_t limit;  // where that segment ends
+  };
+  struct TierItem {
+    enum class Kind { unit, single, pack };
+    Kind kind{};
+    // unit: one file's chunks, in order; single and pack: every reference
+    // to the record (single: the one record they all refer to).
+    std::vector<TierMember> members;
+    StorageForm form{};
+  };
+  struct TierPlan {
+    std::vector<TierItem> items;
+    std::uint64_t bytes = 0;  // uncompressed
+  };
+  struct TierRead {
+    bool ok = false;
+    bool in_place = false;  // no smaller: mark cold as it is
+    EncodedChunk encoded;
+    std::vector<std::uint32_t> pieces;  // unit: where each member starts
+    std::map<std::uint32_t, std::uint32_t> moved;  // pack: old piece -> new
+    // single: the old record's header fields, kept
+    InodeId owner = 0;
+    std::uint64_t file_offset = 0;
+    std::optional<Blake3Hash> blake3;
+    std::uint64_t stored_before = 0;
+    std::optional<std::size_t> damaged;  // the member whose record could not be read
+  };
+  bool cold_enabled() const;
+  // The file's data is cold now: its form if so.
+  std::optional<StorageForm> cold_now(const Inode& file, std::int64_t now_ns,
+                                      std::optional<std::int64_t> age_s) const;
+  bool tier_eligible(const TierMember& m) const;  // still as planned
+  void tier_begin_pass(std::int64_t now_ns, std::optional<std::int64_t> age_s);  // tier_mutex_, shared lock
+  // `only`: plan just these files (GC sends the cold files it meets).
+  TierPlan tier_plan(std::uint64_t budget, std::int64_t now_ns, std::optional<std::int64_t> age_s,
+                     const std::vector<InodeId>* only = nullptr);  // shared lock
+  std::vector<TierRead> tier_read(const TierPlan& plan);  // no lock
+  std::uint64_t tier_apply(const TierPlan& plan, std::vector<TierRead>& reads);
+  bool tier_room(const TierPlan& plan, bool background) const;
+  std::uint64_t tier_files_locked(const std::vector<InodeId>& files);  // GC's cold files
+  void background_tier();
 
   Store& store_;
   Superblock sb_;
@@ -296,12 +363,19 @@ class Filesystem {
   std::int64_t last_commit_ns_ = 0;
   std::int64_t last_checkpoint_ns_ = 0;
   std::int64_t last_change_ns_ = 0;  // by a user of the filesystem (not GC)
-  bool in_gc_ = false;
+  bool in_gc_ = false;  // GC or tiering is changing the metadata (not a user's change)
   GcStats gc_stats_;
   std::uint64_t gc_emptied_ = 0;  // segments GC emptied since the last checkpoints
   std::uint64_t dedup_hits_ = 0;
   std::uint64_t dedup_bytes_ = 0;
   std::set<std::pair<std::uint64_t, std::uint64_t>> gc_skip_;  // segments with damaged data
+  TierStats tier_stats_;
+  std::mutex tier_mutex_;  // one pass at a time; guards the pass state below
+  std::vector<InodeId> tier_queue_;  // files left in this pass, last first
+  std::vector<TierItem> tier_shared_;  // packs and shared records, likewise
+  bool tier_pass_open_ = false;
+  std::int64_t tier_pass_ns_ = 0;  // when the last pass began
+  std::set<std::pair<std::uint64_t, std::uint64_t>> tier_skip_;  // records found damaged
 
   std::mutex counts_mutex_;  // FUSE lookup and open counts
   std::unordered_map<InodeId, std::uint64_t> lookups_;
