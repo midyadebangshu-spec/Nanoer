@@ -800,6 +800,11 @@ for neighbouring reads.
   eighth of its budget (8 of 64 MiB). Since M2. The key is now mixed with
   a full 64-bit finaliser; a test checks one segment's records spread over
   every shard.
+- **One load per missing chunk (M5):** threads that miss the same chunk at
+  once wait for one decompression (`get_or_load`). The kernel reads ahead
+  with several requests in parallel, which often fall in one 1 MiB cold
+  unit: each used to decompress the whole unit. Found when cold data read
+  at half the speed of hot data on a real mount (§14).
 
 ### 8.3 Interaction with the kernel page cache
 
@@ -1628,6 +1633,7 @@ rejected.
 | 2026-10-27 | Background tiering only when idle, 2 s slices, 15 % free to spare, before GC; GC recompresses cold files it meets instead of copying them | no foreground work waits; data is rewritten once, not copied then recompressed | a separate thread; tiering inside GC only (cold data in full segments would never be recompressed) |
 | 2026-10-27 | Policies are copied to new files and folders at creation; a file's own copy decides | no lookup up the tree per write; a tree follows the folder it was made in, also when moved | inheriting at read time (renames would change how old data is stored) |
 | 2026-10-27 | Simplified 2Q replaces the LRU; shards of at least 4 MiB | measured: 98.8 % of a working set kept through a scan against 58.9 %, the scan no slower | full 2Q (worse, §8.2); ARC (not measured: more state, and 2Q already met the bar); keeping the LRU |
+| 2026-10-27 | Concurrent misses on one chunk share one load | parallel kernel read-ahead decompressed a cold unit once per request | a lock per chunk held while reading (blocks other readers of the shard) |
 | 2026-10-27 | Cache shard chosen by a full 64-bit mix of the key | the old hash used 2 of 16 shards (a bug since M2) | — |
 | 2026-10-27 | M5 proposed without an engine read-ahead (pending approval) | measured: the engine streams at 2,000 MB/s, a mount at 808 MB/s, so FUSE sets the speed | parallel prefetch into the safe space (STAGE1_PLAN's original M5 item) |
 

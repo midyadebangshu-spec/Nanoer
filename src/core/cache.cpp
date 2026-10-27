@@ -11,16 +11,11 @@ ChunkCache::Shard& ChunkCache::shard_for(const Key& key) {
   return *shards_[KeyHash()(key) % shards_.size()];
 }
 
-std::shared_ptr<const Bytes> ChunkCache::get(const Key& key) {
-  Shard& s = shard_for(key);
-  std::lock_guard lock(s.mutex);
+std::shared_ptr<const Bytes> ChunkCache::find(Shard& s, const Key& key) {
   auto it = s.index.find(key);
   if (it == s.index.end()) {
     auto i = s.in_index.find(key);
-    if (i == s.in_index.end()) {
-      ++misses_;
-      return nullptr;
-    }
+    if (i == s.in_index.end()) return nullptr;
     // 2Q: asked for again, so it is not a scan's: into the LRU.
     ++hits_;
     s.in_bytes -= i->second->second->size();
@@ -34,10 +29,54 @@ std::shared_ptr<const Bytes> ChunkCache::get(const Key& key) {
   return it->second->second;
 }
 
+std::shared_ptr<const Bytes> ChunkCache::get(const Key& key) {
+  Shard& s = shard_for(key);
+  std::lock_guard lock(s.mutex);
+  std::shared_ptr<const Bytes> data = find(s, key);
+  if (!data) ++misses_;
+  return data;
+}
+
+std::shared_ptr<const Bytes> ChunkCache::get_or_load(const Key& key,
+                                                     const std::function<std::shared_ptr<const Bytes>()>& load) {
+  Shard& s = shard_for(key);
+  std::promise<std::shared_ptr<const Bytes>> promise;
+  {
+    std::unique_lock lock(s.mutex);
+    if (std::shared_ptr<const Bytes> data = find(s, key)) return data;
+    if (auto it = s.loading.find(key); it != s.loading.end()) {
+      auto pending = it->second;
+      lock.unlock();
+      ++hits_;  // decompressed once, for several readers
+      return pending.get();
+    }
+    ++misses_;
+    s.loading.emplace(key, promise.get_future().share());
+  }
+  std::shared_ptr<const Bytes> data;
+  try {
+    data = load();
+  } catch (...) {
+    std::lock_guard lock(s.mutex);
+    s.loading.erase(key);
+    promise.set_exception(std::current_exception());
+    throw;
+  }
+  std::lock_guard lock(s.mutex);
+  s.loading.erase(key);
+  if (data && data->size() <= shard_budget_) insert(s, key, data);
+  promise.set_value(data);
+  return data;
+}
+
 void ChunkCache::put(const Key& key, std::shared_ptr<const Bytes> data) {
   if (!data || data->size() > shard_budget_) return;
   Shard& s = shard_for(key);
   std::lock_guard lock(s.mutex);
+  insert(s, key, std::move(data));
+}
+
+void ChunkCache::insert(Shard& s, const Key& key, std::shared_ptr<const Bytes> data) {
   if (auto it = s.index.find(key); it != s.index.end()) {
     s.bytes -= it->second->second->size();
     s.lru.erase(it->second);

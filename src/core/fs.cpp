@@ -360,14 +360,13 @@ std::shared_ptr<const Bytes> Filesystem::read_chunk(const ChunkRef& ref) {
   auto it = meta_.segments.find(segment);
   if (it == meta_.segments.end()) throw Error(Errc::corrupt, "chunk in a free segment");
   ChunkCache::Key key{ref.offset, it->second.seq};
-  std::shared_ptr<const Bytes> data = cache_.get(key);
-  if (!data) {
+  // A pack is kept whole: its pieces are often read together.
+  std::shared_ptr<const Bytes> data = cache_.get_or_load(key, [&] {
     Record record = read_record(store_, ref.offset, sb_.segment_offset(segment) + sb_.segment_size(),
                                 it->second.seq);
-    data = std::make_shared<const Bytes>(decode_data_chunk(record));
-    if (!ref.packed && data->size() != ref.size) throw Error(Errc::corrupt, "chunk has the wrong size");
-    cache_.put(key, data);  // a pack whole: its pieces are often read together
-  }
+    return std::make_shared<const Bytes>(decode_data_chunk(record));
+  });
+  if (!ref.packed && data->size() != ref.size) throw Error(Errc::corrupt, "chunk has the wrong size");
   if (!ref.packed) return data;
   if (std::uint64_t{ref.piece} + ref.size > data->size()) throw Error(Errc::corrupt, "piece outside its pack");
   return std::make_shared<const Bytes>(data->begin() + ref.piece, data->begin() + ref.piece + ref.size);

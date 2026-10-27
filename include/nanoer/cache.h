@@ -9,6 +9,8 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
+#include <future>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -35,6 +37,12 @@ class ChunkCache {
   explicit ChunkCache(std::uint64_t budget_bytes, unsigned shards = 16, bool two_q = true);
 
   std::shared_ptr<const Bytes> get(const Key& key);
+  // The chunk, from the cache or from `load` (then kept). Threads asking for
+  // the same missing chunk at once wait for one load instead of each
+  // decompressing it (the kernel reads ahead in parallel, often within one
+  // cold unit). An exception from `load` reaches every waiter.
+  std::shared_ptr<const Bytes> get_or_load(const Key& key,
+                                           const std::function<std::shared_ptr<const Bytes>()>& load);
   // Chunks larger than a shard's share of the budget are not kept.
   void put(const Key& key, std::shared_ptr<const Bytes> data);
 
@@ -66,7 +74,10 @@ class ChunkCache {
     std::list<std::pair<Key, std::shared_ptr<const Bytes>>> in;
     std::unordered_map<Key, decltype(in)::iterator, KeyHash> in_index;
     std::uint64_t in_bytes = 0;
+    std::unordered_map<Key, std::shared_future<std::shared_ptr<const Bytes>>, KeyHash> loading;
   };
+  std::shared_ptr<const Bytes> find(Shard& s, const Key& key);  // s.mutex held; counts the hit
+  void insert(Shard& s, const Key& key, std::shared_ptr<const Bytes> data);  // s.mutex held
   void evict(Shard& s);
   Shard& shard_for(const Key& key);
 

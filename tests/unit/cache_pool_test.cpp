@@ -1,4 +1,7 @@
 #include <atomic>
+#include <chrono>
+#include <thread>
+#include <vector>
 #include <stdexcept>
 
 #include <gtest/gtest.h>
@@ -90,6 +93,28 @@ TEST(ChunkCache, TwoQKeepsWhatIsUsedAgainThroughAScan) {
       EXPECT_LT(hits, 10) << "LRU: the scan evicts it";
     }
   }
+}
+
+TEST(ChunkCache, ConcurrentMissesLoadOnce) {
+  ChunkCache cache(1 << 20);
+  std::atomic<int> loads{0};
+  std::vector<std::thread> threads;
+  for (int t = 0; t < 8; ++t) {
+    threads.emplace_back([&] {
+      auto data = cache.get_or_load({4096, 1}, [&] {
+        ++loads;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));  // a slow decompression
+        return std::make_shared<const Bytes>(100, 7);
+      });
+      EXPECT_EQ((*data)[0], 7);
+    });
+  }
+  for (auto& t : threads) t.join();
+  EXPECT_EQ(loads, 1);
+  // A failed load reaches the caller and is not kept.
+  EXPECT_THROW(cache.get_or_load({8192, 1}, []() -> std::shared_ptr<const Bytes> { throw std::runtime_error("x"); }),
+               std::runtime_error);
+  EXPECT_EQ(cache.get({8192, 1}), nullptr);
 }
 
 TEST(ThreadPool, RunsEverythingExactlyOnce) {
