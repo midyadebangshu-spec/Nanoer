@@ -1561,6 +1561,28 @@ driver removes the round trips. Raw data reads slower than compressible data
 because more bytes move. (An earlier "213 MB/s streaming" figure was
 `sha256sum`'s speed, not Nanoer's.)
 
+### 2026-10-27: in-memory metadata at scale (before M6)
+
+Synthetic metadata (files with 128 KiB chunks, a dedup key each, 10,000
+files per directory) applied through `Metadata::apply`, release build; RAM
+is the process's resident growth:
+
+| Filesystem | RAM | Checkpoint | Encode | Decode (mount) |
+|---|---:|---:|---:|---:|
+| 100k files × 1 chunk (13 GB) | 50 MiB | 5.8 MiB | 0.06 s | 0.27 s |
+| 1M files × 1 chunk (131 GB) | 486 MiB | 59.5 MiB | 1.17 s | 5.38 s |
+| 100k files × 40 chunks (524 GB) | 531 MiB | 87.3 MiB | 0.47 s | 5.05 s |
+| 1M files × 4 chunks (524 GB) | 857 MiB | 122.4 MiB | 1.90 s | 12.01 s |
+
+**Conclusion:** about 400 bytes per file and 125 per chunk, without limit;
+every checkpoint rewrites all of it (GC needs two), and mounting decodes
+it all. This is what M6's on-disk tree is for ([`docs/M6_PLAN.md`](docs/M6_PLAN.md)).
+
+Also found while planning M6: Btrfs can be mounted on this VM (kernel
+support, loop devices; `btrfs-progs` and `fio` installed), so the stage 1
+comparison can be run for real rather than estimated; GitHub is reachable
+(`git clone`), kernel.org is not.
+
 ### 2026-10-27: M5, cold data on real mounts
 
 Release build, image files on the VM's disk, 4 cores, default mount

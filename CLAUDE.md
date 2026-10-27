@@ -34,8 +34,8 @@ that a system needing 800 GB without Nanoer needs about 500 GB with it.
 Milestones M1 (foundation), M2 (working filesystem), M3 (crash safety,
 `fsck`) and M4 (garbage collection, dedup, small-file packing, `nanoer
 stats`) and M5 (cold data recompressed, folder policies, 2Q cache) are
-complete; M6 (on-disk metadata, migration, benchmark report) is next, after
-its plan is approved.
+complete; M6 (on-disk metadata, migration, benchmark report; plan in
+`docs/M6_PLAN.md`) is next, after its plan is approved.
 
 - `include/nanoer/`: public headers. `src/core/`: the engine (`fs.cpp` is the
   POSIX layer, `journal.cpp` the log, `metadata.cpp` the operations).
