@@ -541,7 +541,8 @@ unsigned BTree::height() const {
 
 bool BTree::relocate(const NodeRef& ref, const NodeInfo& info) {
   // The root itself.
-  if (root_ ? root_->origin == ref : root_ref_ == ref) {
+  if (root_ && root_->origin == ref) return false;  // already being rewritten
+  if (!root_ && root_ref_ == ref) {
     writable_root();
     return true;
   }
@@ -570,7 +571,7 @@ bool BTree::relocate(const NodeRef& ref, const NodeInfo& info) {
     }
     std::size_t i = child_index(*node, info.first);
     const Node::Child& c = node->children[i];
-    if (c.dirty) return c.dirty->origin == ref;  // already being rewritten
+    if (c.dirty) return false;  // already being rewritten (or not this node)
     if (c.ref != ref) return false;
     path.push_back(i);
   }

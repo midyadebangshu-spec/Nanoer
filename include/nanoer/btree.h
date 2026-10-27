@@ -96,7 +96,8 @@ class BTree {
 
   // GC: whether the node at `ref`, described by `info`, is part of the tree
   // (as of the last flush); if so, marks it and its parents dirty, so that
-  // the next flush writes it elsewhere. Returns whether it was found.
+  // the next flush writes it elsewhere. Returns whether that changed
+  // anything: false if it is not in the tree, or already being rewritten.
   bool relocate(const NodeRef& ref, const NodeInfo& info);
 
   // The encoding of a node, for fsck and fuzzing: throws Error(corrupt).

@@ -706,8 +706,10 @@ Metadata Metadata::decode_checkpoint(ByteView data, std::uint64_t data_start, un
     if (!m.segments.emplace(index, SegmentUsage{seq, live}).second) corrupt("duplicate segment");
   }
   if (!in.done()) corrupt("trailing bytes in checkpoint");
-  if (root && root.offset < data_start) corrupt("tree root before the data area");
-  if (root && !m.segments.contains(m.segment_of(root.offset))) corrupt("tree root in a free segment");
+  if (root && options.account_nodes) {  // (nodes in memory are not in segments)
+    if (root.offset < data_start) corrupt("tree root before the data area");
+    if (!m.segments.contains(m.segment_of(root.offset))) corrupt("tree root in a free segment");
+  }
   return m;
 }
 
@@ -829,6 +831,15 @@ bool same_items(const BTree& a, const BTree& b, bool skip_single = false) {
           if (c && !decode_chunk_item(*c).packed) return true;
         }
       }
+      if (k.kind == item_kind::refs) {
+        // Users in any order: the order they came in.
+        Refs r = decode_refs(v);
+        std::sort(r.users.begin(), r.users.end(), [](const ChunkUser& p, const ChunkUser& q) {
+          return std::pair(p.ino, p.index) < std::pair(q.ino, q.index);
+        });
+        out.emplace_back(k, encode_refs(r));
+        return true;
+      }
       out.emplace_back(k, Bytes(v.begin(), v.end()));
       return true;
     });
@@ -850,7 +861,9 @@ bool Metadata::same_as(const LegacyMetadata& legacy) const {
   o.account_nodes = false;
   Metadata other = from_legacy(legacy, o, std::make_shared<MemNodeIO>());
   bool segs = options_.account_nodes || segments == other.segments;
-  return segs && counters == other.counters && next_inode == other.next_inode && last_txid == other.last_txid &&
+  MetaCounters c = counters;
+  c.node_bytes = other.counters.node_bytes;  // (the legacy metadata has no nodes)
+  return segs && c == other.counters && next_inode == other.next_inode && last_txid == other.last_txid &&
          same_items(*tree_, *other.tree_, true);
 }
 
