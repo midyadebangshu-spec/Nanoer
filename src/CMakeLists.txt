@@ -8,6 +8,7 @@ add_library(nanoer_core STATIC
   core/error.cpp
   core/format.cpp
   core/fs.cpp
+  core/btree.cpp
   core/gc.cpp
   core/policy.cpp
   core/tier.cpp

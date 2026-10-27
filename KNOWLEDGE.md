@@ -422,6 +422,27 @@ problem and adds compaction overhead. Nanoer therefore owns its metadata
 format. Stage 1 may start with in-memory metadata plus checkpoints and add the
 on-disk B+tree once the rest works (see the stage 1 plan).
 
+**As built (M6 step 1, `src/core/btree.cpp`):** keys of (object, kind,
+offset), values of bytes; nodes stored through an interface (`NodeStore`),
+so the tree is tested in memory and the filesystem stores nodes in its log.
+
+- **Copy on write:** a change copies the nodes on its path (dirty, in
+  memory); `flush()` writes them bottom-up and only then releases the
+  nodes they replace, so the previous tree stays whole until then (and on
+  disk until its space is reused). An inner node's key for each child is
+  that child's first key, which also lets GC find a node from what is
+  recorded with it (level and first key) and move it (`relocate`).
+- **Splits** by encoded size (16 KiB; a leaf with one large item may be
+  larger); **merges** when a node falls below a quarter, else sharing with
+  a neighbour. Clean nodes are cached decoded, within a byte budget; a
+  released node leaves the cache, as its location may be reused.
+- **Tests:** against a `std::map` over 20,000 random operations per seed
+  with flushes and reloads, checking after each flush that the live nodes
+  are exactly those reachable from the root; old roots readable; exactly
+  one node per level rewritten for one change; relocation of every node;
+  the cache budget; damaged nodes. Two deliberate bugs (a merge losing an
+  item, a flush not releasing what it replaced) were each caught.
+
 ### 7.6 Garbage collection (GC) and compaction
 
 Overwrites and deletes leave **dead** chunks inside segments. GC picks
@@ -1561,6 +1582,32 @@ driver removes the round trips. Raw data reads slower than compressible data
 because more bytes move. (An earlier "213 MB/s streaming" figure was
 `sha256sum`'s speed, not Nanoer's.)
 
+### 2026-10-27: tree node size and compression (M6 step 1)
+
+1M files' metadata as items (attributes, a directory entry, four chunk
+references each: 6M items, 25.9 bytes on average), in a tree in memory
+flushed every 100,000 files; nodes optionally compressed with zstd 1 and
+counted with a 64-byte record header. Lookups of random files' first
+chunk through a 1 MiB cache (nearly every level missing), CPU only:
+
+| Nodes | Stored | Bytes per item | Height | Cold lookup | Node reads per lookup |
+|---|---:|---:|---:|---:|---:|
+| 4 KiB, raw | 261.7 MiB | 45.7 | 4 | 44.8 µs | 1.87 |
+| 16 KiB, raw | 253.6 MiB | 44.3 | 3 | 114.6 µs | 1.52 |
+| 4 KiB, zstd 1 | 129.4 MiB | 22.6 | 4 | 65.0 µs | 1.87 |
+| 8 KiB, zstd 1 | 118.3 MiB | 20.7 | 4 | 90.1 µs | 1.74 |
+| **16 KiB, zstd 1** | **112.2 MiB** | **19.6** | **3** | **146.7 µs** | **1.52** |
+| 32 KiB, zstd 1 | 109.0 MiB | 19.0 | 3 | 249.0 µs | 1.23 |
+| 64 KiB, zstd 1 | 108.6 MiB | 19.0 | 3 | 422.9 µs | 1.02 |
+
+**Conclusions:** compression halves the metadata on disk (and what a cold
+lookup reads); beyond 16 KiB nodes save little space but cost more per
+miss. 16 KiB with zstd 1 is confirmed (decision 2 of the M6 plan). A miss
+costs about 75 µs of CPU per 16 KiB node here, mostly building one buffer
+per item when decoding: to be made cheaper if the workload measurements
+show cache misses matter (on a disk, the read itself is of the same
+order).
+
 ### 2026-10-27: in-memory metadata at scale (before M6)
 
 Synthetic metadata (files with 128 KiB chunks, a dedup key each, 10,000
@@ -1793,6 +1840,7 @@ rejected.
 | 2026-10-27 | **Cold data recompressed chunk by chunk (zstd 9; zstd 19 under `max`), no cold units**, for every policy; the dedup index's 4 KiB piece encoding removed again (approved by the user, option 1 of §7.7) | measured on a real mount: 1 MiB units read 25–30 % slower sequentially (315–339 against 469–483 MB/s) and 3× slower at random; 256 and 512 KiB units no better; chunks recompressed one by one read as fast as hot data | 1 MiB units with the next unit decompressed ahead of the reader (keeps −14 %; not measured, new code, reverses the no-read-ahead decision); units as they are (slower reads accepted); units only under `max` |
 | 2026-10-27 | Concurrent misses on one chunk share one load | parallel kernel read-ahead decompressed a cold unit once per request | a lock per chunk held while reading (blocks other readers of the shard) |
 | 2026-10-27 | Cache shard chosen by a full 64-bit mix of the key | the old hash used 2 of 16 shards (a bug since M2) | — |
+| 2026-10-27 | Tree nodes of 16 KiB compressed with zstd 1, confirmed | measured (§14): half the size of raw nodes; larger nodes save under 3 % more and cost more per cache miss | 4 or 8 KiB (5–15 % larger, shallower trees lost), 32–64 KiB (slower misses), raw (twice the size) |
 | 2026-10-27 | M6 plan approved with the recommended answers: one CoW B+tree keyed (object, kind, offset); 16 KiB nodes compressed with zstd 1 (to be confirmed by measurement); directory entries by 64-bit name hash; dedup index bounded in RAM (128 MiB) and rebuilt in the background after mount; back-references for packs and shared records; `nanoer upgrade` required to write M2–M5 filesystems; format 1.0 at the end of M6; discard on by default; the full benchmark set on this VM; a 64 MiB metadata cache | user approval of `docs/M6_PLAN.md` | see plan §12 |
 | 2026-10-27 | M5 proposed without an engine read-ahead (pending approval) | measured: the engine streams at 2,000 MB/s, a mount at 808 MB/s, so FUSE sets the speed | parallel prefetch into the safe space (STAGE1_PLAN's original M5 item) |
 
