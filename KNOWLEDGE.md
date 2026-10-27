@@ -522,7 +522,7 @@ investigated further, as the chosen option does not need it.
 1. **Recompress each chunk on its own with zstd 9.** Reads as fast as hot
    data, sequential and random (measured). Saves less: −6.5 % on the log
    file instead of −10.3 %; on `/usr`, about 8.5 % instead of 14 % by the
-   pre-plan benchmark (measured in §14). Least code: single chunks were
+   pre-plan benchmark (then measured: −10.2 % instead of −13.6 %, §14). Least code: single chunks were
    already handled (lone chunks, shared data), unit code is removed.
 2. **Keep 1 MiB units, and decompress the next unit ahead of a
    sequential reader** on the thread pool, so decompression overlaps reading
@@ -1554,6 +1554,71 @@ parallel would have little to gain, so M5 leaves it out; the stage 3 kernel
 driver removes the round trips. Raw data reads slower than compressible data
 because more bytes move. (An earlier "213 MB/s streaming" figure was
 `sha256sum`'s speed, not Nanoer's.)
+
+### 2026-10-27: M5, cold data on real mounts
+
+Release build, image files on the VM's disk, 4 cores, default mount
+options (safe space 256 MiB). Cold data made with `nanoer tier --age 0`
+(the background pass does the same, in slices, when idle).
+
+**A copy of `/usr`** (77,267 files, 4.4 GiB), as in the M4 measurement:
+
+| | stored | records | recompressing |
+|---|---:|---:|---:|
+| hot (M4: zstd 1, small files packed) | 1.7 GiB = 37.4 % | 44,620 | — |
+| **cold, default policy (zstd 9 per chunk)** | **1.5 GiB = 33.6 % (−10.2 %)** | 44,620 | 35.7 s (≈ 120 MB/s) |
+| cold, 1 MiB units (built first, dropped: §7.7) | 1.4 GiB = 32.3 % (−13.6 %) | 19,422 | 54.9 s |
+| cold, `max` policy, 1 MiB units with zstd 19 (dropped) | 1.3 GiB = 29.6 % | 19,199 | 562.8 s |
+Per chunk, 3,945 records were only marked (no 3 % gain) and 2,816 packs
+of small files were packed again. Afterwards `nanoer gc` copied 46 MiB and
+freed 16 more segments, and `fsck --deep` was clean. The image file grew
+from 1.7 to 3.1 GiB allocated: Nanoer reuses freed segments but never
+gives space back to the file underneath (no hole punching or discard yet).
+
+**Reading, 1 GiB of log text and 512 MiB of random data**, freshly
+mounted, page cache dropped, `dd` with 1 MiB blocks; 2,000 random 4 KiB
+reads of the log:
+
+| | log, sequential | random data, sequential | random 4 KiB reads (mean / median / p99) |
+|---|---:|---:|---:|
+| hot | 449 MB/s | 387 MB/s | 0.86 / 0.64 / 2.48 ms |
+| **cold, per chunk** | **428 MB/s** | 624 MB/s | **0.74 / 0.60 / 1.67 ms** |
+| cold, 1 MiB units (dropped) | 306 MB/s | 454 MB/s | 1.95 / 1.94 / 5.56 ms |
+
+(The random data is incompressible: it is only marked cold, so its two
+rows differ by noise alone, which shows how noisy this VM is.) The log
+file stored 204.0 MiB hot and 190.7 MiB cold.
+
+**Conclusions:**
+- Cold data reads as fast as hot data, sequentially and at random: the
+  plan's condition (within 10 %) is met.
+- `/usr` stores 10 % less once cold, at the low end of what the plan
+  aimed for (at least 10 %); units would have saved 13.6 % at the cost
+  of 25–30 % slower reads (§7.7).
+- Toward 800 GB → 500 GB (62.5 %): an OS tree is at 33.6 %, source and
+  text far lower; encoded media stays near 100 % whatever the level.
+
+### 2026-10-27: scan resistance of the safe space (M5)
+
+In-process (no kernel page cache: the worst case for the safe space),
+release build. A working set of files read at random in 128 KiB pieces,
+half the size of the safe space, warmed first; then a scan of four times
+the safe space, 1 MiB after every four working-set reads:
+
+| safe space | data | LRU: working set kept | 2Q: working set kept | working-set reads, LRU → 2Q | scan, LRU → 2Q |
+|---|---|---:|---:|---:|---:|
+| 64 MiB | hot | 60.0 % | **100 %** | 152 → 25 ms | 391 → 491 MB/s |
+| 64 MiB | 1 MiB units | 87.1 % | 82.2 % | 262 → 320 ms | 542 → 570 MB/s |
+| 256 MiB | hot | 58.9 % | **98.8 %** | 503 → 122 ms | 462 → 475 MB/s |
+| 256 MiB | 1 MiB units | 96.3 % | 96.3 % | 409 → 396 ms | 514 → 514 MB/s |
+
+The first run of this benchmark showed an 8 MiB cache where 64 MiB was
+configured: the shard bug of §8.2, fixed before these numbers.
+
+**Conclusion:** 2Q keeps a working set through a scan that an LRU loses
+most of, at no cost to the scan: it replaced the LRU (the plan's rule:
+a quarter better, the scan no slower). Cold data is now stored per chunk,
+so it behaves as the hot rows.
 
 ### 2026-10-24: what M4's techniques could save on `/usr` (before M4)
 

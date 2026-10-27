@@ -11,7 +11,7 @@ space**).
 
 ## Status
 
-**Stage 1, milestones M1–M4 complete.** `nanoerfs` is a read-write
+**Stage 1, milestones M1–M5 complete.** `nanoerfs` is a read-write
 compressed filesystem for Linux (through FUSE): files, directories, hard
 and symbolic links, permissions, extended attributes, `mmap`, `fsync`,
 sparse files. A power cut after any single write recovers a state that
@@ -19,7 +19,10 @@ really existed, with everything `fsync`ed (tested at every write point and
 with `kill -9` on a real mount). Damage is detected and reported, never
 silently dropped. Garbage collection keeps the space of rewritten data
 reusable, identical data is stored once (dedup), small files are
-compressed together, and `nanoer stats` shows where the space goes. See
+compressed together, and `nanoer stats` shows where the space goes. Data
+that has stopped changing is recompressed more tightly in the background,
+and reads as fast as before; each folder can say how its data is stored.
+See
 [`docs/STAGE1_PLAN.md`](docs/STAGE1_PLAN.md) for what comes next.
 
 **Not ready for important data yet.** Nanoer keeps one copy of
@@ -36,9 +39,9 @@ backups.
 
 The same 95 MiB of headers, Python library, source code and build output
 takes **110 MB on ext4 and 32 MB on Nanoer** (stored at 30.5 % of its size).
-A copy of a whole `/usr` (4.4 GiB) is stored at 37.4 %; data with copies
-(several source trees, two Python versions) 31 % smaller again thanks to
-dedup.
+A copy of a whole `/usr` (4.4 GiB) is stored at 37.4 %, and at 33.6 % once
+it has gone cold (unchanged for 7 days); data with copies (several source
+trees, two Python versions) 31 % smaller again thanks to dedup.
 On 4,158 Linux system files, the fast default (zstd level 1) stores 42.5 %
 and maximum zstd 37.2 %, well below the 62.5 % that 800 GB → 500 GB needs. Already-encoded media (video, music, JPEG/PNG, most game assets)
 does not compress; Nanoer stores it raw, so it costs nothing extra but saves
@@ -71,11 +74,16 @@ nanoer bench /usr                     # measure every codec on your own files
 nanoer fsck home.img                  # check (unmounted); --repair, --deep
 nanoer stats /mnt/data                # where the space goes (or an unmounted image)
 nanoer gc home.img                    # compact an unmounted image (it also runs by itself)
+nanoer tier home.img                  # recompress cold data now (it also runs by itself)
+nanoer policy -r /mnt/data/videos none   # how a folder's data is stored: none, fast,
+                                      # balanced (the default) or max
 ```
 
 `nanoerfs` options: `-o safe_space=SIZE` (decompressed-chunk cache, default
-256M), `-o commit=SECONDS` (default 5), `-o ro`, `-o nodedup`, `-o
-allow_other`, `-f` (foreground). `mkfs.nanoer --no-dedup` turns dedup off
+256M), `-o commit=SECONDS` (default 5), `-o cold_after=AGE` (recompress
+data of files unchanged this long: default 7d, `never` to turn it off),
+`-o idle=SECONDS` (background work after this long without changes,
+default 10), `-o ro`, `-o nodedup`, `-o allow_other`, `-f` (foreground). `mkfs.nanoer --no-dedup` turns dedup off
 for good (it saves the index's memory, about 21–43 bytes per chunk). `mount.nanoer` is the same program, for `mount -t nanoer` and
 `/etc/fstab`. `fsck.nanoer` is `nanoer fsck`, for `fsck -t nanoer` and
 boot-time checks; exit codes follow e2fsck (0 clean, 1 repaired, 4 errors
