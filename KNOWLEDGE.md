@@ -1275,6 +1275,12 @@ table fallback that processes 8 bytes per step.
   chunk, which is wrong for a pack's pieces and for data another file
   wrote first. It now uses only the file's own records, else the size of
   a chunk followed by another.
+- **Lesson:** ThreadSanitizer caught, only under a loaded parallel run, a
+  race in the background pass: it counted a pass in the statistics while
+  holding only the shared lock, and `info()` reads them under the shared
+  lock too. Counters now change under the unique lock. Run alone the test
+  passed 15 times out of 15; six copies in parallel reported the race in
+  4 of 6 runs without the fix and 0 of 6 with it.
 - **Lesson:** `recompress_cold` commits first, so a test that wanted a
   file to stay uncommitted (not cold) had to inspect a plan instead.
 - **Benchmarks** compared with ext4 (no compression) and Btrfs + zstd: space

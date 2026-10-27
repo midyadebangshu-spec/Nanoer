@@ -119,7 +119,8 @@ void Filesystem::tier_begin_pass(std::int64_t now_ns, std::optional<std::int64_t
   }
   tier_pass_open_ = true;
   tier_pass_ns_ = now_ns;
-  ++tier_stats_.passes;
+  // (tier_stats_ is counted by the caller, under the unique lock: readers
+  // of info() hold the shared one.)
 }
 
 Filesystem::TierPlan Filesystem::tier_plan(std::uint64_t budget, std::int64_t now_ns,
@@ -364,6 +365,7 @@ void Filesystem::background_tier() {
     return cold_enabled() && now() - last_change_ns_ >= std::int64_t{options_.gc_idle_s} * 1'000'000'000 &&
            dirty_.empty() && pending_ops_.empty();
   };
+  bool began = false;
   {
     std::shared_lock lock(mutex_);
     if (!idle()) return;
@@ -372,7 +374,12 @@ void Filesystem::background_tier() {
       bool due = tier_pass_ns_ == 0 || last_change_ns_ > tier_pass_ns_ || t - tier_pass_ns_ >= kTierRescanNs;
       if (!due) return;
       tier_begin_pass(t, std::nullopt);
+      began = true;
     }
+  }
+  if (began) {
+    std::unique_lock lock(mutex_);
+    ++tier_stats_.passes;
   }
   const auto until = std::chrono::steady_clock::now() + kTierSlice;
   while (std::chrono::steady_clock::now() < until) {
@@ -407,6 +414,7 @@ std::uint64_t Filesystem::recompress_cold(std::optional<std::int64_t> cold_after
   commit();
   const std::int64_t t = now();
   tier_begin_pass(t, cold_after_s);
+  ++tier_stats_.passes;
   std::uint64_t marked = 0;
   while (true) {
     TierPlan plan = tier_plan(kTierCallStepBytes, t, cold_after_s);
