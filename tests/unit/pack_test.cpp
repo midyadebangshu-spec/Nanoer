@@ -59,7 +59,7 @@ Bytes read_all(Filesystem& fs, InodeId ino) {
   return b;
 }
 
-const ChunkRef& ref_of(Filesystem& fs, InodeId ino) {
+ChunkRef ref_of(Filesystem& fs, InodeId ino) {
   return FilesystemTestAccess::chunks(fs, ino).at(0);
 }
 

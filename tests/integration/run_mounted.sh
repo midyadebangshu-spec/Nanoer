@@ -156,9 +156,14 @@ case "$MODE" in
       echo "round $round: recovered, $(grep -c '^file' "$LOG") files written so far"
     done
     if [[ "${NANOER_MOUNT_OPTS:-}" == *cold_after=0* ]]; then
-      # Recompressing ran too: some data is in its cold form.
-      sleep 3
-      "$BIN/nanoer" stats "$MNT" | grep "cold:" | tee "$WORK/cold.txt"
+      # Recompressing ran too: some data is in its cold form (it runs once
+      # the filesystem is idle; sanitizer builds take longer to get there).
+      for _ in $(seq 30); do
+        sleep 1
+        "$BIN/nanoer" stats "$MNT" | grep "cold:" >"$WORK/cold.txt"
+        grep -q "cold: *0 B" "$WORK/cold.txt" || break
+      done
+      cat "$WORK/cold.txt"
       if grep -q "cold: *0 B" "$WORK/cold.txt"; then
         echo "no data was recompressed"
         exit 1
