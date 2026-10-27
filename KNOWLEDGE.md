@@ -488,8 +488,13 @@ so the tree is tested in memory and the filesystem stores nodes in its log.
   bug in the first port, caught by the existing damage test: scanning
   whole records stopped silently at the first bad one. Nodes in a victim
   are marked dirty (`relocate`) and move at the next checkpoint;
-  `relocate` reports only a change, else a victim holding only nodes
-  looped forever (caught by the GC tests hanging). Open: in the GC churn test
+  `relocate` says whether it moved a node, found it already moving, or
+  not in the tree: only a move is progress (else a victim holding only
+  nodes looped forever, caught by the GC tests hanging), and a victim
+  whose live bytes are all nodes on their way out counts as emptied
+  (else GC's count of emptied segments, which decides when it asks for
+  checkpoints, missed them; caught by the TSan run, whose timing put
+  nodes in the victims). Open: in the GC churn test
   (160 MiB rewritten over 6–7 MiB live), write amplification rose from 2.1
   to 3.0 with the tree; to be explained with step 5's measurements.
 - **The dedup index** is no longer in the checkpoint: it starts empty at

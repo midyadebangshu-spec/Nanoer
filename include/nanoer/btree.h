@@ -110,9 +110,10 @@ class BTree {
 
   // GC: whether the node at `ref`, described by `info`, is part of the tree
   // (as of the last flush); if so, marks it and its parents dirty, so that
-  // the next flush writes it elsewhere. Returns whether that changed
-  // anything: false if it is not in the tree, or already being rewritten.
-  bool relocate(const NodeRef& ref, const NodeInfo& info);
+  // the next flush writes it elsewhere. Either way, a node in the tree
+  // leaves its place at the next flush.
+  enum class Relocated { not_in_tree, moved, already_moving };
+  Relocated relocate(const NodeRef& ref, const NodeInfo& info);
 
   // The encoding of a node, for fsck and fuzzing: throws Error(corrupt).
   struct Decoded {

@@ -209,7 +209,8 @@ TEST(BTree, RelocateRewritesExactlyThatNode) {
   std::size_t moved = 0;
   for (std::uint64_t o : nodes) {
     if (!store.live.contains(o)) continue;  // already moved with a child
-    ASSERT_TRUE(t.relocate(store.ref(o), store.info(o))) << o;
+    ASSERT_EQ(t.relocate(store.ref(o), store.info(o)), BTree::Relocated::moved) << o;
+    ASSERT_EQ(t.relocate(store.ref(o), store.info(o)), BTree::Relocated::already_moving) << o;
     root = t.flush();
     ASSERT_FALSE(reachable(store, root).contains(o));
     ++moved;
@@ -217,7 +218,7 @@ TEST(BTree, RelocateRewritesExactlyThatNode) {
   EXPECT_GT(moved, 0u);
   EXPECT_EQ(contents(t), want);
   // A node no longer in the tree is not found.
-  EXPECT_FALSE(t.relocate(store.ref(*nodes.begin()), store.info(*nodes.begin())));
+  EXPECT_EQ(t.relocate(store.ref(*nodes.begin()), store.info(*nodes.begin())), BTree::Relocated::not_in_tree);
 }
 
 TEST(BTree, CacheStaysWithinBudget) {

@@ -254,12 +254,15 @@ bool Filesystem::gc_apply(const GcPlan& plan, std::vector<GcRead>& reads, bool u
                  static_cast<unsigned long long>(v.index));
     moved = true;  // (progress: the next plan takes other victims)
   }
-  // Tree nodes move by being rewritten at the next checkpoint.
+  // Tree nodes move by being rewritten at the next checkpoint; until then
+  // they still count in their segment.
+  std::map<std::uint64_t, std::uint64_t> leaving;  // segment -> node bytes
   for (const auto& [ref, info] : plan.nodes) {
-    if (meta_.tree().relocate(ref, info)) {
-      gc_nodes_moved_ = true;
-      moved = true;
-    }
+    BTree::Relocated r = meta_.tree().relocate(ref, info);
+    if (r == BTree::Relocated::not_in_tree) continue;
+    leaving[meta_.segment_of(ref.offset)] += ref.stored_size;
+    if (r == BTree::Relocated::moved) moved = true;
+    gc_nodes_moved_ = true;
   }
   for (std::size_t i = 0; i < plan.items.size(); ++i) {
     const GcItem& item = plan.items[i];
@@ -321,7 +324,7 @@ bool Filesystem::gc_apply(const GcPlan& plan, std::vector<GcRead>& reads, bool u
   ++gc_stats_.steps;
   for (const GcVictim& v : plan.victims) {
     auto it = meta_.segments.find(v.index);
-    if (it != meta_.segments.end() && it->second.seq == v.seq && it->second.live_bytes == 0) {
+    if (it != meta_.segments.end() && it->second.seq == v.seq && it->second.live_bytes <= leaving[v.index]) {
       ++gc_stats_.segments_emptied;
       ++gc_emptied_;
     }

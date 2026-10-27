@@ -568,15 +568,15 @@ unsigned BTree::height() const {
   return node->level + 1u;
 }
 
-bool BTree::relocate(const NodeRef& ref, const NodeInfo& info) {
+BTree::Relocated BTree::relocate(const NodeRef& ref, const NodeInfo& info) {
   // The root itself.
-  if (root_ && root_->origin == ref) return false;  // already being rewritten
+  if (root_ && root_->origin == ref) return Relocated::already_moving;
   if (!root_ && root_ref_ == ref) {
     writable_root();
-    return true;
+    return Relocated::moved;
   }
-  if (!root_ && !root_ref_) return false;
-  if ((root_ ? root_->level : load(root_ref_)->level) <= info.level) return false;
+  if (!root_ && !root_ref_) return Relocated::not_in_tree;
+  if ((root_ ? root_->level : load(root_ref_)->level) <= info.level) return Relocated::not_in_tree;
   // Down to the parent, copying the path as it goes only once the node is
   // found (a lookup first, read-only).
   std::vector<std::size_t> path;
@@ -600,13 +600,13 @@ bool BTree::relocate(const NodeRef& ref, const NodeInfo& info) {
     }
     std::size_t i = child_index(*node, info.first);
     const Node::Child& c = node->children[i];
-    if (c.dirty) return false;  // already being rewritten (or not this node)
-    if (c.ref != ref) return false;
+    if (c.dirty) return c.dirty->origin == ref ? Relocated::already_moving : Relocated::not_in_tree;
+    if (c.ref != ref) return Relocated::not_in_tree;
     path.push_back(i);
   }
   Node* node = writable_root().get();
   for (std::size_t i : path) node = child_for_write(*node, i).get();
-  return true;
+  return Relocated::moved;
 }
 
 BTree::CacheStats BTree::cache_stats() const {
