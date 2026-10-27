@@ -17,6 +17,7 @@
 #include "nanoer/check.h"
 #include "nanoer/error.h"
 #include "nanoer/fs.h"
+#include "nanoer/legacy_metadata.h"
 #include "nanoer/io.h"
 #include "nanoer/mkfs.h"
 #include "nanoer/segment.h"
@@ -93,11 +94,11 @@ struct Files {
   }
 };
 
-const Inode& inode(Filesystem& fs, InodeId ino) { return *FilesystemTestAccess::metadata(fs).find(ino); }
+std::map<std::uint64_t, ChunkRef> chunks(Filesystem& fs, InodeId ino) { return FilesystemTestAccess::chunks(fs, ino); }
 
 std::size_t cold_chunks(Filesystem& fs, InodeId ino) {
   std::size_t n = 0;
-  for (const auto& [index, ref] : inode(fs, ino).chunks) n += ref.cold;
+  for (const auto& [index, ref] : chunks(fs, ino)) n += ref.cold;
   return n;
 }
 
@@ -122,7 +123,7 @@ TEST(Tier, ColdChunksAndPacksAreRecompressed) {
     lone = files.create(*fs, "lone", log_text(rng, 100 << 10));
     for (int i = 0; i < 6; ++i) small.push_back(files.create(*fs, "s" + std::to_string(i), log_text(rng, 4000)));
     fs->sync();
-    ASSERT_TRUE(inode(*fs, small[0]).chunks.at(0).packed);
+    ASSERT_TRUE(chunks(*fs, small[0]).at(0).packed);
     std::uint64_t before = stored(*fs);
 
     EXPECT_EQ(fs->recompress_cold(3600), 0u);  // written just now: not cold after an hour
@@ -132,10 +133,10 @@ TEST(Tier, ColdChunksAndPacksAreRecompressed) {
     EXPECT_EQ(info.tier.singles, 20u + 1);
     EXPECT_EQ(info.tier.packs, 1u);
     EXPECT_EQ(info.tier.in_place, 0u);
-    for (const auto& [index, ref] : inode(*fs, big).chunks) EXPECT_TRUE(ref.cold && !ref.packed && ref.hash != 0);
-    const ChunkRef& l = inode(*fs, lone).chunks.at(0);
+    for (const auto& [index, ref] : chunks(*fs, big)) EXPECT_TRUE(ref.cold && !ref.packed && ref.hash != 0);
+    const ChunkRef l = chunks(*fs, lone).at(0);
     EXPECT_TRUE(l.cold && !l.packed && l.hash != 0);
-    for (InodeId s : small) EXPECT_TRUE(inode(*fs, s).chunks.at(0).cold);
+    for (InodeId s : small) EXPECT_TRUE(chunks(*fs, s).at(0).cold);
     EXPECT_LT(stored(*fs), before * 97 / 100) << "zstd 9: smaller";
     files.check(*fs);
     EXPECT_EQ(fs->recompress_cold(0), 0u);  // nothing is examined twice
@@ -153,12 +154,12 @@ TEST(Tier, IncompressibleDataIsOnlyMarked) {
   auto fs = Filesystem::mount(*store, options());
   InodeId ino = files.create(*fs, "random", noise(rng, 10 * kChunk));
   fs->sync();
-  std::map<std::uint64_t, ChunkRef> before = inode(*fs, ino).chunks;
+  std::map<std::uint64_t, ChunkRef> before = chunks(*fs, ino);
   EXPECT_EQ(fs->recompress_cold(0), 10u);
   FsInfo info = fs->info();
   EXPECT_EQ(info.tier.singles, 0u);
   EXPECT_EQ(info.tier.in_place, 10u);  // not rewritten
-  for (const auto& [index, ref] : inode(*fs, ino).chunks) {
+  for (const auto& [index, ref] : chunks(*fs, ino)) {
     EXPECT_TRUE(ref.cold);
     EXPECT_EQ(ref.offset, before.at(index).offset);
   }
@@ -182,8 +183,8 @@ TEST(Tier, ChunkWrittenDuringRecompressionKeepsItsNewData) {
   files.write(*fs, ino, 12 * kChunk + 100, log_text(rng, 50));
   fs->sync();
   EXPECT_EQ(FilesystemTestAccess::tier_apply(*fs, plan, reads), 14u);
-  EXPECT_FALSE(inode(*fs, ino).chunks.at(3).cold);
-  EXPECT_FALSE(inode(*fs, ino).chunks.at(12).cold);
+  EXPECT_FALSE(chunks(*fs, ino).at(3).cold);
+  EXPECT_FALSE(chunks(*fs, ino).at(12).cold);
   files.check(*fs);  // nothing went back to the data that was read
   // The next pass takes them.
   EXPECT_EQ(fs->recompress_cold(0), 2u);
@@ -225,7 +226,7 @@ TEST(Tier, SharedDataIsRecompressedOnceForAllItsUsers) {
   InodeId a = files.create(*fs, "a", same);
   InodeId b = files.create(*fs, "b", same);
   fs->sync();
-  ASSERT_EQ(inode(*fs, a).chunks.at(1).offset, inode(*fs, b).chunks.at(1).offset);
+  ASSERT_EQ(chunks(*fs, a).at(1).offset, chunks(*fs, b).at(1).offset);
   // While one user is still being written, its shared data is left alone.
   Files more;
   InodeId c = more.create(*fs, "c", same);
@@ -236,10 +237,10 @@ TEST(Tier, SharedDataIsRecompressedOnceForAllItsUsers) {
   EXPECT_EQ(fs->recompress_cold(0), 9u + 1);  // and c's new chunk alone
   const Metadata& m = FilesystemTestAccess::metadata(*fs);
   for (std::uint64_t i = 0; i < 3; ++i) {
-    const ChunkRef& r = m.find(a)->chunks.at(i);
+    const ChunkRef r = *m.chunk(a, i);
     EXPECT_TRUE(r.cold && !r.packed);
-    EXPECT_EQ(r, m.find(b)->chunks.at(i));
-    EXPECT_EQ(r, m.find(c)->chunks.at(i));
+    EXPECT_EQ(r, *m.chunk(b, i));
+    EXPECT_EQ(r, *m.chunk(c, i));
     EXPECT_EQ(m.references(r), 3u);
   }
   EXPECT_EQ(fs->info().tier.singles + fs->info().tier.in_place, 3u + 1);
@@ -304,7 +305,7 @@ TEST(Tier, DamagedDataIsLeftInPlace) {
   InodeId ino = files.create(*fs, "f", log_text(rng, 16 * kChunk));
   fs->sync();
   // Damage the record of chunk 2.
-  const ChunkRef r = inode(*fs, ino).chunks.at(2);
+  const ChunkRef r = chunks(*fs, ino).at(2);
   Bytes b = store->read(r.offset + r.stored_size - 8, 1);
   b[0] ^= 0xff;
   store->write(r.offset + r.stored_size - 8, b);
@@ -312,7 +313,7 @@ TEST(Tier, DamagedDataIsLeftInPlace) {
   FsInfo info = fs->info();
   EXPECT_EQ(info.tier.damaged, 1u);
   EXPECT_TRUE(info.errors_seen);
-  EXPECT_EQ(inode(*fs, ino).chunks.at(2), r);
+  EXPECT_EQ(chunks(*fs, ino).at(2), r);
   EXPECT_EQ(fs->recompress_cold(0), 0u);  // not tried again
   Bytes out(kChunk);
   EXPECT_THROW(fs->read(ino, 2 * kChunk, out), Error);
@@ -382,17 +383,23 @@ TEST(Tier, NotOnFilesystemsWithoutTheFeature) {
 
 TEST(Tier, ColdFlagOnlyWithTheFeature) {
   // A cold reference on a filesystem without cold data is damage.
-  Metadata m = Metadata::empty(kDataStart, 22, 0, 0, 1, true, false);
+  auto io = std::make_shared<MemNodeIO>();
+  Metadata m = Metadata::empty(kDataStart, 22, {.cold_data = false, .account_nodes = false}, io, 0, 0, 1);
   m.segments[0] = {1, 0};
   m.apply(op::PutInode{{.id = 2, .mode = S_IFREG | 0644, .nlink = 1}});
   ChunkRef ref{kDataStart + 4096, 100, 1000};
   ref.cold = true;
   EXPECT_THROW(m.apply(op::SetChunkRef{2, 0, ref, false}), Error);
-  Metadata c = Metadata::empty(kDataStart, 22, 0, 0, 1, true, true);
+  Metadata t = Metadata::empty(kDataStart, 22, {.account_nodes = false}, io, 0, 0, 1);
+  t.segments[0] = {1, 0};
+  t.apply(op::PutInode{{.id = 2, .mode = S_IFREG | 0644, .nlink = 1}});
+  EXPECT_NO_THROW(t.apply(op::SetChunkRef{2, 0, ref, false}));
+  // Before M6, the checkpoint said it too.
+  LegacyMetadata c = LegacyMetadata::empty(kDataStart, 22, 0, 0, 1, true, true);
   c.segments[0] = {1, 0};
   c.apply(op::PutInode{{.id = 2, .mode = S_IFREG | 0644, .nlink = 1}});
   c.apply(op::SetChunkRef{2, 0, ref, false});
   Bytes snapshot = c.encode_checkpoint();
-  EXPECT_EQ(Metadata::decode_checkpoint(snapshot, kDataStart, 22, true, true), c);
-  EXPECT_THROW(Metadata::decode_checkpoint(snapshot, kDataStart, 22, true, false), Error);
+  EXPECT_EQ(LegacyMetadata::decode_checkpoint(snapshot, kDataStart, 22, true, true), c);
+  EXPECT_THROW(LegacyMetadata::decode_checkpoint(snapshot, kDataStart, 22, true, false), Error);
 }

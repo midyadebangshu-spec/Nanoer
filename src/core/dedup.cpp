@@ -38,7 +38,19 @@ void DedupIndex::grow() {
 void DedupIndex::put(std::uint64_t key, const DedupTarget& target) {
   if (key == 0 || !fits(target)) return;
   std::uint64_t value = pack(target);
-  if ((size_ + 1) * 4 > slots_.size() * 3) grow();
+  if ((size_ + 1) * 4 > slots_.size() * 3) {
+    if (slots_.size() * 2 * sizeof(Slot) > limit_ && !slots_.empty()) {
+      // Full: only a key already there may change.
+      for (std::size_t i = home(key); slots_[i].key; i = (i + 1) & (slots_.size() - 1)) {
+        if (slots_[i].key == key) {
+          slots_[i].value = value;
+          return;
+        }
+      }
+      return;
+    }
+    grow();
+  }
   for (std::size_t i = home(key);; i = (i + 1) & (slots_.size() - 1)) {
     if (slots_[i].key == key) {
       slots_[i].value = value;

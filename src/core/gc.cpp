@@ -8,6 +8,7 @@
 
 #include "nanoer/fs.h"
 #include "nanoer/io.h"
+#include "nanoer/record.h"
 #include "nanoer/segment.h"
 
 namespace nanoer {
@@ -95,32 +96,83 @@ Filesystem::GcPlan Filesystem::gc_plan(const GcPolicy& policy, bool urgent, bool
   // urgent: tiering waits for spare room).
   const bool tiering = divert && !urgent && cold_enabled() && options_.cold_after_s >= 0;
   const std::int64_t t = now();
+  const std::uint64_t cs = sb_.chunk_size();
   std::set<InodeId> cold_files;
-  // Everything that refers into the victims, by record.
+  std::map<InodeId, std::optional<StorageForm>> cold;  // worked out once per file
+  auto cold_of = [&](InodeId ino) {
+    auto it = cold.find(ino);
+    if (it == cold.end()) {
+      std::optional<InodeAttrs> a = find(ino);
+      it = cold.emplace(ino, a ? cold_now(*a, t, std::nullopt) : std::nullopt).first;
+    }
+    return it->second;
+  };
+  // What the victims hold, by record: a record's header names its one user,
+  // packs and shared records list theirs (back-references); tree nodes are
+  // found from their first key.
   std::map<std::uint64_t, GcItem> items;
-  for (const auto& [id, inode] : meta_.inodes) {
-    std::optional<std::optional<StorageForm>> cold;  // worked out once per file
-    for (const auto& [index, ref] : inode.chunks) {
-      auto victim = seq_of.find(meta_.segment_of(ref.offset));
-      if (victim == seq_of.end()) continue;
-      if (tiering && !ref.cold && !ref.packed && meta_.references(ref) == 1 &&
-          !tier_skip_.contains({ref.offset, victim->second})) {
-        if (!cold) cold = cold_now(inode, t, std::nullopt);
-        if (*cold) {
-          cold_files.insert(id);
+  for (const GcVictim& v : plan.victims) {
+    SegmentScanner scan(store_, sb_, v.index);
+    if (!scan.valid() || scan.header().seq != v.seq) continue;
+    const std::uint64_t limit = sb_.segment_offset(v.index) + sb_.segment_size();
+    // Headers only: what a record holds is checked when it is read to be
+    // copied (gc_read), and damaged data found then is left in place.
+    std::map<std::uint64_t, GcItem> found;
+    std::vector<std::pair<NodeRef, NodeInfo>> nodes;
+    std::set<InodeId> cold_found;
+    bool sealed = false;
+    while (std::optional<Record> r = scan.next_header()) {
+      if (r->header.type == RecordType::segment_seal) {
+        sealed = true;
+        break;
+      }
+      if (r->header.type == RecordType::tree_node) {
+        try {
+          nodes.push_back({{r->offset, static_cast<std::uint32_t>(r->stored_size())}, parse_tree_node(*r).info});
+        } catch (const Error&) {
+        }
+        continue;
+      }
+      if (r->header.type != RecordType::data_chunk) continue;
+      std::optional<DataChunkInfo> info;
+      try {
+        info = parse_data_chunk(*r);
+      } catch (const Error&) {
+        continue;
+      }
+      std::vector<ChunkUser> users;
+      if (std::optional<std::vector<ChunkUser>> listed = meta_.users(r->offset)) {
+        users = std::move(*listed);
+      } else if (!info->pack && info->file_offset % cs == 0) {
+        users.push_back({info->inode, info->file_offset / cs});
+      }
+      for (const ChunkUser& u : users) {
+        std::optional<ChunkRef> ref = meta_.chunk(u.ino, u.index);
+        if (!ref || ref->offset != r->offset) continue;  // no longer refers to it
+        if (tiering && !ref->cold && !ref->packed && meta_.references(*ref) == 1 &&
+            !tier_skip_.contains({ref->offset, v.seq}) && cold_of(u.ino)) {
+          cold_found.insert(u.ino);
           continue;
         }
+        auto [it, first] = found.try_emplace(r->offset, GcItem{r->offset, v.seq, limit, ref->stored_size, {}});
+        if (first) {
+          // A pack built again keeps its form: its users' policy, cold or not.
+          Policy p = policy_of(meta_, u.ino);
+          std::optional<StorageForm> form = ref->cold ? cold_form(p) : std::nullopt;
+          it->second.form = form ? *form : hot_form(p, sb_);
+        }
+        it->second.users.push_back({u.ino, u.index, *ref});
       }
-      std::uint64_t limit = sb_.segment_offset(victim->first) + sb_.segment_size();
-      auto [it, first] = items.try_emplace(ref.offset, GcItem{ref.offset, victim->second, limit, ref.stored_size, {}});
-      if (first) {
-        // A pack built again keeps its form: its users' policy, cold or not.
-        Policy p = policy_of(inode);
-        std::optional<StorageForm> form = ref.cold ? cold_form(p) : std::nullopt;
-        it->second.form = form ? *form : hot_form(p, sb_);
-      }
-      it->second.users.push_back({id, index, ref});
     }
+    // Every victim was sealed (only the segment being written is not, and
+    // it is never a victim): a scan that stops short met damage.
+    if (!sealed) {
+      plan.blind.push_back(v);
+      continue;
+    }
+    items.merge(found);
+    plan.nodes.insert(plan.nodes.end(), nodes.begin(), nodes.end());
+    cold_files.insert(cold_found.begin(), cold_found.end());
   }
   if (!cold_files.empty()) {
     plan.cold_files.assign(cold_files.begin(), cold_files.end());
@@ -194,15 +246,27 @@ bool Filesystem::gc_apply(const GcPlan& plan, std::vector<GcRead>& reads, bool u
   } in_gc(in_gc_);
 
   bool moved = false;
+  for (const GcVictim& v : plan.blind) {
+    ++gc_stats_.damaged;
+    errors_seen_ = true;
+    gc_skip_.insert({v.index, v.seq});
+    std::fprintf(stderr, "nanoer: garbage collection found a damaged record in segment %llu; left in place\n",
+                 static_cast<unsigned long long>(v.index));
+    moved = true;  // (progress: the next plan takes other victims)
+  }
+  // Tree nodes move by being rewritten at the next checkpoint.
+  for (const auto& [ref, info] : plan.nodes) {
+    if (meta_.tree().relocate(ref, info)) {
+      gc_nodes_moved_ = true;
+      moved = true;
+    }
+  }
   for (std::size_t i = 0; i < plan.items.size(); ++i) {
     const GcItem& item = plan.items[i];
     // Only chunks that still refer to the record move with it.
     std::vector<GcItem::User> users;
     for (const GcItem::User& u : item.users) {
-      const Inode* file = meta_.find(u.ino);
-      if (!file) continue;
-      auto c = file->chunks.find(u.index);
-      if (c != file->chunks.end() && c->second == u.ref) users.push_back(u);
+      if (meta_.chunk(u.ino, u.index) == u.ref) users.push_back(u);
     }
     if (users.empty()) continue;
     if (!reads[i].record) {
@@ -223,7 +287,11 @@ bool Filesystem::gc_apply(const GcPlan& plan, std::vector<GcRead>& reads, bool u
         copy = journal_->append_repacked(*reads[i].repacked, urgent);
         ++gc_stats_.packs_repacked;
       } else {
-        copy.offset = journal_->append_copy(*reads[i].record, urgent);
+        // The copy's header names its first user: once only one is left,
+        // that is how GC finds it again.
+        std::optional<ChunkUser> owner;
+        if (!users.front().ref.packed) owner = ChunkUser{users.front().ino, users.front().index};
+        copy.offset = journal_->append_copy(*reads[i].record, urgent, owner);
         copy.stored_size = item.stored_size;
       }
     } catch (const Error& e) {
@@ -239,7 +307,10 @@ bool Filesystem::gc_apply(const GcPlan& plan, std::vector<GcRead>& reads, bool u
         record(op::SetChunk{users[k].ino, users[k].index, ref});
       } else {
         // The first reference claims the copy; the others share it.
-        record(op::SetChunkRef{users[k].ino, users[k].index, ref, !ref.packed && k > 0});
+        bool share = !ref.packed && k > 0;
+        std::optional<ChunkUser> owner;
+        if (share && k == 1) owner = ChunkUser{users[0].ino, users[0].index};
+        record(op::SetChunkRef{users[k].ino, users[k].index, ref, share, owner});
       }
     }
     ++gc_stats_.records_copied;
@@ -264,14 +335,14 @@ bool Filesystem::gc_step_locked(const GcPolicy& policy, bool urgent) {
     if (tier_files_locked(plan.cold_files) > 0) return true;
     plan = gc_plan(policy, urgent, false);  // no room to recompress: copy
   }
-  if (plan.items.empty()) return false;
+  if (plan.empty()) return false;
   std::vector<GcRead> reads = gc_read(plan);
   return gc_apply(plan, reads, urgent);
 }
 
 void Filesystem::gc_checkpoints(bool low_space) {
   // Emptied segments are released by one checkpoint and free after the
-  // next; checkpoints rewrite all metadata (until M6), so wait for several.
+  // next; wait for several, so that two checkpoints free many.
   std::uint64_t worth = low_space ? 1 : std::max<std::uint64_t>(2, sb_.segment_count / 20);
   if (gc_emptied_ < worth || read_only_ || failed_ || !journal_) return;
   checkpoint();
@@ -301,12 +372,12 @@ void Filesystem::background_gc() {
       std::unique_lock lock(mutex_);
       if (tier_files_locked(plan.cold_files) > 0) continue;
       plan = gc_plan(policy, false, false);
-      if (plan.items.empty()) break;
+      if (plan.empty()) break;
       std::vector<GcRead> reads = gc_read(plan);
       if (!gc_apply(plan, reads, false)) break;
       continue;
     }
-    if (plan.items.empty()) break;
+    if (plan.empty()) break;
     std::vector<GcRead> reads = gc_read(plan);
     std::unique_lock lock(mutex_);
     if (!gc_apply(plan, reads, false)) break;

@@ -120,6 +120,8 @@ TEST(Dedup, IdenticalFilesAreStoredOnce) {
   expect_clean(*store);
   auto fs = Filesystem::mount(*store, options());
   for (const char* n : {"a", "b", "c", "d"}) EXPECT_EQ(read_all(*fs, fs->lookup(kRootInode, n).ino), data);
+  EXPECT_EQ(fs->info().dedup_entries, 0u) << "rebuilt after mount";
+  fs->rebuild_dedup();
   EXPECT_EQ(fs->info().dedup_entries, 21u);
 }
 
@@ -195,7 +197,7 @@ TEST(Dedup, AWrongIndexEntryIsNeverTrusted) {
   auto fs = Filesystem::mount(*store, options());
   InodeId a = create(*fs, "a", a_data);
   fs->sync();
-  ChunkRef a_ref = FilesystemTestAccess::metadata(*fs).find(a)->chunks.at(0);
+  ChunkRef a_ref = FilesystemTestAccess::chunks(*fs, a).at(0);
   Blake3Hash b_id = blake3(b_data);
   FilesystemTestAccess::set_index(*fs, hash_key(b_id.data()), {a_ref.offset, false, 0});
   InodeId b = create(*fs, "b", b_data);
@@ -242,7 +244,7 @@ TEST(Dedup, GarbageCollectionMovesSharedRecords) {
     for (InodeId o : others) fs->write(o, 0, noise(200 + o, 28 * kChunk));
     fs->sync();
     InodeId a = fs->lookup(kRootInode, "a").ino, b = fs->lookup(kRootInode, "b").ino;
-    auto chunks = [&](InodeId ino) { return FilesystemTestAccess::metadata(*fs).find(ino)->chunks; };
+    auto chunks = [&](InodeId ino) { return FilesystemTestAccess::chunks(*fs, ino); };
     auto placed = chunks(a);
     ASSERT_EQ(placed, chunks(b));
     fs->collect_garbage(0.97);

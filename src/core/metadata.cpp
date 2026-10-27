@@ -5,260 +5,252 @@
 
 #include <sys/stat.h>
 
+#include "meta_encoding.h"
+#include "nanoer/checksum.h"
 #include "nanoer/encoding.h"
 #include "nanoer/error.h"
-#include "nanoer/io.h"
+#include "nanoer/legacy_metadata.h"
 
 namespace nanoer {
+
+using namespace meta;
+
 namespace {
 
-// Operation type codes; part of the on-disk format.
-enum class OpCode : std::uint8_t {
-  put_inode = 1,
-  delete_inode = 2,
-  set_entry = 3,
-  remove_entry = 4,
-  set_chunk = 5,
-  remove_chunk = 6,
-  truncate_chunks = 7,
-  set_xattr = 8,
-  remove_xattr = 9,
-  set_chunk_ref = 10,  // shared records only
-};
+constexpr char kCheckpointMagicV3[8] = {'N', 'N', 'R', 'C', 'K', 'P', 'T', '3'};
 
-// Flags of set_chunk_ref and of version 2 checkpoint chunks.
-namespace ref_flags {
-constexpr std::uint64_t packed = 0x1;  // followed by the piece offset
-constexpr std::uint64_t hash = 0x2;    // followed by the 8-byte dedup key
-constexpr std::uint64_t share = 0x4;   // set_chunk_ref: a reference to an existing record;
-                                       // checkpoint: the record has several references
-constexpr std::uint64_t cold = 0x8;    // recompressed in its cold form (cold data only)
-constexpr std::uint64_t known = packed | hash | share | cold;
-}  // namespace ref_flags
+DedupTarget target_of(const ChunkRef& ref) { return {ref.offset, ref.packed, ref.piece}; }
 
-constexpr char kCheckpointMagic[8] = {'N', 'N', 'R', 'C', 'K', 'P', 'T', '1'};
-constexpr char kCheckpointMagicV2[8] = {'N', 'N', 'R', 'C', 'K', 'P', 'T', '2'};
+TreeKey key(InodeId object, std::uint8_t kind, std::uint64_t offset = 0) { return {object, kind, offset}; }
+TreeKey refs_key(std::uint64_t record) { return {kRefsObject | record, item_kind::refs, 0}; }
 
-[[noreturn]] void corrupt(const std::string& what) {
-  throw Error(Errc::corrupt, "metadata: " + what);
+bool is_dir(const InodeAttrs& a) { return S_ISDIR(a.mode); }
+bool is_regular(const InodeAttrs& a) { return S_ISREG(a.mode); }
+
+Bytes encode(const InodeAttrs& a) {
+  Encoder out;
+  encode_attrs(out, a);
+  return out.take();
 }
 
-std::uint32_t u32(std::uint64_t v) {
-  if (v > UINT32_MAX) corrupt("value out of range");
-  return static_cast<std::uint32_t>(v);
-}
-
-bool valid_name(std::string_view name) {
-  return !name.empty() && name.size() <= kMaxNameLength && name != "." && name != ".." &&
-         name.find('/') == std::string_view::npos && name.find('\0') == std::string_view::npos;
-}
-
-void encode_attrs(Encoder& out, const InodeAttrs& a) {
-  out.varint(a.id);
-  out.varint(a.mode);
-  out.varint(a.uid);
-  out.varint(a.gid);
-  out.varint(a.nlink);
-  out.varint(a.size);
-  out.svarint(a.atime_ns);
-  out.svarint(a.mtime_ns);
-  out.svarint(a.ctime_ns);
-  out.svarint(a.btime_ns);
-  out.varint(a.rdev);
-  out.varint(a.parent);
-  out.str(a.symlink);
-}
-
-InodeAttrs decode_attrs(Decoder& in) {
-  InodeAttrs a;
-  a.id = in.varint();
-  a.mode = u32(in.varint());
-  a.uid = u32(in.varint());
-  a.gid = u32(in.varint());
-  a.nlink = u32(in.varint());
-  a.size = in.varint();
-  a.atime_ns = in.svarint();
-  a.mtime_ns = in.svarint();
-  a.ctime_ns = in.svarint();
-  a.btime_ns = in.svarint();
-  a.rdev = in.varint();
-  a.parent = in.varint();
-  a.symlink = in.str(kMaxSymlinkLength);
-  if (a.id == 0) corrupt("inode number 0");
+InodeAttrs decode_inode(ByteView v) {
+  Decoder in(v);
+  InodeAttrs a = decode_attrs(in);
+  if (!in.done()) corrupt("trailing bytes in an inode item");
   return a;
 }
 
-void encode_ref(Encoder& out, const ChunkRef& r) {
-  out.varint(r.offset);
-  out.varint(r.stored_size);
-  out.varint(r.size);
-}
-
-ChunkRef decode_ref(Decoder& in) {
-  ChunkRef r;
-  r.offset = in.varint();
-  r.stored_size = u32(in.varint());
-  r.size = u32(in.varint());
-  return r;
-}
-
-// The extended form: flags, the three fields above, then what the flags say.
-void encode_ref_ex(Encoder& out, const ChunkRef& r, bool share) {
-  std::uint64_t flags = (r.packed ? ref_flags::packed : 0) | (r.hash ? ref_flags::hash : 0) |
-                        (share ? ref_flags::share : 0) | (r.cold ? ref_flags::cold : 0);
-  out.varint(flags);
-  encode_ref(out, r);
-  if (r.packed) out.varint(r.piece);
-  if (r.hash) {
-    std::uint8_t key[8];
-    store_le(key, r.hash);
-    out.raw(ByteView(key, 8));
-  }
-}
-
-ChunkRef decode_ref_ex(Decoder& in, bool& share) {
-  std::uint64_t flags = in.varint();
-  if (flags & ~ref_flags::known) corrupt("unknown chunk flags");
-  ChunkRef r = decode_ref(in);
-  if (flags & ref_flags::packed) {
-    r.packed = true;
-    r.piece = u32(in.varint());
-  }
-  if (flags & ref_flags::hash) {
-    r.hash = load_le<std::uint64_t>(in.raw(8).data());
-    if (r.hash == 0) corrupt("zero dedup key");
-  }
-  share = flags & ref_flags::share;
-  r.cold = flags & ref_flags::cold;
-  return r;
-}
-
-template <class... Ts>
-struct Overloaded : Ts... {
-  using Ts::operator()...;
+// (name, value) pairs: entries (value an inode number) and xattrs.
+template <class V>
+struct Named {
+  std::vector<std::pair<std::string, V>> items;
 };
-template <class... Ts>
-Overloaded(Ts...) -> Overloaded<Ts...>;
+
+Bytes encode_entries(const std::vector<std::pair<std::string, InodeId>>& list) {
+  Encoder out;
+  out.varint(list.size());
+  for (const auto& [name, ino] : list) {
+    out.str(name);
+    out.varint(ino);
+  }
+  return out.take();
+}
+
+std::vector<std::pair<std::string, InodeId>> decode_entries(ByteView v) {
+  Decoder in(v);
+  std::vector<std::pair<std::string, InodeId>> out;
+  std::uint64_t n = in.varint();
+  if (n == 0 || n > v.size()) corrupt("bad entry item");
+  for (std::uint64_t i = 0; i < n; ++i) {
+    std::string name = in.str(kMaxNameLength);
+    out.emplace_back(std::move(name), in.varint());
+  }
+  if (!in.done()) corrupt("trailing bytes in an entry item");
+  return out;
+}
+
+Bytes encode_xattrs(const std::vector<std::pair<std::string, Bytes>>& list) {
+  Encoder out;
+  out.varint(list.size());
+  for (const auto& [name, value] : list) {
+    out.str(name);
+    out.bytes(value);
+  }
+  return out.take();
+}
+
+std::vector<std::pair<std::string, Bytes>> decode_xattrs(ByteView v) {
+  Decoder in(v);
+  std::vector<std::pair<std::string, Bytes>> out;
+  std::uint64_t n = in.varint();
+  if (n == 0 || n > v.size()) corrupt("bad xattr item");
+  for (std::uint64_t i = 0; i < n; ++i) {
+    std::string name = in.str(kMaxXattrNameLength);
+    out.emplace_back(std::move(name), in.bytes(kMaxXattrValueSize));
+  }
+  if (!in.done()) corrupt("trailing bytes in an xattr item");
+  return out;
+}
+
+Bytes encode_chunk_item(const ChunkRef& r) {
+  Encoder out;
+  encode_ref_ex(out, r, false);
+  return out.take();
+}
+
+ChunkRef decode_chunk_item(ByteView v) {
+  Decoder in(v);
+  bool share = false;
+  ChunkRef r = decode_ref_ex(in, share);
+  if (share || !in.done()) corrupt("bad chunk item");
+  if (!r.packed && r.piece) corrupt("a piece offset outside a pack");
+  return r;
+}
+
+struct Refs {
+  std::uint32_t count = 0;
+  std::vector<ChunkUser> users;
+};
+
+Bytes encode_refs(const Refs& r) {
+  Encoder out;
+  out.varint(r.count);
+  out.varint(r.users.size());
+  for (const ChunkUser& u : r.users) {
+    out.varint(u.ino);
+    out.varint(u.index);
+  }
+  return out.take();
+}
+
+Refs decode_refs(ByteView v) {
+  Decoder in(v);
+  Refs r;
+  r.count = u32(in.varint());
+  std::uint64_t n = in.varint();
+  if (n != r.count || n > v.size()) corrupt("reference count disagrees with its users");
+  for (std::uint64_t i = 0; i < n; ++i) {
+    ChunkUser u;
+    u.ino = in.varint();
+    u.index = in.varint();
+    r.users.push_back(u);
+  }
+  if (!in.done()) corrupt("trailing bytes in a refs item");
+  return r;
+}
+
+Bytes encode_counts(const InodeCounts& c) {
+  Encoder out;
+  out.varint(c.entries);
+  out.varint(c.data_bytes);
+  return out.take();
+}
+
+InodeCounts decode_counts(ByteView v) {
+  Decoder in(v);
+  InodeCounts c;
+  c.entries = in.varint();
+  c.data_bytes = in.varint();
+  if (!in.done()) corrupt("trailing bytes in a counts item");
+  return c;
+}
 
 }  // namespace
 
-bool Inode::is_dir() const { return S_ISDIR(mode); }
-bool Inode::is_regular() const { return S_ISREG(mode); }
-bool Inode::is_symlink() const { return S_ISLNK(mode); }
+std::uint64_t name_hash(std::string_view name) { return xxh3_64(as_bytes(name)); }
 
-// ---- operations ------------------------------------------------------------
+// ---- nodes -------------------------------------------------------------------
 
-void encode_op(Encoder& out, const Op& op) {
-  std::visit(Overloaded{
-                 [&](const op::PutInode& o) {
-                   out.u8(static_cast<std::uint8_t>(OpCode::put_inode));
-                   encode_attrs(out, o.attrs);
-                 },
-                 [&](const op::DeleteInode& o) {
-                   out.u8(static_cast<std::uint8_t>(OpCode::delete_inode));
-                   out.varint(o.ino);
-                 },
-                 [&](const op::SetEntry& o) {
-                   out.u8(static_cast<std::uint8_t>(OpCode::set_entry));
-                   out.varint(o.dir);
-                   out.str(o.name);
-                   out.varint(o.ino);
-                 },
-                 [&](const op::RemoveEntry& o) {
-                   out.u8(static_cast<std::uint8_t>(OpCode::remove_entry));
-                   out.varint(o.dir);
-                   out.str(o.name);
-                 },
-                 [&](const op::SetChunk& o) {
-                   out.u8(static_cast<std::uint8_t>(OpCode::set_chunk));
-                   out.varint(o.ino);
-                   out.varint(o.index);
-                   encode_ref(out, o.ref);
-                 },
-                 [&](const op::RemoveChunk& o) {
-                   out.u8(static_cast<std::uint8_t>(OpCode::remove_chunk));
-                   out.varint(o.ino);
-                   out.varint(o.index);
-                 },
-                 [&](const op::TruncateChunks& o) {
-                   out.u8(static_cast<std::uint8_t>(OpCode::truncate_chunks));
-                   out.varint(o.ino);
-                   out.varint(o.first_index);
-                 },
-                 [&](const op::SetXattr& o) {
-                   out.u8(static_cast<std::uint8_t>(OpCode::set_xattr));
-                   out.varint(o.ino);
-                   out.str(o.name);
-                   out.bytes(o.value);
-                 },
-                 [&](const op::RemoveXattr& o) {
-                   out.u8(static_cast<std::uint8_t>(OpCode::remove_xattr));
-                   out.varint(o.ino);
-                   out.str(o.name);
-                 },
-                 [&](const op::SetChunkRef& o) {
-                   out.u8(static_cast<std::uint8_t>(OpCode::set_chunk_ref));
-                   out.varint(o.ino);
-                   out.varint(o.index);
-                   encode_ref_ex(out, o.ref, o.share);
-                 },
-             },
-             op);
+Bytes MemNodeIO::read(const NodeRef& ref, std::uint64_t) {
+  auto it = nodes_.find(ref.offset);
+  if (it == nodes_.end()) throw Error(Errc::corrupt, "no such tree node");
+  return it->second;
 }
 
-Op decode_op(Decoder& in) {
-  switch (static_cast<OpCode>(in.u8())) {
-    case OpCode::put_inode: return op::PutInode{decode_attrs(in)};
-    case OpCode::delete_inode: return op::DeleteInode{in.varint()};
-    case OpCode::set_entry: {
-      InodeId dir = in.varint();
-      std::string name = in.str(kMaxNameLength);
-      return op::SetEntry{dir, std::move(name), in.varint()};
+NodeRef MemNodeIO::write(ByteView encoded, const NodeInfo&) {
+  std::uint64_t at = next_++;
+  nodes_[at].assign(encoded.begin(), encoded.end());
+  return {at, static_cast<std::uint32_t>(encoded.size())};
+}
+
+class Metadata::Nodes final : public NodeStore {
+ public:
+  explicit Nodes(Metadata* meta) : owner(meta) {}
+  Bytes read(const NodeRef& ref) override {
+    std::uint64_t seq = 0;
+    if (owner->options_.account_nodes) {
+      auto it = owner->segments.find(owner->segment_of(ref.offset));
+      if (it == owner->segments.end()) throw Error(Errc::corrupt, "tree node in a free segment");
+      seq = it->second.seq;
     }
-    case OpCode::remove_entry: {
-      InodeId dir = in.varint();
-      return op::RemoveEntry{dir, in.str(kMaxNameLength)};
-    }
-    case OpCode::set_chunk: {
-      InodeId ino = in.varint();
-      std::uint64_t index = in.varint();
-      return op::SetChunk{ino, index, decode_ref(in)};
-    }
-    case OpCode::remove_chunk: {
-      InodeId ino = in.varint();
-      return op::RemoveChunk{ino, in.varint()};
-    }
-    case OpCode::truncate_chunks: {
-      InodeId ino = in.varint();
-      return op::TruncateChunks{ino, in.varint()};
-    }
-    case OpCode::set_xattr: {
-      InodeId ino = in.varint();
-      std::string name = in.str(kMaxXattrNameLength);
-      return op::SetXattr{ino, std::move(name), in.bytes(kMaxXattrValueSize)};
-    }
-    case OpCode::remove_xattr: {
-      InodeId ino = in.varint();
-      return op::RemoveXattr{ino, in.str(kMaxXattrNameLength)};
-    }
-    case OpCode::set_chunk_ref: {
-      InodeId ino = in.varint();
-      std::uint64_t index = in.varint();
-      bool share = false;
-      ChunkRef ref = decode_ref_ex(in, share);
-      return op::SetChunkRef{ino, index, ref, share};
-    }
+    return owner->io_->read(ref, seq);
   }
-  corrupt("unknown operation");
+  NodeRef write(ByteView encoded, const NodeInfo& info) override {
+    NodeRef ref = owner->io_->write(encoded, info);
+    if (owner->options_.account_nodes) owner->claim(ref.offset, ref.stored_size);
+    owner->counters.node_bytes += ref.stored_size;
+    return ref;
+  }
+  void release(const NodeRef& ref) override {
+    if (owner->options_.account_nodes) owner->release(ref.offset, ref.stored_size);
+    owner->counters.node_bytes -= std::min<std::uint64_t>(owner->counters.node_bytes, ref.stored_size);
+  }
+  Metadata* owner;
+};
+
+// ---- construction --------------------------------------------------------------
+
+Metadata::Metadata(std::uint64_t data_start, unsigned segment_shift, const Options& options,
+                   std::shared_ptr<NodeIO> io, NodeRef root)
+    : data_start_(data_start),
+      segment_shift_(segment_shift),
+      options_(options),
+      io_(std::move(io)),
+      nodes_(std::make_unique<Nodes>(this)),
+      tree_(std::make_unique<BTree>(*nodes_, options.tree, root)) {
+  options_.cold_data = options_.shared_records && options_.cold_data;
 }
 
-// ---- Metadata --------------------------------------------------------------
+Metadata::~Metadata() = default;
 
-Metadata Metadata::empty(std::uint64_t data_start, unsigned segment_shift, std::uint32_t uid,
-                         std::uint32_t gid, std::int64_t now_ns, bool shared_records,
-                         bool cold_data) {
-  Metadata m(data_start, segment_shift, shared_records, cold_data);
-  Inode root;
+Metadata::Metadata(Metadata&& o) noexcept
+    : segments(std::move(o.segments)),
+      counters(o.counters),
+      dedup(std::move(o.dedup)),
+      dedup_complete(o.dedup_complete),
+      next_inode(o.next_inode),
+      last_txid(o.last_txid),
+      data_start_(o.data_start_),
+      segment_shift_(o.segment_shift_),
+      options_(o.options_),
+      io_(std::move(o.io_)),
+      nodes_(std::move(o.nodes_)),
+      tree_(std::move(o.tree_)) {
+  if (nodes_) nodes_->owner = this;
+}
+
+Metadata& Metadata::operator=(Metadata&& o) noexcept {
+  segments = std::move(o.segments);
+  counters = o.counters;
+  dedup = std::move(o.dedup);
+  dedup_complete = o.dedup_complete;
+  next_inode = o.next_inode;
+  last_txid = o.last_txid;
+  data_start_ = o.data_start_;
+  segment_shift_ = o.segment_shift_;
+  options_ = o.options_;
+  io_ = std::move(o.io_);
+  tree_.reset();
+  nodes_ = std::move(o.nodes_);
+  tree_ = std::move(o.tree_);
+  if (nodes_) nodes_->owner = this;
+  return *this;
+}
+
+Metadata Metadata::empty(std::uint64_t data_start, unsigned segment_shift, const Options& options,
+                         std::shared_ptr<NodeIO> io, std::uint32_t uid, std::uint32_t gid, std::int64_t now_ns) {
+  Metadata m(data_start, segment_shift, options, std::move(io));
+  InodeAttrs root;
   root.id = kRootInode;
   root.mode = S_IFDIR | 0755;
   root.uid = uid;
@@ -266,316 +258,600 @@ Metadata Metadata::empty(std::uint64_t data_start, unsigned segment_shift, std::
   root.nlink = 2;
   root.atime_ns = root.mtime_ns = root.ctime_ns = root.btime_ns = now_ns;
   root.parent = kRootInode;
-  m.inodes.emplace(kRootInode, std::move(root));
+  m.apply(op::PutInode{root});
+  m.dedup_complete = true;
   return m;
 }
 
-Inode* Metadata::find(InodeId ino) {
-  auto it = inodes.find(ino);
-  return it == inodes.end() ? nullptr : &it->second;
+// ---- reading -------------------------------------------------------------------
+
+std::optional<InodeAttrs> Metadata::attrs(InodeId ino) const {
+  std::optional<Bytes> v = tree_->get(key(ino, item_kind::inode));
+  if (!v) return std::nullopt;
+  return decode_inode(*v);
 }
 
-const Inode* Metadata::find(InodeId ino) const {
-  auto it = inodes.find(ino);
-  return it == inodes.end() ? nullptr : &it->second;
+InodeAttrs Metadata::need(InodeId ino) const {
+  std::optional<InodeAttrs> a = attrs(ino);
+  if (!a) corrupt("operation on missing inode " + std::to_string(ino));
+  return *a;
 }
 
-void Metadata::claim(const ChunkRef& ref) {
-  if (ref.offset < data_start_) corrupt("chunk location before the data area");
-  auto it = segments.find(segment_of(ref.offset));
-  if (it == segments.end()) corrupt("chunk in a segment that is not in use");
-  it->second.live_bytes += ref.stored_size;
+InodeCounts Metadata::counts(InodeId ino) const {
+  std::optional<Bytes> v = tree_->get(key(ino, item_kind::counts));
+  return v ? decode_counts(*v) : InodeCounts{};
 }
 
-void Metadata::release(const ChunkRef& ref) {
-  auto it = segments.find(segment_of(ref.offset));
-  if (it == segments.end() || it->second.live_bytes < ref.stored_size) {
-    corrupt("segment space accounting is inconsistent");
+void Metadata::put_counts(InodeId ino, const InodeCounts& c) {
+  if (c == InodeCounts{}) {
+    tree_->erase(key(ino, item_kind::counts));
+  } else {
+    tree_->put(key(ino, item_kind::counts), encode_counts(c));
   }
-  it->second.live_bytes -= ref.stored_size;
+}
+
+std::optional<ChunkRef> Metadata::chunk(InodeId ino, std::uint64_t index) const {
+  std::optional<Bytes> v = tree_->get(key(ino, item_kind::chunk, index));
+  if (!v) return std::nullopt;
+  return decode_chunk_item(*v);
+}
+
+void Metadata::chunks(InodeId ino, std::uint64_t from,
+                      const std::function<bool(std::uint64_t, const ChunkRef&)>& fn) const {
+  tree_->scan(key(ino, item_kind::chunk, from), key(ino, item_kind::chunk, UINT64_MAX),
+              [&](const TreeKey& k, ByteView v) { return fn(k.offset, decode_chunk_item(v)); });
+}
+
+bool Metadata::has_chunk_from(InodeId ino, std::uint64_t from) const {
+  bool any = false;
+  tree_->scan(key(ino, item_kind::chunk, from), key(ino, item_kind::chunk, UINT64_MAX), [&](const TreeKey&, ByteView) {
+    any = true;
+    return false;
+  });
+  return any;
+}
+
+std::optional<InodeId> Metadata::entry(InodeId dir, std::string_view name) const {
+  std::optional<Bytes> v = tree_->get(key(dir, item_kind::entry, name_hash(name)));
+  if (!v) return std::nullopt;
+  for (const auto& [n, ino] : decode_entries(*v)) {
+    if (n == name) return ino;
+  }
+  return std::nullopt;
+}
+
+void Metadata::entries(InodeId dir, const std::function<bool(std::string_view, InodeId)>& fn) const {
+  tree_->scan(key(dir, item_kind::entry, 0), key(dir, item_kind::entry, UINT64_MAX), [&](const TreeKey&, ByteView v) {
+    for (const auto& [n, ino] : decode_entries(v)) {
+      if (!fn(n, ino)) return false;
+    }
+    return true;
+  });
+}
+
+std::optional<Bytes> Metadata::xattr(InodeId ino, std::string_view name) const {
+  std::optional<Bytes> v = tree_->get(key(ino, item_kind::xattr, name_hash(name)));
+  if (!v) return std::nullopt;
+  for (auto& [n, value] : decode_xattrs(*v)) {
+    if (n == name) return std::move(value);
+  }
+  return std::nullopt;
+}
+
+void Metadata::xattrs(InodeId ino, const std::function<bool(std::string_view, ByteView)>& fn) const {
+  tree_->scan(key(ino, item_kind::xattr, 0), key(ino, item_kind::xattr, UINT64_MAX), [&](const TreeKey&, ByteView v) {
+    for (const auto& [n, value] : decode_xattrs(v)) {
+      if (!fn(n, value)) return false;
+    }
+    return true;
+  });
+}
+
+std::vector<InodeId> Metadata::orphans() const {
+  std::vector<InodeId> out;
+  tree_->scan(key(0, item_kind::orphan, 0), key(0, item_kind::orphan, UINT64_MAX), [&](const TreeKey& k, ByteView) {
+    out.push_back(k.offset);
+    return true;
+  });
+  return out;
 }
 
 std::uint32_t Metadata::references(const ChunkRef& ref) const {
-  auto it = shared.find(ref.offset);
-  return it == shared.end() ? 1 : it->second;
+  std::optional<Bytes> v = tree_->get(refs_key(ref.offset));
+  return v ? decode_refs(*v).count : 1;
 }
 
-namespace {
-DedupTarget target_of(const ChunkRef& ref) { return {ref.offset, ref.packed, ref.piece}; }
-}  // namespace
+std::optional<std::vector<ChunkUser>> Metadata::users(std::uint64_t offset) const {
+  std::optional<Bytes> v = tree_->get(refs_key(offset));
+  if (!v) return std::nullopt;
+  return decode_refs(*v).users;
+}
+
+void Metadata::for_each_inode(const std::function<bool(const InodeAttrs&)>& fn) const {
+  tree_->scan({}, {kRefsObject - 1, UINT8_MAX, UINT64_MAX}, [&](const TreeKey& k, ByteView v) {
+    return k.kind != item_kind::inode || fn(decode_inode(v));
+  });
+}
+
+void Metadata::for_each_chunk(const std::function<bool(InodeId, std::uint64_t, const ChunkRef&)>& fn) const {
+  tree_->scan({}, {kRefsObject - 1, UINT8_MAX, UINT64_MAX}, [&](const TreeKey& k, ByteView v) {
+    return k.kind != item_kind::chunk || fn(k.object, k.offset, decode_chunk_item(v));
+  });
+}
+
+std::optional<TreeKey> Metadata::chunks_from(
+    const TreeKey& from, std::size_t items,
+    const std::function<void(InodeId, std::uint64_t, const ChunkRef&)>& fn) const {
+  std::optional<TreeKey> next;
+  std::size_t seen = 0;
+  tree_->scan(from, kMaxTreeKey, [&](const TreeKey& k, ByteView v) {
+    if (seen++ == items) {
+      next = k;
+      return false;
+    }
+    if (k.kind == item_kind::chunk && !(k.object & kRefsObject)) fn(k.object, k.offset, decode_chunk_item(v));
+    return true;
+  });
+  return next;
+}
+
+void Metadata::for_each_shared(const std::function<bool(std::uint64_t, const std::vector<ChunkUser>&)>& fn) const {
+  tree_->scan({kRefsObject, 0, 0}, kMaxTreeKey, [&](const TreeKey& k, ByteView v) {
+    return k.kind != item_kind::refs || fn(k.object & ~kRefsObject, decode_refs(v).users);
+  });
+}
+
+void Metadata::scan(const TreeKey& from, const std::function<bool(const TreeKey&, ByteView)>& fn) const {
+  tree_->scan(from, kMaxTreeKey, fn);
+}
+
+// ---- space and references -------------------------------------------------------
+
+void Metadata::claim(std::uint64_t offset, std::uint64_t bytes) {
+  if (offset < data_start_) corrupt("location before the data area");
+  auto it = segments.find(segment_of(offset));
+  if (it == segments.end()) corrupt("chunk in a segment that is not in use");
+  it->second.live_bytes += bytes;
+}
+
+void Metadata::release(std::uint64_t offset, std::uint64_t bytes) {
+  auto it = segments.find(segment_of(offset));
+  if (it == segments.end() || it->second.live_bytes < bytes) corrupt("segment space accounting is inconsistent");
+  it->second.live_bytes -= bytes;
+}
 
 // A record's space is claimed by its first reference and released by its
-// last. Only packs and records referenced more than once are counted.
-void Metadata::add_ref(const ChunkRef& ref, bool share) {
-  if (ref.hash) dedup.put(ref.hash, target_of(ref));
-  if ((ref.packed || share || ref.hash) && !shared_records_) {
+// last. Packs, and records that have been shared, have a refs item with
+// every reference (back-references); any other record has one reference,
+// the owner its header names.
+void Metadata::add_ref(const ChunkRef& ref, bool share, const ChunkUser& user, const std::optional<ChunkUser>& owner) {
+  if ((ref.packed || share || ref.hash) && !options_.shared_records) {
     corrupt("shared records on a filesystem without that feature");
   }
-  if (ref.cold && !cold_data_) corrupt("cold data on a filesystem without that feature");
+  if (ref.cold && !options_.cold_data) corrupt("cold data on a filesystem without that feature");
+  if (ref.hash) dedup.put(ref.hash, target_of(ref));
+  std::optional<Bytes> v = tree_->get(refs_key(ref.offset));
   if (ref.packed) {
     if (share) corrupt("a pack piece marked as shared");
-    auto [it, first] = shared.try_emplace(ref.offset, 0);
-    if (first) claim(ref);
-    if (it->second == UINT32_MAX) corrupt("too many references to one record");
-    ++it->second;
+    Refs r = v ? decode_refs(*v) : Refs{};
+    if (!v) claim(ref.offset, ref.stored_size);
+    if (r.count == UINT32_MAX) corrupt("too many references to one record");
+    ++r.count;
+    r.users.push_back(user);
+    tree_->put(refs_key(ref.offset), encode_refs(r));
   } else if (share) {
-    auto [it, first] = shared.try_emplace(ref.offset, 1);
-    if (it->second == UINT32_MAX) corrupt("too many references to one record");
-    ++it->second;
+    Refs r;
+    if (v) {
+      r = decode_refs(*v);
+    } else {
+      if (!owner) corrupt("a record shared for the first time without its owner");
+      r = {1, {*owner}};
+    }
+    if (r.count == UINT32_MAX) corrupt("too many references to one record");
+    ++r.count;
+    r.users.push_back(user);
+    tree_->put(refs_key(ref.offset), encode_refs(r));
   } else {
-    if (shared.contains(ref.offset)) corrupt("a new chunk at a location already in use");
-    claim(ref);
+    if (v) corrupt("a new chunk at a location already in use");
+    claim(ref.offset, ref.stored_size);
   }
 }
 
-void Metadata::drop_ref(const ChunkRef& ref) {
-  // Pieces are not counted one by one: a piece leaves the index with any
-  // reference to it (a missed duplicate at worst); other data with its
+void Metadata::drop_ref(const ChunkRef& ref, const ChunkUser& user) {
+  // Pieces are not counted one by one in the index: a piece leaves it with
+  // any reference to it (a missed duplicate at worst); other data with its
   // record.
   if (ref.hash && ref.packed) dedup.erase(ref.hash, target_of(ref));
-  auto it = shared.find(ref.offset);
-  if (it == shared.end()) {
+  std::optional<Bytes> v = tree_->get(refs_key(ref.offset));
+  if (!v) {
     if (ref.packed) corrupt("a pack piece of an unknown pack");
     if (ref.hash) dedup.erase(ref.hash, target_of(ref));
-    release(ref);
+    release(ref.offset, ref.stored_size);
     return;
   }
-  --it->second;
-  if (ref.packed) {
-    if (it->second == 0) {
-      shared.erase(it);
-      release(ref);
-    }
-  } else if (it->second <= 1) {
-    shared.erase(it);  // one reference left: no longer counted
+  Refs r = decode_refs(*v);
+  auto it = std::find(r.users.begin(), r.users.end(), user);
+  if (it == r.users.end()) corrupt("a reference missing from its record's users");
+  r.users.erase(it);
+  --r.count;
+  if (r.count > 0) {
+    tree_->put(refs_key(ref.offset), encode_refs(r));
+    return;
+  }
+  tree_->erase(refs_key(ref.offset));
+  if (ref.hash && !ref.packed) dedup.erase(ref.hash, target_of(ref));
+  release(ref.offset, ref.stored_size);
+}
+
+void Metadata::count_inode(const InodeAttrs& a, int sign) {
+  auto add = [&](std::uint64_t& c, std::uint64_t n) { c = sign > 0 ? c + n : c - std::min(c, n); };
+  if (is_regular(a)) {
+    add(counters.files, 1);
+    add(counters.logical_bytes, a.size);
+  } else if (is_dir(a)) {
+    add(counters.directories, 1);
+  } else {
+    add(counters.other_inodes, 1);
   }
 }
 
+// ---- operations ------------------------------------------------------------------
+
 void Metadata::apply(const Op& op) {
-  auto need = [&](InodeId ino) -> Inode& {
-    Inode* inode = find(ino);
-    if (!inode) corrupt("operation on missing inode " + std::to_string(ino));
-    return *inode;
+  auto need_dir = [&](InodeId ino) {
+    InodeAttrs a = need(ino);
+    if (!is_dir(a)) corrupt("directory operation on non-directory " + std::to_string(ino));
+    return a;
   };
-  auto need_dir = [&](InodeId ino) -> Inode& {
-    Inode& dir = need(ino);
-    if (!dir.is_dir()) corrupt("directory operation on non-directory " + std::to_string(ino));
-    return dir;
+  auto need_file = [&](InodeId ino) {
+    InodeAttrs a = need(ino);
+    if (!is_regular(a)) corrupt("chunk operation on non-file " + std::to_string(ino));
+    return a;
   };
-  auto need_file = [&](InodeId ino) -> Inode& {
-    Inode& file = need(ino);
-    if (!file.is_regular()) corrupt("chunk operation on non-file " + std::to_string(ino));
-    return file;
+  auto set_chunk = [&](InodeId ino, std::uint64_t index, const ChunkRef& ref, bool share,
+                       const std::optional<ChunkUser>& owner) {
+    need_file(ino);
+    std::optional<ChunkRef> old = chunk(ino, index);
+    ChunkUser user{ino, index};
+    add_ref(ref, share, user, owner);
+    if (old) drop_ref(*old, user);
+    tree_->put(key(ino, item_kind::chunk, index), encode_chunk_item(ref));
+    InodeCounts c = counts(ino);
+    c.data_bytes = c.data_bytes - std::min<std::uint64_t>(c.data_bytes, old ? old->size : 0) + ref.size;
+    put_counts(ino, c);
+  };
+  auto remove_chunks = [&](InodeId ino, std::uint64_t from, std::uint64_t to) {
+    std::vector<std::pair<std::uint64_t, ChunkRef>> gone;
+    chunks(ino, from, [&](std::uint64_t index, const ChunkRef& ref) {
+      if (index > to) return false;
+      gone.emplace_back(index, ref);
+      return true;
+    });
+    if (gone.empty()) return;
+    InodeCounts c = counts(ino);
+    for (const auto& [index, ref] : gone) {
+      drop_ref(ref, {ino, index});
+      tree_->erase(key(ino, item_kind::chunk, index));
+      c.data_bytes -= std::min<std::uint64_t>(c.data_bytes, ref.size);
+    }
+    put_counts(ino, c);
   };
 
   std::visit(
       Overloaded{
           [&](const op::PutInode& o) {
             if (o.attrs.id == 0) corrupt("inode number 0");
-            Inode& inode = inodes[o.attrs.id];
-            static_cast<InodeAttrs&>(inode) = o.attrs;
+            if (std::optional<InodeAttrs> old = attrs(o.attrs.id)) count_inode(*old, -1);
+            count_inode(o.attrs, +1);
+            tree_->put(key(o.attrs.id, item_kind::inode), encode(o.attrs));
+            if (o.attrs.nlink == 0 && o.attrs.id != kRootInode) {
+              tree_->put(key(0, item_kind::orphan, o.attrs.id), {});
+            } else {
+              tree_->erase(key(0, item_kind::orphan, o.attrs.id));
+            }
             next_inode = std::max(next_inode, o.attrs.id + 1);
           },
           [&](const op::DeleteInode& o) {
             if (o.ino == kRootInode) corrupt("deleting the root directory");
-            Inode& inode = need(o.ino);
-            for (const auto& [index, ref] : inode.chunks) drop_ref(ref);
-            inodes.erase(o.ino);
+            InodeAttrs a = need(o.ino);
+            remove_chunks(o.ino, 0, UINT64_MAX);
+            // Everything else under the inode: attributes, counts, xattrs, entries.
+            std::vector<TreeKey> keys;
+            tree_->scan(key(o.ino, 0, 0), key(o.ino, item_kind::entry, UINT64_MAX), [&](const TreeKey& k, ByteView) {
+              keys.push_back(k);
+              return true;
+            });
+            for (const TreeKey& k : keys) tree_->erase(k);
+            tree_->erase(key(0, item_kind::orphan, o.ino));
+            count_inode(a, -1);
           },
           [&](const op::SetEntry& o) {
             if (!valid_name(o.name)) corrupt("invalid file name");
             need(o.ino);
-            need_dir(o.dir).entries.insert_or_assign(o.name, o.ino);
+            need_dir(o.dir);
+            TreeKey k = key(o.dir, item_kind::entry, name_hash(o.name));
+            std::optional<Bytes> v = tree_->get(k);
+            auto list = v ? decode_entries(*v) : std::vector<std::pair<std::string, InodeId>>{};
+            auto it = std::find_if(list.begin(), list.end(), [&](const auto& e) { return e.first == o.name; });
+            if (it != list.end()) {
+              it->second = o.ino;
+            } else {
+              list.emplace_back(o.name, o.ino);
+              InodeCounts c = counts(o.dir);
+              ++c.entries;
+              put_counts(o.dir, c);
+            }
+            tree_->put(k, encode_entries(list));
           },
           [&](const op::RemoveEntry& o) {
-            Inode& dir = need_dir(o.dir);
-            auto it = dir.entries.find(o.name);
-            if (it == dir.entries.end()) corrupt("removing a missing directory entry");
-            dir.entries.erase(it);
+            need_dir(o.dir);
+            TreeKey k = key(o.dir, item_kind::entry, name_hash(o.name));
+            std::optional<Bytes> v = tree_->get(k);
+            auto list = v ? decode_entries(*v) : std::vector<std::pair<std::string, InodeId>>{};
+            auto it = std::find_if(list.begin(), list.end(), [&](const auto& e) { return e.first == o.name; });
+            if (it == list.end()) corrupt("removing a missing directory entry");
+            list.erase(it);
+            if (list.empty()) {
+              tree_->erase(k);
+            } else {
+              tree_->put(k, encode_entries(list));
+            }
+            InodeCounts c = counts(o.dir);
+            c.entries -= std::min<std::uint64_t>(c.entries, 1);
+            put_counts(o.dir, c);
           },
           [&](const op::SetChunk& o) {
             if (o.ref.packed || o.ref.piece || o.ref.hash || o.ref.cold) corrupt("extended chunk fields in SetChunk");
-            Inode& file = need_file(o.ino);
-            auto [it, inserted] = file.chunks.try_emplace(o.index, o.ref);
-            add_ref(o.ref, false);
-            if (!inserted) {
-              drop_ref(it->second);
-              it->second = o.ref;
-            }
+            set_chunk(o.ino, o.index, o.ref, false, std::nullopt);
           },
           [&](const op::SetChunkRef& o) {
             if (!o.ref.packed && o.ref.piece) corrupt("a piece offset outside a pack");
-            Inode& file = need_file(o.ino);
-            auto [it, inserted] = file.chunks.try_emplace(o.index, o.ref);
-            add_ref(o.ref, o.share);
-            if (!inserted) {
-              drop_ref(it->second);
-              it->second = o.ref;
-            }
+            set_chunk(o.ino, o.index, o.ref, o.share, o.owner);
           },
           [&](const op::RemoveChunk& o) {
-            Inode& file = need_file(o.ino);
-            auto it = file.chunks.find(o.index);
-            if (it == file.chunks.end()) return;
-            drop_ref(it->second);
-            file.chunks.erase(it);
+            need_file(o.ino);
+            remove_chunks(o.ino, o.index, o.index);
           },
           [&](const op::TruncateChunks& o) {
-            Inode& file = need_file(o.ino);
-            auto it = file.chunks.lower_bound(o.first_index);
-            for (auto i = it; i != file.chunks.end(); ++i) drop_ref(i->second);
-            file.chunks.erase(it, file.chunks.end());
+            need_file(o.ino);
+            remove_chunks(o.ino, o.first_index, UINT64_MAX);
           },
           [&](const op::SetXattr& o) {
-            need(o.ino).xattrs.insert_or_assign(o.name, o.value);
+            need(o.ino);
+            TreeKey k = key(o.ino, item_kind::xattr, name_hash(o.name));
+            std::optional<Bytes> v = tree_->get(k);
+            auto list = v ? decode_xattrs(*v) : std::vector<std::pair<std::string, Bytes>>{};
+            auto it = std::find_if(list.begin(), list.end(), [&](const auto& e) { return e.first == o.name; });
+            if (it != list.end()) {
+              it->second = o.value;
+            } else {
+              list.emplace_back(o.name, o.value);
+            }
+            tree_->put(k, encode_xattrs(list));
           },
           [&](const op::RemoveXattr& o) {
-            Inode& inode = need(o.ino);
-            if (inode.xattrs.erase(o.name) == 0) corrupt("removing a missing xattr");
+            need(o.ino);
+            TreeKey k = key(o.ino, item_kind::xattr, name_hash(o.name));
+            std::optional<Bytes> v = tree_->get(k);
+            auto list = v ? decode_xattrs(*v) : std::vector<std::pair<std::string, Bytes>>{};
+            auto it = std::find_if(list.begin(), list.end(), [&](const auto& e) { return e.first == o.name; });
+            if (it == list.end()) corrupt("removing a missing xattr");
+            list.erase(it);
+            if (list.empty()) {
+              tree_->erase(k);
+            } else {
+              tree_->put(k, encode_xattrs(list));
+            }
           },
       },
       op);
 }
 
-// ---- checkpoints -----------------------------------------------------------
+// ---- checkpoints -------------------------------------------------------------------
 
-bool Metadata::is_v2_checkpoint(ByteView stream_start) {
-  return stream_start.size() >= 8 && std::memcmp(stream_start.data(), kCheckpointMagicV2, 8) == 0;
+void Metadata::flush() { tree_->flush(); }
+
+std::uint64_t Metadata::dirty_bytes() const { return tree_->dirty_bytes(); }
+
+bool Metadata::is_tree_checkpoint(ByteView stream_start) {
+  return stream_start.size() >= 8 && std::memcmp(stream_start.data(), kCheckpointMagicV3, 8) == 0;
 }
 
 Bytes Metadata::encode_checkpoint() const {
+  if (tree_->dirty()) throw Error(Errc::invalid_argument, "checkpoint of a tree not flushed");
   Encoder out;
-  out.raw(ByteView(
-      reinterpret_cast<const std::uint8_t*>(shared_records_ ? kCheckpointMagicV2 : kCheckpointMagic), 8));
+  out.raw(ByteView(reinterpret_cast<const std::uint8_t*>(kCheckpointMagicV3), 8));
   out.varint(last_txid);
   out.varint(next_inode);
+  NodeRef root = tree_->root();
+  out.varint(root.offset);
+  out.varint(root.stored_size);
+  out.varint(counters.node_bytes);
+  out.varint(counters.files);
+  out.varint(counters.directories);
+  out.varint(counters.other_inodes);
+  out.varint(counters.logical_bytes);
   out.varint(segments.size());
   for (const auto& [index, usage] : segments) {
     out.varint(index);
     out.varint(usage.seq);
     out.varint(usage.live_bytes);
   }
-  // Sorted, so the same state always encodes to the same bytes.
-  std::vector<InodeId> ids;
-  ids.reserve(inodes.size());
-  for (const auto& [id, inode] : inodes) ids.push_back(id);
-  std::sort(ids.begin(), ids.end());
-  out.varint(ids.size());
-  for (InodeId id : ids) {
-    const Inode& inode = inodes.at(id);
-    encode_attrs(out, inode);
-    out.varint(inode.chunks.size());
-    for (const auto& [index, ref] : inode.chunks) {
-      out.varint(index);
-      if (shared_records_) {
-        // "share" marks a record with several references, so that loading
-        // counts only those.
-        encode_ref_ex(out, ref, !ref.packed && shared.contains(ref.offset));
-      } else {
-        encode_ref(out, ref);
-      }
-    }
-    out.varint(inode.entries.size());
-    for (const auto& [name, ino] : inode.entries) {
-      out.str(name);
-      out.varint(ino);
-    }
-    out.varint(inode.xattrs.size());
-    for (const auto& [name, value] : inode.xattrs) {
-      out.str(name);
-      out.bytes(value);
-    }
-  }
   return out.take();
 }
 
-Metadata Metadata::decode_checkpoint(ByteView data, std::uint64_t data_start,
-                                     unsigned segment_shift, bool shared_records, bool cold_data) {
+Metadata Metadata::decode_checkpoint(ByteView data, std::uint64_t data_start, unsigned segment_shift,
+                                     const Options& options, std::shared_ptr<NodeIO> io) {
   Decoder in(data);
-  ByteView magic = in.raw(8);
-  bool v2 = std::memcmp(magic.data(), kCheckpointMagicV2, 8) == 0;
-  if (!v2 && std::memcmp(magic.data(), kCheckpointMagic, 8) != 0) corrupt("not a checkpoint");
-  if (v2 && !shared_records) corrupt("checkpoint with shared records on a filesystem without them");
-  Metadata m(data_start, segment_shift, shared_records, cold_data);
-  m.last_txid = in.varint();
-  m.next_inode = in.varint();
-
-  std::uint64_t segment_count = in.varint();
-  std::map<std::uint64_t, std::uint64_t> recorded_live;
-  for (std::uint64_t i = 0; i < segment_count; ++i) {
+  if (std::memcmp(in.raw(8).data(), kCheckpointMagicV3, 8) != 0) corrupt("not a tree checkpoint");
+  std::uint64_t txid = in.varint();
+  std::uint64_t next = in.varint();
+  NodeRef root;
+  root.offset = in.varint();
+  root.stored_size = u32(in.varint());
+  if ((root.offset == 0) != (root.stored_size == 0)) corrupt("bad tree root");
+  Metadata m(data_start, segment_shift, options, std::move(io), root);
+  m.last_txid = txid;
+  m.next_inode = next;
+  m.counters.node_bytes = in.varint();
+  m.counters.files = in.varint();
+  m.counters.directories = in.varint();
+  m.counters.other_inodes = in.varint();
+  m.counters.logical_bytes = in.varint();
+  std::uint64_t n = in.varint();
+  for (std::uint64_t i = 0; i < n; ++i) {
     std::uint64_t index = in.varint();
     std::uint64_t seq = in.varint();
-    recorded_live[index] = in.varint();
-    if (!m.segments.emplace(index, SegmentUsage{seq, 0}).second) corrupt("duplicate segment");
-  }
-
-  // Records with several references, and packs: their references are
-  // counted here, and their space claimed once at the end.
-  struct Counted {
-    ChunkRef ref;
-    std::uint32_t count = 0;
-  };
-  std::unordered_map<std::uint64_t, Counted> counted;
-  std::uint64_t inode_count = in.varint();
-  for (std::uint64_t i = 0; i < inode_count; ++i) {
-    Inode inode;
-    static_cast<InodeAttrs&>(inode) = decode_attrs(in);
-    std::uint64_t chunks = in.varint();
-    for (std::uint64_t c = 0; c < chunks; ++c) {
-      std::uint64_t index = in.varint();
-      bool share = false;
-      ChunkRef ref = v2 ? decode_ref_ex(in, share) : decode_ref(in);
-      if (!ref.packed && ref.piece) corrupt("a piece offset outside a pack");
-      if (ref.cold && !m.cold_data_) corrupt("cold data on a filesystem without that feature");
-      if (ref.hash) m.dedup.put(ref.hash, target_of(ref));
-      if (ref.packed || share) {
-        auto it = counted.try_emplace(ref.offset, Counted{ref, 0}).first;
-        if (it->second.ref.stored_size != ref.stored_size || it->second.ref.packed != ref.packed) {
-          corrupt("references to one record disagree");
-        }
-        if (it->second.count == UINT32_MAX) corrupt("too many references to one record");
-        ++it->second.count;
-      } else {
-        m.claim(ref);
-      }
-      if (!inode.chunks.emplace(index, ref).second) corrupt("duplicate chunk");
-    }
-    std::uint64_t entries = in.varint();
-    for (std::uint64_t e = 0; e < entries; ++e) {
-      std::string name = in.str(kMaxNameLength);
-      if (!valid_name(name)) corrupt("invalid file name");
-      inode.entries.emplace(std::move(name), in.varint());
-    }
-    std::uint64_t xattrs = in.varint();
-    for (std::uint64_t x = 0; x < xattrs; ++x) {
-      std::string name = in.str(kMaxXattrNameLength);
-      inode.xattrs.emplace(std::move(name), in.bytes(kMaxXattrValueSize));
-    }
-    InodeId id = inode.id;
-    if (id >= m.next_inode) corrupt("inode number beyond the allocation counter");
-    if (!m.inodes.emplace(id, std::move(inode)).second) corrupt("duplicate inode");
+    std::uint64_t live = in.varint();
+    if (!m.segments.emplace(index, SegmentUsage{seq, live}).second) corrupt("duplicate segment");
   }
   if (!in.done()) corrupt("trailing bytes in checkpoint");
-  for (const auto& [offset, c] : counted) {
-    if (!c.ref.packed && c.count < 2) corrupt("a record marked shared has one reference");
-    m.claim(c.ref);
-    m.shared.emplace(offset, c.count);
-  }
-
-  // Cross-checks: every reference resolves, and the space accounting that
-  // was recorded matches what the chunks add up to.
-  const Inode* root = m.find(kRootInode);
-  if (!root || !root->is_dir()) corrupt("checkpoint has no root directory");
-  for (const auto& [id, inode] : m.inodes) {
-    for (const auto& [name, child] : inode.entries) {
-      if (!inode.is_dir() || !m.find(child)) corrupt("dangling directory entry");
-    }
-    if (!inode.chunks.empty() && !inode.is_regular()) corrupt("chunks on a non-file");
-  }
-  for (const auto& [index, usage] : m.segments) {
-    if (recorded_live[index] != usage.live_bytes) corrupt("segment space accounting mismatch");
-  }
+  if (root && root.offset < data_start) corrupt("tree root before the data area");
+  if (root && !m.segments.contains(m.segment_of(root.offset))) corrupt("tree root in a free segment");
   return m;
+}
+
+// ---- legacy filesystems ----------------------------------------------------------------
+
+Metadata Metadata::from_legacy(const LegacyMetadata& old, const Options& options, std::shared_ptr<NodeIO> io) {
+  Options o = options;
+  o.shared_records = old.shared_records();
+  o.cold_data = old.cold_data();
+  Metadata m(old.data_start(), old.segment_shift(), o, std::move(io));
+  m.segments = old.segments;
+  m.next_inode = old.next_inode;
+  m.last_txid = old.last_txid;
+  m.dedup = old.dedup;
+  m.dedup_complete = true;
+  std::vector<InodeId> ids;
+  ids.reserve(old.inodes.size());
+  for (const auto& [id, inode] : old.inodes) ids.push_back(id);
+  std::sort(ids.begin(), ids.end());
+  std::map<std::uint64_t, Refs> refs;
+  for (InodeId id : ids) {
+    const Inode& inode = old.inodes.at(id);
+    const InodeAttrs& a = inode;
+    m.tree_->put(key(id, item_kind::inode), encode(a));
+    m.count_inode(a, +1);
+    if (a.nlink == 0 && id != kRootInode) m.tree_->put(key(0, item_kind::orphan, id), {});
+    InodeCounts c;
+    c.entries = inode.entries.size();
+    std::map<std::uint64_t, std::vector<std::pair<std::string, InodeId>>> entries;
+    for (const auto& [name, child] : inode.entries) entries[name_hash(name)].emplace_back(name, child);
+    for (const auto& [h, list] : entries) m.tree_->put(key(id, item_kind::entry, h), encode_entries(list));
+    std::map<std::uint64_t, std::vector<std::pair<std::string, Bytes>>> xattrs;
+    for (const auto& [name, value] : inode.xattrs) xattrs[name_hash(name)].emplace_back(name, value);
+    for (const auto& [h, list] : xattrs) m.tree_->put(key(id, item_kind::xattr, h), encode_xattrs(list));
+    for (const auto& [index, ref] : inode.chunks) {
+      c.data_bytes += ref.size;
+      m.tree_->put(key(id, item_kind::chunk, index), encode_chunk_item(ref));
+      if (ref.packed || old.shared.contains(ref.offset)) {
+        Refs& r = refs[ref.offset];
+        ++r.count;
+        r.users.push_back({id, index});
+      }
+    }
+    m.put_counts(id, c);
+  }
+  for (const auto& [offset, r] : refs) m.tree_->put(refs_key(offset), encode_refs(r));
+  return m;
+}
+
+LegacyMetadata Metadata::to_legacy() const {
+  LegacyMetadata m(data_start_, segment_shift_, options_.shared_records, options_.cold_data);
+  m.segments = segments;
+  m.next_inode = next_inode;
+  m.last_txid = last_txid;
+  Inode* inode = nullptr;
+  tree_->scan({}, kMaxTreeKey, [&](const TreeKey& k, ByteView v) {
+    if (k.kind == item_kind::refs) {
+      if (!(k.object & kRefsObject) || k.offset != 0) corrupt("misplaced refs item");
+      m.shared[k.object & ~kRefsObject] = decode_refs(v).count;
+      return true;
+    }
+    if (k.kind == item_kind::orphan) {
+      if (k.object != 0) corrupt("misplaced orphan item");
+      return true;
+    }
+    if (k.kind == item_kind::inode) {
+      if (k.offset != 0) corrupt("misplaced inode item");
+      InodeAttrs a = decode_inode(v);
+      if (a.id != k.object) corrupt("inode item under another inode number");
+      Inode& i = m.inodes[k.object];
+      static_cast<InodeAttrs&>(i) = a;
+      inode = &i;
+      return true;
+    }
+    // The inode item comes first: every other item of an inode follows it.
+    if (!inode || inode->id != k.object) corrupt("an item of an inode that does not exist");
+    switch (k.kind) {
+      case item_kind::counts:
+        decode_counts(v);
+        break;
+      case item_kind::xattr:
+        for (auto& [name, value] : decode_xattrs(v)) {
+          if (name_hash(name) != k.offset) corrupt("xattr item under another name's hash");
+          if (!inode->xattrs.emplace(std::move(name), std::move(value)).second) corrupt("duplicate xattr");
+        }
+        break;
+      case item_kind::entry:
+        for (auto& [name, child] : decode_entries(v)) {
+          if (name_hash(name) != k.offset) corrupt("entry item under another name's hash");
+          if (!inode->entries.emplace(std::move(name), child).second) corrupt("duplicate entry");
+        }
+        break;
+      case item_kind::chunk: {
+        ChunkRef ref = decode_chunk_item(v);
+        if (ref.hash) m.dedup.put(ref.hash, target_of(ref));
+        inode->chunks.emplace(k.offset, ref);
+        break;
+      }
+      default:
+        corrupt("an item of unknown kind");
+    }
+    return true;
+  });
+  return m;
+}
+
+namespace {
+
+// `skip_single`: leave out the users of shared records down to one
+// reference, which the legacy metadata does not keep.
+bool same_items(const BTree& a, const BTree& b, bool skip_single = false) {
+  std::vector<std::pair<TreeKey, Bytes>> x, y;
+  auto collect = [&](const BTree& t, std::vector<std::pair<TreeKey, Bytes>>& out) {
+    t.scan({}, kMaxTreeKey, [&](const TreeKey& k, ByteView v) {
+      if (skip_single && k.kind == item_kind::refs) {
+        Refs r = decode_refs(v);
+        if (r.count == 1) {
+          std::optional<Bytes> c = t.get({r.users[0].ino, item_kind::chunk, r.users[0].index});
+          if (c && !decode_chunk_item(*c).packed) return true;
+        }
+      }
+      out.emplace_back(k, Bytes(v.begin(), v.end()));
+      return true;
+    });
+  };
+  collect(a, x);
+  collect(b, y);
+  return x == y;
+}
+
+}  // namespace
+
+bool Metadata::same_as(const Metadata& o) const {
+  return segments == o.segments && counters == o.counters && next_inode == o.next_inode && last_txid == o.last_txid &&
+         same_items(*tree_, *o.tree_);
+}
+
+bool Metadata::same_as(const LegacyMetadata& legacy) const {
+  Options o = options_;
+  o.account_nodes = false;
+  Metadata other = from_legacy(legacy, o, std::make_shared<MemNodeIO>());
+  bool segs = options_.account_nodes || segments == other.segments;
+  return segs && counters == other.counters && next_inode == other.next_inode && last_txid == other.last_txid &&
+         same_items(*tree_, *other.tree_, true);
 }
 
 }  // namespace nanoer

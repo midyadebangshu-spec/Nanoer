@@ -1,5 +1,6 @@
 #include "nanoer/stats.h"
 
+#include <algorithm>
 #include <set>
 #include <sstream>
 #include <unordered_map>
@@ -48,6 +49,7 @@ void each_field(SpaceStats& s, F&& f) {
   f("dedup_entries", s.dedup_entries);
   f("dedup_index_bytes", s.dedup_index_bytes);
   f("metadata_bytes", s.metadata_bytes);
+  f("metadata_disk_bytes", s.metadata_disk_bytes);
 }
 
 }  // namespace
@@ -122,12 +124,12 @@ SpaceStats Filesystem::space_stats_locked(bool by_codec) {
     std::set<std::pair<std::uint32_t, std::uint32_t>> pieces;
   };
   std::unordered_map<std::uint64_t, Use> uses;
-  std::uint64_t chunk_refs = 0, entries = 0, xattr_bytes = 0;
-  for (const auto& [id, inode] : meta_.inodes) {
+  meta_.for_each_inode([&](const InodeAttrs& a) {
+    InodeAttrs inode = find(a.id).value_or(a);  // with changes not committed yet
     if (inode.is_regular()) {
       ++s.files;
       s.logical_bytes += inode.size;
-      SpaceStats::PolicyUse& p = s.by_policy[std::string(policy_name(policy_of(inode)))];
+      SpaceStats::PolicyUse& p = s.by_policy[std::string(policy_name(policy_of(meta_, inode.id)))];
       ++p.files;
       p.logical_bytes += inode.size;
     } else if (inode.is_dir()) {
@@ -135,10 +137,10 @@ SpaceStats Filesystem::space_stats_locked(bool by_codec) {
     } else {
       ++s.other_inodes;
     }
-    for (const auto& [name, child] : inode.entries) entries += name.size();
-    for (const auto& [name, value] : inode.xattrs) xattr_bytes += name.size() + value.size();
-    for (const auto& [index, ref] : inode.chunks) {
-      ++chunk_refs;
+    return true;
+  });
+  meta_.for_each_chunk([&](InodeId, std::uint64_t, const ChunkRef& ref) {
+    {
       s.referenced_bytes += ref.size;
       Use& u = uses[ref.offset];
       u.stored = ref.stored_size;
@@ -154,7 +156,8 @@ SpaceStats Filesystem::space_stats_locked(bool by_codec) {
         u.size = ref.size;
       }
     }
-  }
+    return true;
+  });
   for (const auto& [offset, u] : uses) {
     ++s.records;
     s.stored_bytes += u.stored;
@@ -198,6 +201,7 @@ SpaceStats Filesystem::space_stats_locked(bool by_codec) {
   s.segments_pending = journal_ ? journal_->pending_free_segments() : 0;
   s.segments_free = journal_ ? journal_->free_segments() : sb_.segment_count - meta_.segments.size();
   for (const auto& [index, usage] : meta_.segments) s.live_bytes += usage.live_bytes;
+  s.live_bytes -= std::min(s.live_bytes, meta_.counters.node_bytes);  // data only: nodes are metadata_disk_bytes
 
   s.gc_bytes_copied = gc_stats_.bytes_copied;
   s.gc_records_copied = gc_stats_.records_copied;
@@ -212,11 +216,11 @@ SpaceStats Filesystem::space_stats_locked(bool by_codec) {
   s.dedup = dedup_ && !read_only_;
   s.dedup_entries = meta_.dedup.size();
   s.dedup_index_bytes = meta_.dedup.memory_bytes();
-  // Rough sizes of the in-memory structures (node-based maps): an inode
-  // ~200 bytes, a chunk reference ~80, a directory entry ~64 plus its name.
-  s.metadata_bytes = meta_.inodes.size() * 200 + chunk_refs * 80 + entries + xattr_bytes +
-                     meta_.shared.size() * 32 + meta_.segments.size() * 64 + s.dedup_index_bytes;
-  for (const auto& [id, inode] : meta_.inodes) s.metadata_bytes += inode.entries.size() * 64 + inode.xattrs.size() * 64;
+  // In memory: the tree's cache and changed nodes, the dedup index, the
+  // segment table. On disk: the tree's nodes.
+  s.metadata_bytes = meta_.tree().cache_stats().resident_bytes + meta_.dirty_bytes() + s.dedup_index_bytes +
+                     meta_.segments.size() * 64;
+  s.metadata_disk_bytes = meta_.counters.node_bytes;
   return s;
 }
 

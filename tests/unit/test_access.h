@@ -1,6 +1,7 @@
 // Tests: reaching into a Filesystem (it names this struct as a friend).
 #pragma once
 
+#include <map>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
@@ -28,6 +29,16 @@ struct FilesystemTestAccess {
     fs.meta_.dedup.put(key, target);
   }
   static const Metadata& metadata(Filesystem& fs) { return fs.meta_; }
+  // A file's committed chunks.
+  static std::map<std::uint64_t, ChunkRef> chunks(Filesystem& fs, InodeId ino) {
+    std::shared_lock lock(fs.mutex_);
+    std::map<std::uint64_t, ChunkRef> out;
+    fs.meta_.chunks(ino, 0, [&](std::uint64_t index, const ChunkRef& ref) {
+      out.emplace(index, ref);
+      return true;
+    });
+    return out;
+  }
 
   // Tiering one phase at a time: a pass over the files cold after `age_s`.
   static Filesystem::TierPlan tier_plan(Filesystem& fs, std::int64_t age_s) {

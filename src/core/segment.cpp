@@ -143,4 +143,15 @@ std::optional<Record> SegmentScanner::next() {
   return record;
 }
 
+std::optional<Record> SegmentScanner::next_header() {
+  if (done_ || !header_) return std::nullopt;
+  auto record = try_read_record_header(store_, next_, end_, header_->seq);
+  if (!record) {
+    done_ = true;
+    return std::nullopt;
+  }
+  next_ += record->stored_size();
+  return record;
+}
+
 }  // namespace nanoer

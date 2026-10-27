@@ -24,6 +24,7 @@ struct FormatOptions {
   // as M3 made them, for compatibility tests.
   bool shared_records = true;
   bool cold_data = true;  // cold data recompression (needs shared_records)
+  bool metadata_tree = true;  // false: metadata in full checkpoints, as M2-M5 made them (tests)
   bool dedup = true;  // false: the no_dedup preference
 };
 

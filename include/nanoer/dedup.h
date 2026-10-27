@@ -28,7 +28,9 @@ class DedupIndex {
   // target the index cannot hold (an offset from 256 TiB, a piece from
   // 64 KiB on: possible only in other writers' or damaged images) is left
   // out: a missed duplicate at worst.
+  // Beyond the memory limit, new keys are left out (missed duplicates).
   void put(std::uint64_t key, const DedupTarget& target);
+  void set_limit(std::size_t bytes) { limit_ = bytes; }
   std::optional<DedupTarget> find(std::uint64_t key) const;
   // Removes `key`, if it still points at `target`.
   void erase(std::uint64_t key, const DedupTarget& target);
@@ -54,6 +56,7 @@ class DedupIndex {
 
   std::vector<Slot> slots_;  // a power of two in size, or empty
   std::size_t size_ = 0;
+  std::size_t limit_ = SIZE_MAX;  // bytes of slots
 };
 
 }  // namespace nanoer

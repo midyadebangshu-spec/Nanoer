@@ -42,7 +42,7 @@ struct SpaceStats {
   std::uint64_t segments_in_use = 0;
   std::uint64_t segments_pending = 0;  // free after the next checkpoint
   std::uint64_t segments_free = 0;
-  std::uint64_t live_bytes = 0;  // in segments in use, by the space accounting
+  std::uint64_t live_bytes = 0;  // of data in segments in use, by the space accounting (nodes excluded)
 
   // Garbage collection, since mounting.
   std::uint64_t gc_bytes_copied = 0;
@@ -61,7 +61,8 @@ struct SpaceStats {
   bool dedup = false;
   std::uint64_t dedup_entries = 0;
   std::uint64_t dedup_index_bytes = 0;
-  std::uint64_t metadata_bytes = 0;  // an estimate of the metadata held in memory
+  std::uint64_t metadata_bytes = 0;       // an estimate of the metadata held in memory
+  std::uint64_t metadata_disk_bytes = 0;  // the metadata tree's nodes on disk
 
   // Stored data by codec (only when asked for: every record header is read).
   struct Codec {

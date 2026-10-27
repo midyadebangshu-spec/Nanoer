@@ -48,10 +48,11 @@ bool Filesystem::cold_enabled() const {
   return has_cold_data(sb_) && !read_only_ && !failed_ && journal_ != nullptr;
 }
 
-std::optional<StorageForm> Filesystem::cold_now(const Inode& file, std::int64_t now_ns,
+std::optional<StorageForm> Filesystem::cold_now(const InodeAttrs& file, std::int64_t now_ns,
                                                 std::optional<std::int64_t> age_s) const {
-  if (!file.is_regular() || file.chunks.empty()) return std::nullopt;
-  Policy policy = policy_of(file);
+  if (!file.is_regular() || meta_.counts(file.id).data_bytes == 0) return std::nullopt;
+  if (attrs_.contains(file.id)) return std::nullopt;  // changed since the last commit
+  Policy policy = policy_of(meta_, file.id);
   std::optional<std::int64_t> after = cold_after_s(policy, age_s.value_or(options_.cold_after_s));
   if (!after) return std::nullopt;
   // The change time cannot be set by users (unlike mtime, which tar and
@@ -63,10 +64,7 @@ std::optional<StorageForm> Filesystem::cold_now(const Inode& file, std::int64_t 
 }
 
 bool Filesystem::tier_eligible(const TierMember& m) const {
-  const Inode* file = meta_.find(m.ino);
-  if (!file) return false;
-  auto c = file->chunks.find(m.index);
-  if (c == file->chunks.end() || c->second != m.ref) return false;
+  if (meta_.chunk(m.ino, m.index) != m.ref) return false;
   auto usage = meta_.segments.find(meta_.segment_of(m.ref.offset));
   return usage != meta_.segments.end() && usage->second.seq == m.seq;
 }
@@ -74,49 +72,49 @@ bool Filesystem::tier_eligible(const TierMember& m) const {
 void Filesystem::tier_begin_pass(std::int64_t now_ns, std::optional<std::int64_t> age_s) {
   tier_queue_.clear();
   tier_shared_.clear();
+  std::vector<InodeId> files;
+  meta_.for_each_inode([&](const InodeAttrs& a) {
+    if (cold_now(a, now_ns, age_s)) files.push_back(a.id);
+    return true;
+  });
+  std::sort(files.rbegin(), files.rend());  // taken from the back: lowest inode first
+  tier_queue_ = std::move(files);
   // Records with several references (packs, deduplicated data) are taken
   // only when every reference is from a cold file: one still changing would
   // soon leave a fresh record behind anyway.
-  struct Shared {
-    std::vector<TierMember> members;
-    bool all_cold = true;  // every user is a cold file
-    bool any_hot = false;  // some reference is not marked cold yet
-    bool packed = false;
-    StorageForm form{};
-  };
-  std::map<std::uint64_t, Shared> shared;
-  std::vector<InodeId> files;
-  for (const auto& [id, inode] : meta_.inodes) {
-    if (!inode.is_regular()) continue;
-    std::optional<StorageForm> form = cold_now(inode, now_ns, age_s);
-    bool candidate = false;
-    for (const auto& [index, ref] : inode.chunks) {
-      auto usage = meta_.segments.find(meta_.segment_of(ref.offset));
-      if (usage == meta_.segments.end()) continue;
-      if (tier_skip_.contains({ref.offset, usage->second.seq})) continue;
-      if (!ref.packed && meta_.references(ref) == 1) {
-        candidate |= form && !ref.cold;
-        continue;
-      }
-      Shared& s = shared[ref.offset];
-      if (s.members.empty()) {
-        s.packed = ref.packed;
-        if (form) s.form = *form;
-      }
-      std::uint64_t limit = sb_.segment_offset(usage->first) + sb_.segment_size();
-      s.members.push_back({id, index, ref, usage->second.seq, limit});
-      s.all_cold &= form.has_value();
-      s.any_hot |= !ref.cold;
+  std::map<InodeId, std::optional<StorageForm>> cold;
+  auto cold_of = [&](InodeId ino) {
+    auto it = cold.find(ino);
+    if (it == cold.end()) {
+      std::optional<InodeAttrs> a = find(ino);
+      it = cold.emplace(ino, a ? cold_now(*a, now_ns, age_s) : std::nullopt).first;
     }
-    if (candidate) files.push_back(id);
-  }
-  std::sort(files.rbegin(), files.rend());  // taken from the back: lowest inode first
-  tier_queue_ = std::move(files);
-  for (auto it = shared.rbegin(); it != shared.rend(); ++it) {
-    Shared& s = it->second;
-    if (!s.all_cold || !s.any_hot) continue;
-    tier_shared_.push_back({s.packed ? TierItem::Kind::pack : TierItem::Kind::single, std::move(s.members), s.form});
-  }
+    return it->second;
+  };
+  std::vector<TierItem> shared;
+  meta_.for_each_shared([&](std::uint64_t offset, const std::vector<ChunkUser>& users) {
+    auto usage = meta_.segments.find(meta_.segment_of(offset));
+    if (usage == meta_.segments.end() || tier_skip_.contains({offset, usage->second.seq})) return true;
+    std::uint64_t limit = sb_.segment_offset(usage->first) + sb_.segment_size();
+    TierItem item;
+    bool all_cold = true, any_hot = false;
+    for (const ChunkUser& u : users) {
+      std::optional<ChunkRef> ref = meta_.chunk(u.ino, u.index);
+      if (!ref || ref->offset != offset) continue;
+      std::optional<StorageForm> form = cold_of(u.ino);
+      if (!form) all_cold = false;
+      if (item.members.empty()) {
+        item.kind = ref->packed ? TierItem::Kind::pack : TierItem::Kind::single;
+        if (form) item.form = *form;
+      }
+      any_hot |= !ref->cold;
+      item.members.push_back({u.ino, u.index, *ref, usage->second.seq, limit});
+    }
+    if (all_cold && any_hot && !item.members.empty()) shared.push_back(std::move(item));
+    return true;
+  });
+  std::reverse(shared.begin(), shared.end());
+  tier_shared_ = std::move(shared);
   tier_pass_open_ = true;
   tier_pass_ns_ = now_ns;
   // (tier_stats_ is counted by the caller, under the unique lock: readers
@@ -142,25 +140,31 @@ Filesystem::TierPlan Filesystem::tier_plan(std::uint64_t budget, std::int64_t no
   while (plan.bytes < budget) {
     std::optional<InodeId> id = next_file();
     if (!id) break;
-    const Inode* file = meta_.find(*id);
+    std::optional<InodeAttrs> file = find(*id);
     if (!file) continue;
     std::optional<StorageForm> form = cold_now(*file, now_ns, age_s);
     if (!form) continue;
     // The file's chunks that only it refers to and that are not cold yet,
     // each recompressed on its own (KNOWLEDGE.md §7.7: chunks compressed
     // together in larger units read 25-30 % slower).
-    for (const auto& [index, ref] : file->chunks) {
-      if (ref.cold || ref.packed || meta_.references(ref) != 1) continue;
+    bool full = false;
+    meta_.chunks(*id, 0, [&](std::uint64_t index, const ChunkRef& ref) {
+      if (ref.cold || ref.packed || meta_.references(ref) != 1) return true;
       auto usage = meta_.segments.find(meta_.segment_of(ref.offset));
-      if (usage == meta_.segments.end() || tier_skip_.contains({ref.offset, usage->second.seq})) continue;
+      if (usage == meta_.segments.end() || tier_skip_.contains({ref.offset, usage->second.seq})) return true;
       if (plan.bytes > 0 && plan.bytes + ref.size > budget) {
-        // The rest of a large file waits for the next step.
-        if (!only) tier_queue_.push_back(*id);
-        return plan;
+        full = true;
+        return false;
       }
       std::uint64_t limit = sb_.segment_offset(usage->first) + sb_.segment_size();
       plan.items.push_back({TierItem::Kind::single, {{*id, index, ref, usage->second.seq, limit}}, *form});
       plan.bytes += ref.size;
+      return true;
+    });
+    if (full) {
+      // The rest of a large file waits for the next step.
+      if (!only) tier_queue_.push_back(*id);
+      return plan;
     }
   }
   if (only) return plan;
@@ -279,7 +283,7 @@ std::uint64_t Filesystem::tier_apply(const TierPlan& plan, std::vector<TierRead>
         const TierMember& m = item.members[k];
         ChunkRef ref = m.ref;
         ref.cold = true;
-        record(op::SetChunkRef{m.ino, m.index, ref, !ref.packed && meta_.references(ref) > 1});
+        record(op::SetChunkRef{m.ino, m.index, ref, !ref.packed && meta_.users(ref.offset).has_value()});
       }
       ++tier_stats_.in_place;
       marked += live.size();
@@ -291,7 +295,10 @@ std::uint64_t Filesystem::tier_apply(const TierPlan& plan, std::vector<TierRead>
       if (item.kind == TierItem::Kind::pack) {
         fresh = journal_->append_chunk(r.encoded, 0, 0, std::nullopt, true);
       } else {
-        fresh = journal_->append_chunk(r.encoded, r.owner, r.file_offset, r.blake3);
+        // The new record's header names its first user (GC finds it so
+        // once only one is left), and keeps the data's identity.
+        const TierMember& first = item.members[live.front()];
+        fresh = journal_->append_chunk(r.encoded, first.ino, first.index * sb_.chunk_size(), r.blake3);
       }
     } catch (const Error& e) {
       if (e.code() == Errc::no_space) break;  // nothing was written
@@ -304,12 +311,14 @@ std::uint64_t Filesystem::tier_apply(const TierPlan& plan, std::vector<TierRead>
       ref.stored_size = fresh.stored_size;
       ref.cold = true;
       bool share = false;
+      std::optional<ChunkUser> owner;
       if (item.kind == TierItem::Kind::pack) {
         ref.piece = r.moved.at(m.ref.piece);
       } else {
         share = j > 0;  // the first claims the record
+        if (j == 1) owner = ChunkUser{item.members[live[0]].ino, item.members[live[0]].index};
       }
-      record(op::SetChunkRef{m.ino, m.index, ref, share});
+      record(op::SetChunkRef{m.ino, m.index, ref, share, owner});
     }
     ++(item.kind == TierItem::Kind::pack ? tier_stats_.packs : tier_stats_.singles);
     tier_stats_.stored_before += r.stored_before;

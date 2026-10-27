@@ -52,19 +52,20 @@ std::unique_ptr<MemStore> sample(bool dedup = true) {
 
 // Writes a transaction straight into the log: a way to create states that
 // the filesystem itself would never produce.
-void inject(Store& store, const std::function<std::vector<Op>(const Metadata&)>& make) {
+// `make` sees the metadata in memory, as fsck does.
+void inject(Store& store, const std::function<std::vector<Op>(const LegacyMetadata&)>& make) {
   Superblock sb = load_superblock(store).sb;
   ReplayResult r = replay(store, sb);
-  Metadata meta = r.meta;
-  Journal journal(store, sb, meta, std::max(sb.next_segment_seq, r.max_seq + 1));
-  journal.resume(r.end);
-  std::vector<Op> ops = make(meta);
+  Metadata& meta = r.meta;
+  Journal journal(store, sb, meta.segments, std::max(sb.next_segment_seq, r.max_seq + 1));
+  journal.resume(r.end, meta.last_txid);
+  std::vector<Op> ops = make(meta.to_legacy());
   for (const Op& op : ops) meta.apply(op);
   journal.append_transaction(meta.last_txid + 1, ops);
   journal.flush();
 }
 
-InodeId find(const Metadata& m, InodeId dir, const std::string& name) {
+InodeId find(const LegacyMetadata& m, InodeId dir, const std::string& name) {
   return m.find(dir)->entries.at(name);
 }
 
@@ -110,7 +111,7 @@ TEST(Fsck, CleanFilesystemIsClean) {
 
 TEST(Fsck, WrongLinkCount) {
   auto store = sample();
-  inject(*store, [](const Metadata& m) {
+  inject(*store, [](const LegacyMetadata& m) {
     InodeAttrs a = *m.find(find(m, kRootInode, "a"));
     a.nlink = 5;
     return std::vector<Op>{op::PutInode{a}};
@@ -120,7 +121,7 @@ TEST(Fsck, WrongLinkCount) {
 
 TEST(Fsck, EntryPointingAtMissingInode) {
   auto store = sample();
-  inject(*store, [](const Metadata& m) {
+  inject(*store, [](const LegacyMetadata& m) {
     return std::vector<Op>{op::DeleteInode{find(m, kRootInode, "a")}};  // entry left behind
   });
   expect_found_and_repaired(*store, "which does not exist");
@@ -131,7 +132,7 @@ TEST(Fsck, EntryPointingAtMissingInode) {
 TEST(Fsck, UnreachableTreeGoesToLostAndFound) {
   auto store = sample();
   InodeId d = 0;
-  inject(*store, [&](const Metadata& m) {
+  inject(*store, [&](const LegacyMetadata& m) {
     d = find(m, kRootInode, "d");
     return std::vector<Op>{op::RemoveEntry{kRootInode, "d"}};  // /d, with contents, detached
   });
@@ -149,7 +150,7 @@ TEST(Fsck, UnreachableTreeGoesToLostAndFound) {
 
 TEST(Fsck, DirectoryWithTwoNames) {
   auto store = sample();
-  inject(*store, [](const Metadata& m) {
+  inject(*store, [](const LegacyMetadata& m) {
     return std::vector<Op>{op::SetEntry{kRootInode, "alias", find(m, kRootInode, "d")}};
   });
   expect_found_and_repaired(*store, "a directory may have only one name");
@@ -157,7 +158,7 @@ TEST(Fsck, DirectoryWithTwoNames) {
 
 TEST(Fsck, WrongDirectoryParent) {
   auto store = sample();
-  inject(*store, [](const Metadata& m) {
+  inject(*store, [](const LegacyMetadata& m) {
     InodeAttrs a = *m.find(find(m, find(m, kRootInode, "d"), "sub"));
     a.parent = kRootInode;
     return std::vector<Op>{op::PutInode{a}};
@@ -167,7 +168,7 @@ TEST(Fsck, WrongDirectoryParent) {
 
 TEST(Fsck, ChunkPastTheEndOfAFile) {
   auto store = sample();
-  inject(*store, [](const Metadata& m) {
+  inject(*store, [](const LegacyMetadata& m) {
     InodeAttrs a = *m.find(find(m, kRootInode, "a"));
     a.size = 100;  // chunks 1 and 2 are still there
     return std::vector<Op>{op::PutInode{a}};
@@ -177,7 +178,7 @@ TEST(Fsck, ChunkPastTheEndOfAFile) {
 
 TEST(Fsck, ChunkBorrowedFromAnotherFile) {
   auto store = sample(false);
-  inject(*store, [](const Metadata& m) {
+  inject(*store, [](const LegacyMetadata& m) {
     const Inode& a = *m.find(find(m, kRootInode, "a"));
     InodeId x = find(m, find(m, kRootInode, "d"), "x");
     return std::vector<Op>{op::SetChunk{x, 0, a.chunks.at(0)}};
@@ -189,10 +190,10 @@ TEST(Fsck, SharingDataWithoutAnIdentity) {
   // Only data with a BLAKE3 identity may be shared (dedup); other data
   // belongs to the file it was written for.
   auto store = sample(false);
-  inject(*store, [](const Metadata& m) {
+  inject(*store, [](const LegacyMetadata& m) {
     const Inode& a = *m.find(find(m, kRootInode, "a"));
     InodeId x = find(m, find(m, kRootInode, "d"), "x");
-    return std::vector<Op>{op::SetChunkRef{x, 0, a.chunks.at(0), true}};
+    return std::vector<Op>{op::SetChunkRef{x, 0, a.chunks.at(0), true, ChunkUser{a.id, 0}}};
   });
   expect_found_and_repaired(*store, "belongs to another file");
 }
@@ -200,11 +201,11 @@ TEST(Fsck, SharingDataWithoutAnIdentity) {
 TEST(Fsck, SharedDataIsClean) {
   // Data with an identity, shared by two files, as dedup does it.
   auto store = sample();
-  inject(*store, [](const Metadata& m) {
+  inject(*store, [](const LegacyMetadata& m) {
     const Inode& a = *m.find(find(m, kRootInode, "a"));
     InodeId x = find(m, find(m, kRootInode, "d"), "x");
     EXPECT_NE(a.chunks.at(0).hash, 0u);
-    return std::vector<Op>{op::SetChunkRef{x, 0, a.chunks.at(0), true}};
+    return std::vector<Op>{op::SetChunkRef{x, 0, a.chunks.at(0), true, ChunkUser{a.id, 0}}};
   });
   FsckReport report = check(*store, true);
   EXPECT_EQ(report.exit_code(), 0) << all(report.errors);
@@ -212,11 +213,11 @@ TEST(Fsck, SharedDataIsClean) {
 
 TEST(Fsck, WrongDedupKey) {
   auto store = sample();
-  inject(*store, [](const Metadata& m) {
+  inject(*store, [](const LegacyMetadata& m) {
     InodeId x = find(m, find(m, kRootInode, "d"), "x");
     ChunkRef ref = m.find(x)->chunks.at(1);
     ref.hash ^= 0x100;  // the record's own BLAKE3 says otherwise
-    return std::vector<Op>{op::SetChunkRef{x, 1, ref, true}};
+    return std::vector<Op>{op::SetChunkRef{x, 1, ref, false}};
   });
   expect_found_and_repaired(*store, "identity does not match");
 }
@@ -300,7 +301,7 @@ TEST(Fsck, MidLogDamageKeepsTheIntactPrefix) {
 TEST(Fsck, ContradictoryTransaction) {
   auto store = sample();
   // A transaction whose second operation cannot be applied after the first.
-  inject(*store, [](const Metadata& m) {
+  inject(*store, [](const LegacyMetadata& m) {
     InodeId a = find(m, kRootInode, "a");
     return std::vector<Op>{op::SetEntry{kRootInode, "b", a}};
   });
@@ -309,9 +310,9 @@ TEST(Fsck, ContradictoryTransaction) {
     // that removes an entry that does not exist, written the same way.
     Superblock sb = load_superblock(*store).sb;
     ReplayResult r = replay(*store, sb);
-    Metadata meta = r.meta;
-    Journal journal(*store, sb, meta, std::max(sb.next_segment_seq, r.max_seq + 1));
-    journal.resume(r.end);
+    Metadata& meta = r.meta;
+    Journal journal(*store, sb, meta.segments, std::max(sb.next_segment_seq, r.max_seq + 1));
+    journal.resume(r.end, meta.last_txid);
     journal.append_transaction(meta.last_txid + 1, {op::RemoveEntry{kRootInode, "nonexistent"}});
     journal.flush();
   }
@@ -353,7 +354,7 @@ TEST(Fsck, BothSuperblocksLostAreRebuilt) {
 
 TEST(Fsck, OrphansAreFreed) {
   auto store = sample();
-  inject(*store, [](const Metadata& m) {
+  inject(*store, [](const LegacyMetadata& m) {
     InodeAttrs a = *m.find(find(m, kRootInode, "a"));
     a.nlink = 0;
     return std::vector<Op>{op::RemoveEntry{kRootInode, "a"}, op::PutInode{a}};
@@ -403,7 +404,7 @@ TEST(Fsck, DamagedColdRecord) {
     fs->recompress_cold(0);
   }
   Superblock sb = load_superblock(*store).sb;
-  Metadata m = replay(*store, sb).meta;
+  LegacyMetadata m = replay(*store, sb).meta.to_legacy();
   const Inode& a = *m.find(find(m, kRootInode, "a"));
   const ChunkRef ref = a.chunks.at(1);
   ASSERT_TRUE(ref.cold);

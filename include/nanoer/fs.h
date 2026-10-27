@@ -94,6 +94,7 @@ struct FsInfo {
   std::uint64_t other_inodes = 0;
   std::uint64_t logical_bytes = 0;  // sum of regular file sizes
   std::uint64_t stored_bytes = 0;   // data chunk records still referenced
+  std::uint64_t metadata_bytes = 0;  // the metadata tree's nodes on disk
   std::uint64_t segments_in_use = 0;
   std::uint64_t segments_pending_free = 0;
   std::uint64_t segments_free = 0;
@@ -125,6 +126,7 @@ class Filesystem {
  public:
   struct Options {
     std::uint64_t safe_space = 256 << 20;    // decompressed chunk cache
+    std::uint64_t metadata_cache = 64 << 20;  // metadata tree nodes
     unsigned commit_interval_s = 5;          // 0: commit only on sync/fsync/limits
     std::uint64_t dirty_limit = 64 << 20;    // unwritten data before a commit is forced
     std::uint64_t checkpoint_bytes = 256 << 20;  // log written before a checkpoint
@@ -136,6 +138,7 @@ class Filesystem {
     // policy's setting; `max` folders use at most a day.
     std::int64_t cold_after_s = 7 * 24 * 60 * 60;
     bool dedup = true;  // store identical chunks once (needs shared records, and no no_dedup preference)
+    std::uint64_t dedup_memory = 128 << 20;  // the dedup index's limit (beyond it: missed duplicates)
     bool read_only = false;
     bool count_lookups = true;  // FUSE lookup counting (in-process users turn it off)
     bool start_threads = true;  // false: call start() later (after daemonizing)
@@ -201,6 +204,10 @@ class Filesystem {
   // `cold_after_s` (default: the mount's setting) count as cold, then writes
   // the checkpoints that free the old copies. Returns chunks made cold.
   std::uint64_t recompress_cold(std::optional<std::int64_t> cold_after_s = std::nullopt);
+  // The dedup index starts empty at mount and is filled from the files'
+  // chunks in the background (duplicates written before are missed until
+  // then). This fills it now: tests and tools.
+  void rebuild_dedup();
   bool read_only() const { return read_only_; }
   std::uint32_t chunk_size() const { return sb_.chunk_size(); }
   const Superblock& superblock() const { return sb_; }
@@ -212,30 +219,40 @@ class Filesystem {
              bool read_only);
 
   // Everything below expects mutex_ to be held (unique unless noted).
-  Inode& inode(InodeId ino);
-  Inode& directory(InodeId ino);
+  // Attributes: as changed since the last commit, else as stored. edit()
+  // keeps a copy to be written at the next commit (which admit() may start:
+  // call it first).
+  std::optional<InodeAttrs> find(InodeId ino) const;  // shared lock is enough
+  InodeAttrs get(InodeId ino) const;                  // shared lock is enough; ENOENT
+  InodeAttrs get_dir(InodeId ino) const;              // ... ENOTDIR
+  InodeAttrs& edit(InodeId ino);
+  InodeAttrs& edit_dir(InodeId ino);
+  std::vector<InodeId> orphans() const;
+  bool has_data(InodeId ino, std::uint64_t index) const;  // stored or not yet
   void check_writable() const;
   void record(Op op);
-  void mark(InodeId ino);
-  void touch(Inode& inode, bool content);
+  void touch(InodeAttrs& inode, bool content);
   void count_lookup(InodeId ino);
   void maybe_free(InodeId ino);
   bool is_ancestor(InodeId ancestor, InodeId dir) const;
-  Attr make_attr(const Inode& inode) const;  // shared lock is enough
+  Attr make_attr(const InodeAttrs& inode) const;  // shared lock is enough
   Attr create(InodeId parent, std::string_view name, std::uint32_t mode, std::uint64_t rdev,
               std::string_view target, const Caller& caller);
-  Bytes load_chunk(const Inode& file, std::uint64_t index);  // shared lock is enough
+  Bytes load_chunk(InodeId ino, std::uint64_t index);  // shared lock is enough
   std::shared_ptr<const Bytes> read_chunk(const ChunkRef& ref);  // shared lock is enough
-  Bytes& dirty_chunk(Inode& file, std::uint64_t index);
+  Bytes& dirty_chunk(InodeId ino, std::uint64_t index);
   void drop_dirty(InodeId ino, std::uint64_t first_index);
-  void truncate(Inode& file, std::uint64_t size);
+  void truncate(InodeAttrs& file, std::uint64_t size);
+  std::uint64_t node_limit() const;        // changed tree nodes before a checkpoint is due
+  std::uint64_t reserve_segments() const;  // what normal writes leave free
   void admit(std::uint64_t bytes);
   bool checkpoints_free_space() const;  // two checkpoints would free a segment
   std::uint64_t available_bytes() const;
   void maybe_commit();
   void commit();
   // A live record with exactly this content, confirmed by its full BLAKE3.
-  std::optional<ChunkRef> find_duplicate(const Blake3Hash& id, ByteView data);
+  // With its one reference (from its header) if it is not shared yet.
+  std::optional<std::pair<ChunkRef, std::optional<ChunkUser>>> find_duplicate(const Blake3Hash& id, ByteView data);
   void maybe_checkpoint();
   void checkpoint();
   SpaceStats space_stats_locked(bool by_codec);  // shared lock is enough
@@ -264,6 +281,11 @@ class Filesystem {
     // Not copied: cold files whose data in the victims is not cold yet. It
     // is recompressed instead (a tiering step), not copied first.
     std::vector<InodeId> cold_files;
+    std::vector<std::pair<NodeRef, NodeInfo>> nodes;  // tree nodes in the victims
+    // Victims whose scan stopped before their seal: a damaged record header
+    // hides the rest, so they are not collected (records there would be lost).
+    std::vector<GcVictim> blind;
+    bool empty() const { return items.empty() && nodes.empty() && blind.empty(); }
   };
   struct GcRead {
     std::optional<Record> record;  // the record to copy, intact
@@ -319,7 +341,7 @@ class Filesystem {
   };
   bool cold_enabled() const;
   // The file's data is cold now: its form if so.
-  std::optional<StorageForm> cold_now(const Inode& file, std::int64_t now_ns,
+  std::optional<StorageForm> cold_now(const InodeAttrs& file, std::int64_t now_ns,
                                       std::optional<std::int64_t> age_s) const;
   bool tier_eligible(const TierMember& m) const;  // still as planned
   void tier_begin_pass(std::int64_t now_ns, std::optional<std::int64_t> age_s);  // tier_mutex_, shared lock
@@ -337,12 +359,17 @@ class Filesystem {
   Options options_;
   bool read_only_;
   bool dedup_;
+  // One step of rebuilding the dedup index (about `items` tree items),
+  // taking the locks itself. False once it is complete.
+  bool dedup_step(std::size_t items);
+  std::optional<TreeKey> dedup_cursor_;  // where the rebuild goes on; nothing: complete
   std::uint64_t replayed_transactions_;
   std::uint64_t checkpoint_bytes_;
 
   mutable std::shared_mutex mutex_;  // metadata, write buffer, journal
   Metadata meta_;
   std::unique_ptr<Journal> journal_;
+  std::shared_ptr<LogNodeIO> node_io_;  // the tree's nodes in the log (writes go through journal_)
   ChunkCache cache_;
   std::unique_ptr<ThreadPool> pool_;
 
@@ -351,7 +378,7 @@ class Filesystem {
   std::uint64_t dirty_chunks_ = 0;
   std::vector<Op> pending_ops_;             // applied in memory, not yet in the log
   std::uint64_t pending_bytes_ = 0;         // their (approximate) encoded size
-  std::unordered_set<InodeId> dirty_inodes_;  // attributes to write at the next commit
+  std::unordered_map<InodeId, InodeAttrs> attrs_;  // changed attributes, written at the next commit
   bool failed_ = false;  // a write to the store failed; refuse further changes
   std::atomic<bool> errors_seen_{false};  // damage seen: set the superblock's errors flag
   std::atomic<std::uint64_t> read_errors_{0};
@@ -361,7 +388,8 @@ class Filesystem {
   std::int64_t last_commit_ns_ = 0;
   std::int64_t last_checkpoint_ns_ = 0;
   std::int64_t last_change_ns_ = 0;  // by a user of the filesystem (not GC)
-  bool in_gc_ = false;  // GC or tiering is changing the metadata (not a user's change)
+  bool in_gc_ = false;
+  bool gc_nodes_moved_ = false;  // tree nodes to be rewritten by the next checkpoint  // GC or tiering is changing the metadata (not a user's change)
   GcStats gc_stats_;
   std::uint64_t gc_emptied_ = 0;  // segments GC emptied since the last checkpoints
   std::uint64_t dedup_hits_ = 0;

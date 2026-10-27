@@ -56,12 +56,12 @@ std::string policy(Filesystem& fs, InodeId ino) {
   return std::string(v.begin(), v.end());
 }
 
-const Inode& inode(Filesystem& fs, InodeId ino) { return *FilesystemTestAccess::metadata(fs).find(ino); }
+std::map<std::uint64_t, ChunkRef> chunks(Filesystem& fs, InodeId ino) { return FilesystemTestAccess::chunks(fs, ino); }
 
 // The codec of the record behind a file's chunk.
 CodecId codec_of(Filesystem& fs, Store& store, InodeId ino, std::uint64_t index = 0) {
   const Metadata& m = FilesystemTestAccess::metadata(fs);
-  const ChunkRef& ref = inode(fs, ino).chunks.at(index);
+  const ChunkRef ref = chunks(fs, ino).at(index);
   std::uint64_t seg = m.segment_of(ref.offset);
   const Superblock& sb = fs.superblock();
   auto r = try_read_record_header(store, ref.offset, sb.segment_offset(seg) + sb.segment_size(), m.segments.at(seg).seq);
@@ -119,7 +119,7 @@ TEST(Policy, EachStoresNewDataItsWay) {
   // Cold: none and fast stay as they are.
   fs->recompress_cold(0);
   auto cold = [&](InodeId f) {
-    for (const auto& [index, ref] : inode(*fs, f).chunks) {
+    for (const auto& [index, ref] : chunks(*fs, f)) {
       if (!ref.cold) return false;
     }
     return true;
@@ -131,7 +131,7 @@ TEST(Policy, EachStoresNewDataItsWay) {
   EXPECT_TRUE(cold(plain));
   EXPECT_EQ(codec_of(*fs, *store, files["none"]), CodecId::none);
   EXPECT_EQ(codec_of(*fs, *store, files["fast"]), CodecId::lz4);
-  EXPECT_FALSE(inode(*fs, files["max"]).chunks.at(0).packed) << "each chunk on its own";
+  EXPECT_FALSE(chunks(*fs, files["max"]).at(0).packed) << "each chunk on its own";
 
   // Space by policy.
   SpaceStats s = fs->space_stats();
@@ -207,10 +207,10 @@ TEST(Policy, SmallFilesArePackedOnlyWithTheirOwnPolicy) {
     }
   }
   fs->sync();
-  for (InodeId f : files["none"]) EXPECT_FALSE(inode(*fs, f).chunks.at(0).packed);
+  for (InodeId f : files["none"]) EXPECT_FALSE(chunks(*fs, f).at(0).packed);
   std::set<std::uint64_t> fast, balanced;
-  for (InodeId f : files["fast"]) fast.insert(inode(*fs, f).chunks.at(0).offset);
-  for (InodeId f : files["balanced"]) balanced.insert(inode(*fs, f).chunks.at(0).offset);
+  for (InodeId f : files["fast"]) fast.insert(chunks(*fs, f).at(0).offset);
+  for (InodeId f : files["balanced"]) balanced.insert(chunks(*fs, f).at(0).offset);
   EXPECT_EQ(fast.size(), 1u);
   EXPECT_EQ(balanced.size(), 1u);
   EXPECT_NE(*fast.begin(), *balanced.begin());

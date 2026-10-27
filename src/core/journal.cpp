@@ -24,23 +24,50 @@ std::uint64_t record_size(std::size_t extra, std::size_t payload) {
 
 }  // namespace
 
+// ---- tree nodes ------------------------------------------------------------
+
+Bytes LogNodeIO::read(const NodeRef& ref, std::uint64_t seq) {
+  if (ref.offset < sb_.data_start) throw Error(Errc::corrupt, "tree node before the data area");
+  std::uint64_t index = (ref.offset - sb_.data_start) >> sb_.segment_shift;
+  if (index >= sb_.segment_count) throw Error(Errc::corrupt, "tree node beyond the store");
+  Record r = read_record(store_, ref.offset, sb_.segment_offset(index) + sb_.segment_size(), seq);
+  if (r.header.type != RecordType::tree_node || r.stored_size() != ref.stored_size) {
+    throw Error(Errc::corrupt, "not the tree node expected at byte " + std::to_string(ref.offset));
+  }
+  return decode_tree_node(r);
+}
+
+NodeRef LogNodeIO::write(ByteView encoded, const NodeInfo& info) {
+  if (!journal_) throw Error(Errc::invalid_argument, "tree node written on a read-only filesystem");
+  return journal_->append_node(encoded, info);
+}
+
+Metadata::Options metadata_options(const Superblock& sb, const BTree::Options& tree) {
+  Metadata::Options o;
+  o.shared_records = has_shared_records(sb);
+  o.cold_data = has_cold_data(sb);
+  o.tree = tree;
+  return o;
+}
+
 // ---- Journal ---------------------------------------------------------------
 
-Journal::Journal(Store& store, const Superblock& sb, Metadata& meta, std::uint64_t next_seq)
-    : store_(store), sb_(sb), meta_(meta), next_seq_(next_seq) {}
+Journal::Journal(Store& store, const Superblock& sb, std::map<std::uint64_t, SegmentUsage>& segments,
+                 std::uint64_t next_seq)
+    : store_(store), sb_(sb), segments_(segments), next_seq_(next_seq) {}
 
 void Journal::start() { open_segment(allocate(0)); }
 
-void Journal::resume(const LogPosition& end) {
+void Journal::resume(const LogPosition& end, std::uint64_t last_txid) {
   writer_.emplace(SegmentWriter::resume(store_, sb_, end.index, end.seq, end.offset));
   roll_over(0);
   flush();
   // Everything replayed is on disk and now part of the sealed log.
-  appended_txid_ = durable_txid_ = meta_.last_txid;
+  appended_txid_ = durable_txid_ = last_txid;
 }
 
 std::uint64_t Journal::free_segments() const {
-  std::uint64_t used = meta_.segments.size() + pending_free_.size();
+  std::uint64_t used = segments_.size() + pending_free_.size();
   return used >= sb_.segment_count ? 0 : sb_.segment_count - used;
 }
 
@@ -67,7 +94,7 @@ std::size_t Journal::max_transaction_payload() const {
 std::uint64_t Journal::allocate(std::uint64_t keep_free) {
   if (free_segments() <= keep_free) throw Error(Errc::no_space, "the filesystem is full");
   for (std::uint64_t i = 0; i < sb_.segment_count; ++i) {
-    if (!meta_.segments.contains(i) && !pending_free_.contains(i)) return i;
+    if (!segments_.contains(i) && !pending_free_.contains(i)) return i;
   }
   throw Error(Errc::no_space, "the filesystem is full");
 }
@@ -76,7 +103,7 @@ void Journal::open_segment(std::uint64_t index) {
   std::uint64_t seq = next_seq_++;
   if (writer_) writer_->write_buffered();
   writer_.emplace(store_, sb_, index, seq);
-  meta_.segments[index] = SegmentUsage{seq, 0};
+  segments_[index] = SegmentUsage{seq, 0};
 }
 
 void Journal::roll_over(std::uint64_t keep_free) {
@@ -122,14 +149,20 @@ ChunkRef Journal::append_chunk(const EncodedChunk& chunk, InodeId ino, std::uint
   return ref;
 }
 
-std::uint64_t Journal::append_copy(const Record& r, bool urgent) {
+std::uint64_t Journal::append_copy(const Record& r, bool urgent, const std::optional<ChunkUser>& owner) {
   if (r.header.type != RecordType::data_chunk) throw Error(Errc::invalid_argument, "not a data chunk");
   std::uint64_t size = r.stored_size();
   // What GC copies is freed again two checkpoints later; when space is
   // urgent it may use the part of the reserve kept for GC alone (the rest
   // stays for those checkpoints and the next mount).
   ensure_room(size, urgent ? gc_reserve_ : reserve_);
-  Bytes record = encode_record(RecordType::data_chunk, r.header.flags, writer_->seq(), r.extra, r.payload);
+  Bytes extra = r.extra;
+  if (owner) {
+    if (extra.size() < kDataChunkHeaderSize - kRecordHeaderSize) throw Error(Errc::invalid_argument, "short chunk header");
+    store_le(extra.data() + 16, owner->ino);  // inode, then file_offset (docs/format.md §6)
+    store_le(extra.data() + 24, owner->index << sb_.chunk_shift);
+  }
+  Bytes record = encode_record(RecordType::data_chunk, r.header.flags, writer_->seq(), extra, r.payload);
   std::uint64_t at = *writer_->append(record);
   bytes_since_checkpoint_ += size;
   return at;
@@ -164,8 +197,26 @@ LogPosition Journal::append_transaction(std::uint64_t txid, const std::vector<Op
   return append_record(RecordType::metadata_log, 0, ByteView(extra), out.buffer(), 0);
 }
 
-LogPosition Journal::append_checkpoint(const Metadata& meta) {
-  Bytes stream = meta.encode_checkpoint();
+NodeRef Journal::append_node(ByteView encoded, const NodeInfo& info) {
+  EncodedChunk c = encode_chunk(encoded, CodecId::zstd, 1);
+  std::uint64_t size = record_size(kTreeNodeExtraSize, c.payload.size());
+  ensure_room(size, 0);
+  Bytes record = encode_tree_node_record(writer_->seq(), c, info);
+  std::uint64_t at = *writer_->append(record);
+  bytes_since_checkpoint_ += size;
+  return {at, static_cast<std::uint32_t>(size)};
+}
+
+LogPosition Journal::append_checkpoint(Metadata& meta) {
+  meta.flush();  // the changed nodes first: the checkpoint names the new root
+  return append_checkpoint_stream(meta.encode_checkpoint(), meta.last_txid);
+}
+
+LogPosition Journal::append_legacy_checkpoint(const LegacyMetadata& meta) {
+  return append_checkpoint_stream(meta.encode_checkpoint(), meta.last_txid);
+}
+
+LogPosition Journal::append_checkpoint_stream(ByteView stream, std::uint64_t txid) {
   std::uint64_t hash = xxh3_64(stream);
   std::uint64_t overhead = record_size(kCheckpointExtraSize, 0) + kRecordAlignment;
   std::optional<LogPosition> first;
@@ -181,7 +232,7 @@ LogPosition Journal::append_checkpoint(const Metadata& meta) {
     }
     std::uint64_t n = std::min({left, kMaxCheckpointPart, room - overhead});
     std::uint8_t extra[kCheckpointExtraSize] = {};
-    store_le(extra, meta.last_txid);
+    store_le(extra, txid);
     store_le(extra + 8, part);
     store_le<std::uint32_t>(extra + 12, done + n == stream.size() ? checkpoint_flags::final_part : 0);
     store_le<std::uint64_t>(extra + 16, stream.size());
@@ -204,11 +255,11 @@ void Journal::flush() {
 
 void Journal::checkpoint_done(const LogPosition& start) {
   pending_free_.clear();
-  for (auto it = meta_.segments.begin(); it != meta_.segments.end();) {
+  for (auto it = segments_.begin(); it != segments_.end();) {
     const auto& [index, usage] = *it;
     if (usage.live_bytes == 0 && usage.seq < start.seq && index != writer_->index()) {
       pending_free_.insert(index);
-      it = meta_.segments.erase(it);
+      it = segments_.erase(it);
     } else {
       ++it;
     }
@@ -217,10 +268,10 @@ void Journal::checkpoint_done(const LogPosition& start) {
 }
 
 void Journal::release_after_mount(const LogPosition& start, std::uint64_t log_end_index) {
-  for (auto it = meta_.segments.begin(); it != meta_.segments.end();) {
+  for (auto it = segments_.begin(); it != segments_.end();) {
     const auto& [index, usage] = *it;
     if (usage.live_bytes == 0 && usage.seq < start.seq && index != log_end_index) {
-      it = meta_.segments.erase(it);
+      it = segments_.erase(it);
     } else {
       ++it;
     }
@@ -337,7 +388,8 @@ std::uint64_t claims_after(Store& store, const Superblock& sb, std::uint64_t ind
   return claim;
 }
 
-void add_visited(Metadata& meta, const LogReader& reader) {
+template <class Meta>
+void add_visited(Meta& meta, const LogReader& reader) {
   for (const auto& [index, seq] : reader.visited()) {
     auto [it, inserted] = meta.segments.try_emplace(index, SegmentUsage{seq, 0});
     if (inserted || it->second.seq == seq) continue;
@@ -353,7 +405,8 @@ void add_visited(Metadata& meta, const LogReader& reader) {
 
 }  // namespace
 
-ReplayResult replay(Store& store, const Superblock& sb, std::uint64_t stop_before_txid) {
+ReplayResult replay(Store& store, const Superblock& sb, std::uint64_t stop_before_txid,
+                    const BTree::Options& tree_options) {
   if (sb.checkpoint_offset == 0) {
     corrupt("no checkpoint (the filesystem was made by an older mkfs.nanoer)");
   }
@@ -394,53 +447,79 @@ ReplayResult replay(Store& store, const Superblock& sb, std::uint64_t stop_befor
     throw CheckpointError("log: checkpoint checksum mismatch");
   }
 
+  // A tree checkpoint (M6) names the root of the metadata; an older one
+  // holds all of it, and is converted in memory (read-only mounts, upgrade).
+  bool tree = Metadata::is_tree_checkpoint(stream);
+  if (tree != has_metadata_tree(sb)) {
+    throw CheckpointError("log: the checkpoint's format does not match the filesystem's features");
+  }
+  Metadata::Options options = metadata_options(sb, tree_options);
   std::optional<Metadata> snapshot;
+  std::optional<LegacyMetadata> legacy;
   try {
-    snapshot = Metadata::decode_checkpoint(stream, sb.data_start, sb.segment_shift,
-                                           has_shared_records(sb), has_cold_data(sb));
+    if (tree) {
+      snapshot.emplace(Metadata::decode_checkpoint(stream, sb.data_start, sb.segment_shift, options,
+                                                   std::make_shared<LogNodeIO>(store, sb)));
+    } else {
+      legacy.emplace(LegacyMetadata::decode_checkpoint(stream, sb.data_start, sb.segment_shift,
+                                                       has_shared_records(sb), has_cold_data(sb)));
+    }
   } catch (const Error& e) {
     throw CheckpointError(std::string("log: checkpoint cannot be decoded: ") + e.what());
   }
-  ReplayResult result{std::move(*snapshot), start, {}, max_seq, 0, 0, stream.size(), {}};
-  Metadata& meta = result.meta;
-  if (meta.last_txid != txid) throw CheckpointError("log: checkpoint transaction id mismatch");
+  std::uint64_t snapshot_txid = tree ? snapshot->last_txid : legacy->last_txid;
+  if (snapshot_txid != txid) throw CheckpointError("log: checkpoint transaction id mismatch");
   std::uint64_t checkpoint_log_bytes = reader.bytes();
 
   // The transactions after it.
+  std::uint64_t transactions = 0;
   std::optional<LogPosition> stopped;
-  while (std::optional<Record> r = reader.next()) {
-    switch (r->header.type) {
-      case RecordType::data_chunk:
-        break;  // referenced by transactions, not replayed on its own
-      case RecordType::checkpoint:
-        break;  // a later checkpoint the superblock never pointed to; its state follows anyway
-      case RecordType::metadata_log: {
-        if (r->extra.size() != kTransactionExtraSize) corrupt("bad transaction header");
-        std::uint64_t id = load_le<std::uint64_t>(r->extra.data());
-        std::uint32_t count = load_le<std::uint32_t>(r->extra.data() + 8);
-        if (id != meta.last_txid + 1) corrupt("transaction ids are not consecutive");
-        if (id >= stop_before_txid) {
-          stopped = LogPosition{reader.position().index, reader.position().seq, r->offset};
+  auto replay_into = [&](auto& meta) {
+    while (std::optional<Record> r = reader.next()) {
+      switch (r->header.type) {
+        case RecordType::data_chunk:
+          break;  // referenced by transactions, not replayed on its own
+        case RecordType::tree_node:
+        case RecordType::checkpoint:
+          break;  // a later checkpoint the superblock never pointed to; its state follows anyway
+        case RecordType::metadata_log: {
+          if (r->extra.size() != kTransactionExtraSize) corrupt("bad transaction header");
+          std::uint64_t id = load_le<std::uint64_t>(r->extra.data());
+          std::uint32_t count = load_le<std::uint32_t>(r->extra.data() + 8);
+          if (id != meta.last_txid + 1) corrupt("transaction ids are not consecutive");
+          if (id >= stop_before_txid) {
+            stopped = LogPosition{reader.position().index, reader.position().seq, r->offset};
+            break;
+          }
+          add_visited(meta, reader);  // before applying: chunks may live in new segments
+          try {
+            Decoder in(r->payload);
+            for (std::uint32_t i = 0; i < count; ++i) meta.apply(decode_op(in));
+            if (!in.done()) corrupt("trailing bytes in a transaction");
+          } catch (const Error& e) {
+            throw ReplayError(id, "transaction " + std::to_string(id) + ": " + e.what());
+          }
+          meta.last_txid = id;
+          ++transactions;
           break;
         }
-        add_visited(meta, reader);  // before applying: chunks may live in new segments
-        try {
-          Decoder in(r->payload);
-          for (std::uint32_t i = 0; i < count; ++i) meta.apply(decode_op(in));
-          if (!in.done()) corrupt("trailing bytes in a transaction");
-        } catch (const Error& e) {
-          throw ReplayError(id, "transaction " + std::to_string(id) + ": " + e.what());
-        }
-        meta.last_txid = id;
-        ++result.transactions;
-        break;
+        default:
+          corrupt("unknown record type " + std::to_string(static_cast<int>(r->header.type)));
       }
-      default:
-        corrupt("unknown record type " + std::to_string(static_cast<int>(r->header.type)));
+      if (stopped) break;
     }
-    if (stopped) break;
+    add_visited(meta, reader);
+  };
+  if (tree) {
+    replay_into(*snapshot);
+  } else {
+    replay_into(*legacy);
+    Metadata::Options mem = options;
+    mem.account_nodes = false;
+    snapshot.emplace(Metadata::from_legacy(*legacy, mem, std::make_shared<MemNodeIO>()));
   }
-  add_visited(meta, reader);
+  ReplayResult result{std::move(*snapshot), std::move(legacy), start, {}, max_seq, transactions, 0, stream.size(), {}};
+  Metadata& meta = result.meta;
   result.end = stopped ? *stopped : reader.position();
   result.log_bytes = reader.bytes() - checkpoint_log_bytes;
 

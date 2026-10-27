@@ -14,7 +14,9 @@ add_library(nanoer_core STATIC
   core/tier.cpp
   core/io.cpp
   core/journal.cpp
+  core/legacy_metadata.cpp
   core/metadata.cpp
+  core/ops.cpp
   core/mkfs.cpp
   core/record.cpp
   core/segment.cpp

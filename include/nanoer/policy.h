@@ -26,8 +26,10 @@ std::string_view policy_name(Policy policy);
 // Exactly one of the names above; anything else is not a policy.
 std::optional<Policy> parse_policy(std::string_view value);
 
+class Metadata;
+
 // The file's own attribute, or the default.
-Policy policy_of(const Inode& inode);
+Policy policy_of(const Metadata& meta, InodeId ino);
 
 struct StorageForm {
   CodecId codec;

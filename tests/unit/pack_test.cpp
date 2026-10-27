@@ -60,7 +60,7 @@ Bytes read_all(Filesystem& fs, InodeId ino) {
 }
 
 const ChunkRef& ref_of(Filesystem& fs, InodeId ino) {
-  return FilesystemTestAccess::metadata(fs).find(ino)->chunks.at(0);
+  return FilesystemTestAccess::chunks(fs, ino).at(0);
 }
 
 }  // namespace

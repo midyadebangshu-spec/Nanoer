@@ -88,7 +88,7 @@ Files fragment(Filesystem& fs, std::mt19937_64& rng, int files, std::uint64_t si
 }  // namespace
 
 TEST(GcPolicy, GreedyTakesTheEmptiestCostBenefitTheOldest) {
-  Metadata m(kDataStart, 20);
+  Metadata m(kDataStart, 20, {}, std::make_shared<MemNodeIO>());
   m.segments[0] = {1, 300};  // old, a little fuller
   m.segments[1] = {9, 200};  // young, emptier
   m.segments[2] = {5, 0};    // empty: nothing to copy

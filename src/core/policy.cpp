@@ -1,5 +1,7 @@
 #include "nanoer/policy.h"
 
+#include "nanoer/metadata.h"
+
 #include <algorithm>
 #include <cstdint>
 
@@ -27,10 +29,10 @@ std::optional<Policy> parse_policy(std::string_view value) {
   return std::nullopt;
 }
 
-Policy policy_of(const Inode& inode) {
-  auto it = inode.xattrs.find(kPolicyXattr);
-  if (it == inode.xattrs.end()) return Policy::balanced;
-  std::string_view value(reinterpret_cast<const char*>(it->second.data()), it->second.size());
+Policy policy_of(const Metadata& meta, InodeId ino) {
+  std::optional<Bytes> v = meta.xattr(ino, kPolicyXattr);
+  if (!v) return Policy::balanced;
+  std::string_view value(reinterpret_cast<const char*>(v->data()), v->size());
   return parse_policy(value).value_or(Policy::balanced);
 }
 

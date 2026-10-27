@@ -16,8 +16,10 @@ TEST(Mkfs, DefaultGeometry) {
   EXPECT_EQ(sb.chunk_size(), 128u << 10);
   EXPECT_EQ(sb.default_codec, CodecId::zstd);
   EXPECT_EQ(sb.default_level, 1);
-  // The initial checkpoint sits at the start of segment 0, the first segment.
-  EXPECT_EQ(sb.checkpoint_offset, kDataStart + kSegmentHeaderSize);
+  // The initial checkpoint sits in segment 0, the first segment, right
+  // after the metadata tree's root node.
+  EXPECT_GT(sb.checkpoint_offset, kDataStart + kSegmentHeaderSize);
+  EXPECT_LT(sb.checkpoint_offset, kDataStart + kSegmentHeaderSize + 4096);
   EXPECT_EQ(sb.checkpoint_seq, 1u);
   EXPECT_EQ(sb.next_segment_seq, 2u);
   ASSERT_TRUE(read_segment_header(store, sb, 0));

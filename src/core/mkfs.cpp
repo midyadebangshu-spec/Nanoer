@@ -3,6 +3,7 @@
 #include "nanoer/error.h"
 #include "nanoer/io.h"
 #include "nanoer/journal.h"
+#include "nanoer/legacy_metadata.h"
 #include "nanoer/metadata.h"
 
 namespace nanoer {
@@ -57,17 +58,33 @@ Superblock make_filesystem(Store& store, const FormatOptions& options) {
   // always has a starting point.
   if (options.shared_records) sb.features_incompat |= incompat_features::shared_records;
   if (options.shared_records && options.cold_data) sb.features_incompat |= incompat_features::cold_data;
+  if (options.metadata_tree) sb.features_incompat |= incompat_features::metadata_tree;
   if (!options.dedup) sb.features_compat |= compat_features::no_dedup;
-  Metadata meta = Metadata::empty(sb.data_start, sb.segment_shift, options.root_uid,
-                                  options.root_gid, static_cast<std::int64_t>(sb.created_ns),
-                                  options.shared_records, has_cold_data(sb));
-  Journal journal(store, sb, meta, sb.next_segment_seq);
-  journal.start();
-  LogPosition checkpoint = journal.append_checkpoint(meta);
-  journal.flush();
+  LogPosition checkpoint;
+  std::uint64_t next_seq = 0;
+  if (options.metadata_tree) {
+    auto io = std::make_shared<LogNodeIO>(store, sb);
+    Metadata meta = Metadata::empty(sb.data_start, sb.segment_shift, metadata_options(sb), io, options.root_uid,
+                                    options.root_gid, static_cast<std::int64_t>(sb.created_ns));
+    Journal journal(store, sb, meta.segments, sb.next_segment_seq);
+    io->set_journal(&journal);
+    journal.start();
+    checkpoint = journal.append_checkpoint(meta);
+    journal.flush();
+    next_seq = journal.next_seq();
+  } else {
+    LegacyMetadata meta = LegacyMetadata::empty(sb.data_start, sb.segment_shift, options.root_uid, options.root_gid,
+                                                static_cast<std::int64_t>(sb.created_ns), options.shared_records,
+                                                has_cold_data(sb));
+    Journal journal(store, sb, meta.segments, sb.next_segment_seq);
+    journal.start();
+    checkpoint = journal.append_legacy_checkpoint(meta);
+    journal.flush();
+    next_seq = journal.next_seq();
+  }
   sb.checkpoint_offset = checkpoint.offset;
   sb.checkpoint_seq = checkpoint.seq;
-  sb.next_segment_seq = journal.next_seq();
+  sb.next_segment_seq = next_seq;
 
   // Fill both superblock slots (generations 1 and 2), so the store never
   // has an empty slot that could be mistaken for damage.

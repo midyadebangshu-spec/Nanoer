@@ -90,6 +90,9 @@ class BTree {
   std::uint64_t dirty_bytes() const { return dirty_bytes_; }  // encoded size of the dirty nodes, roughly
   std::uint64_t items() const;  // walks the tree: for tests and fsck
   unsigned height() const;      // 1: the root is a leaf
+  // Every node on disk whose space the tree holds: those it uses, and those
+  // replaced since the last flush (released by the next one). For fsck.
+  void for_each_node(const std::function<void(const NodeRef&)>& fn) const;
 
   // GC: whether the node at `ref`, described by `info`, is part of the tree
   // (as of the last flush); if so, marks it and its parents dirty, so that
@@ -135,6 +138,7 @@ class BTree {
   void rebalance(Node& parent, std::size_t i);
   NodeRef write(Node& node);
   std::uint64_t count(const Node& node) const;
+  void visit(const Node& node, const NodeRef* ref, const std::function<void(const NodeRef&)>& fn) const;
 
   NodeStore& store_;
   Options options_;

@@ -507,6 +507,27 @@ std::uint64_t BTree::items() const {
   return root_ref_ ? count(*load(root_ref_)) : 0;
 }
 
+void BTree::visit(const Node& node, const NodeRef* ref, const std::function<void(const NodeRef&)>& fn) const {
+  if (ref) fn(*ref);
+  if (node.origin) fn(node.origin);
+  for (const Node::Child& c : node.children) {
+    if (c.dirty) {
+      visit(*c.dirty, nullptr, fn);
+    } else {
+      visit(*load(c.ref), &c.ref, fn);
+    }
+  }
+}
+
+void BTree::for_each_node(const std::function<void(const NodeRef&)>& fn) const {
+  if (root_) {
+    visit(*root_, nullptr, fn);
+  } else if (root_ref_) {
+    visit(*load(root_ref_), &root_ref_, fn);
+  }
+  for (const NodeRef& r : released_) fn(r);
+}
+
 unsigned BTree::height() const {
   const Node* node = root_.get();
   ConstNodePtr hold;

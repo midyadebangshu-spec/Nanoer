@@ -17,6 +17,7 @@
 #include "nanoer/format.h"
 #include "nanoer/io.h"
 #include "nanoer/journal.h"
+#include "nanoer/legacy_metadata.h"
 #include "nanoer/metadata.h"
 #include "nanoer/record.h"
 #include "nanoer/segment.h"
@@ -34,6 +35,9 @@ namespace {
 std::string range(std::uint64_t first, std::uint64_t length) {
   return "bytes " + std::to_string(first) + "-" + std::to_string(first + length - 1);
 }
+
+// fsck checks the whole filesystem at once: its metadata, in memory.
+LegacyMetadata materialize(const ReplayResult& r) { return r.legacy ? *r.legacy : r.meta.to_legacy(); }
 
 const char* kind(const Inode& i) {
   if (i.is_dir()) return "directory";
@@ -101,7 +105,8 @@ void rescue_superblocks(Store& store, FsckReport& report, const std::optional<Su
   // Every checkpoint's first part, newest first.
   struct Candidate {
     std::uint64_t txid, offset, seq;
-    bool shared_records;  // its snapshot says which encoding, so which feature
+    bool shared_records;  // its snapshot says which encoding, so which features
+    bool tree;
   };
   std::vector<Candidate> candidates;
   std::uint64_t max_seq = 0;
@@ -112,8 +117,9 @@ void rescue_superblocks(Store& store, FsckReport& report, const std::optional<Su
     while (auto r = scan.next()) {
       if (r->header.type == RecordType::checkpoint && r->extra.size() == kCheckpointExtraSize &&
           load_le<std::uint32_t>(r->extra.data() + 8) == 0) {
+        bool tree = Metadata::is_tree_checkpoint(r->payload);
         candidates.push_back({load_le<std::uint64_t>(r->extra.data()), r->offset, scan.header().seq,
-                              Metadata::is_v2_checkpoint(r->payload)});
+                              tree || LegacyMetadata::is_v2_checkpoint(r->payload), tree});
       }
     }
   }
@@ -125,25 +131,26 @@ void rescue_superblocks(Store& store, FsckReport& report, const std::optional<Su
     sb.next_segment_seq = max_seq + 1;
     if (!known) {
       // What this version writes: a version 2 checkpoint may be followed by
-      // cold references.
+      // cold references; a version 3 one is the metadata tree's.
       sb.features_incompat =
           c.shared_records ? incompat_features::shared_records | incompat_features::cold_data : 0;
+      if (c.tree) sb.features_incompat |= incompat_features::metadata_tree;
     }
     try {
-      ReplayResult r = replay(store, sb);
+      LegacyMetadata meta = materialize(replay(store, sb));
       // The chunk size: any chunk past the first tells it exactly.
       // Else a chunk followed by another is at most a chunk long, and
       // usually exactly one.
       std::uint64_t chunk = 0, largest = 0, inner = 0;
-      for (const auto& [id, inode] : r.meta.inodes) {
+      for (const auto& [id, inode] : meta.inodes) {
         for (const auto& [index, ref] : inode.chunks) {
           largest = std::max<std::uint64_t>(largest, ref.size);
           if (index != inode.chunks.rbegin()->first) inner = std::max<std::uint64_t>(inner, ref.size);
           // (Not a pack's piece, and not data another file wrote first.)
           if (index == 0 || chunk || ref.packed) continue;
-          std::uint64_t seg = r.meta.segment_of(ref.offset);
-          auto usage = r.meta.segments.find(seg);
-          if (usage == r.meta.segments.end()) continue;
+          std::uint64_t seg = meta.segment_of(ref.offset);
+          auto usage = meta.segments.find(seg);
+          if (usage == meta.segments.end()) continue;
           auto h = try_read_record_header(store, ref.offset, sb.segment_offset(seg) + sb.segment_size(),
                                           usage->second.seq);
           if (h && h->header.type == RecordType::data_chunk) {
@@ -286,7 +293,17 @@ class Checker {
                              std::to_string(replayed_->meta.last_txid));
       new_checkpoint_ = true;
     }
-    meta_ = replayed_->meta;
+    try {
+      meta_ = materialize(*replayed_);
+      // The tree's nodes hold space too.
+      replayed_->meta.tree().for_each_node([&](const NodeRef& ref) {
+        node_live_[replayed_->meta.segment_of(ref.offset)] += ref.stored_size;
+      });
+    } catch (const Error& e) {
+      if (e.code() != Errc::corrupt) throw;
+      error(std::string("the metadata tree is damaged: ") + e.what());
+      meta_.reset();
+    }
   }
 
   ReplayResult replay_carefully(const Superblock& sb) {
@@ -532,9 +549,11 @@ class Checker {
     std::unordered_map<std::uint64_t, std::uint32_t> counts;
     std::map<std::uint64_t, std::uint64_t> live;
     for (const auto& [offset, u] : uses) {
-      if (u.ref.packed || u.count > 1) counts.emplace(offset, u.count);
+      // (A record once shared keeps its refs item down to one reference.)
+      if (u.ref.packed || u.count > 1 || meta_->shared.contains(offset)) counts.emplace(offset, u.count);
       live[meta_->segment_of(offset)] += u.ref.stored_size * (meta_->shared_records() ? 1 : u.count);
     }
+    for (const auto& [index, bytes] : node_live_) live[index] += bytes;
     bool counts_wrong = meta_->shared_records() && counts != meta_->shared;
     bool space_wrong = false;
     for (auto& [index, usage] : meta_->segments) {
@@ -548,6 +567,7 @@ class Checker {
       if (meta_->shared_records()) meta_->shared = counts;
       for (auto& [index, usage] : meta_->segments) usage.live_bytes = live.contains(index) ? live[index] : 0;
     }
+    // (repair() writes the tree again, so the nodes' space is counted then.)
     for (const Bad& b : bad) fix(op::RemoveChunk{b.ino, b.index});
   }
 
@@ -643,22 +663,28 @@ class Checker {
     }
     for (auto& [index, usage] : meta_->segments) usage.live_bytes = live[index];
     if (meta_->shared_records()) {
-      meta_->shared.clear();
+      std::unordered_map<std::uint64_t, std::uint32_t> old;
+      old.swap(meta_->shared);
       for (const auto& [offset, u] : uses) {
-        if (u.first.packed || u.second > 1) meta_->shared.emplace(offset, u.second);
+        if (u.first.packed || u.second > 1 || old.contains(offset)) meta_->shared.emplace(offset, u.second);
       }
     }
 
     std::uint64_t next_seq = std::max(sb_.next_segment_seq, replayed_->max_seq + 1);
-    Journal journal(store_, sb_, *meta_, next_seq);
-    journal.resume(replayed_->end);
-    if (!fixes_.empty()) {
-      std::uint64_t txid = meta_->last_txid + 1;
-      journal.append_transaction(txid, fixes_);
-      meta_->last_txid = txid;
-    }
+    const std::uint64_t replayed_txid = meta_->last_txid;
+    if (!fixes_.empty()) ++meta_->last_txid;
+    // A filesystem with the metadata tree gets a new tree with everything
+    // (nodes are written by the checkpoint); an older one a full snapshot,
+    // as before.
+    std::optional<Metadata> tree;
+    auto io = std::make_shared<LogNodeIO>(store_, sb_);
+    if (has_metadata_tree(sb_)) tree = Metadata::from_legacy(*meta_, metadata_options(sb_), io);
+    Journal journal(store_, sb_, tree ? tree->segments : meta_->segments, next_seq);
+    io->set_journal(&journal);
+    journal.resume(replayed_->end, replayed_txid);
+    if (!fixes_.empty()) journal.append_transaction(meta_->last_txid, fixes_);
     journal.flush();
-    LogPosition at = journal.append_checkpoint(*meta_);
+    LogPosition at = tree ? journal.append_checkpoint(*tree) : journal.append_legacy_checkpoint(*meta_);
     journal.flush();
     sb_.checkpoint_offset = at.offset;
     sb_.checkpoint_seq = at.seq;
@@ -680,7 +706,8 @@ class Checker {
   std::optional<LoadedSuperblock> loaded_;
   Superblock sb_;
   std::optional<ReplayResult> replayed_;
-  std::optional<Metadata> meta_;
+  std::optional<LegacyMetadata> meta_;
+  std::map<std::uint64_t, std::uint64_t> node_live_;  // segment -> bytes of tree nodes in it
   std::vector<Op> fixes_;
   std::unordered_map<InodeId, std::string> paths_;
   std::optional<InodeId> lost_found_;

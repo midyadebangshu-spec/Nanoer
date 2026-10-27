@@ -39,6 +39,7 @@ static_assert(kPackSize <= 65536);
 // live data out of a victim, and write the checkpoints that free it, even
 // when the filesystem is full.
 constexpr std::uint64_t kGcHeadroomSegments = 2;
+constexpr std::uint64_t kMaxDirtyNodeBytes = 32 << 20;
 
 std::int64_t now() { return static_cast<std::int64_t>(now_ns()); }
 
@@ -87,13 +88,14 @@ std::unique_ptr<Filesystem> Filesystem::mount(Store& store, const Options& optio
   bool contradiction = false;
   // A transaction that cannot be applied is damage too: use the state
   // before it, read-only.
+  const BTree::Options tree{.cache_bytes = options.metadata_cache};
   auto careful = [&](const Superblock& from) {
     try {
-      return replay(store, from);
+      return replay(store, from, UINT64_MAX, tree);
     } catch (const ReplayError& e) {
       std::fprintf(stderr, "nanoer: the log contradicts itself (%s)\n", e.what());
       contradiction = true;
-      return replay(store, from, e.txid());
+      return replay(store, from, e.txid(), tree);
     }
   };
   try {
@@ -107,6 +109,11 @@ std::unique_ptr<Filesystem> Filesystem::mount(Store& store, const Options& optio
     sb = *loaded.older;
     replayed = careful(sb);
     fell_back = true;
+  }
+  if (replayed->legacy && !read_only) {
+    std::fprintf(stderr, "nanoer: this filesystem was made before metadata moved to disk (M6); mounting "
+                         "read-only. Run nanoer upgrade to write to it.\n");
+    read_only = true;
   }
   LogDamage damage = replayed->damage;
   if (contradiction) damage = {true, replayed->end.offset, replayed->meta.last_txid + 1};
@@ -127,12 +134,16 @@ std::unique_ptr<Filesystem> Filesystem::mount(Store& store, const Options& optio
   std::uint64_t next_seq = std::max(sb.next_segment_seq, replayed->max_seq + 1);
   std::unique_ptr<Filesystem> fs(new Filesystem(store, sb, std::move(*replayed), options, read_only));
   fs->damage_ = damage;
+  fs->meta_.dedup.set_limit(options.dedup_memory);
+  if (fs->dedup_ && !fs->meta_.dedup_complete) fs->dedup_cursor_ = TreeKey{};
   fs->checkpoint_fallback_ = fell_back;
   if (fell_back || damage.found) fs->errors_seen_ = true;
 
   if (!fs->read_only_) {
     std::unique_lock lock(fs->mutex_);
-    fs->journal_ = std::make_unique<Journal>(store, fs->sb_, fs->meta_, next_seq);
+    fs->journal_ = std::make_unique<Journal>(store, fs->sb_, fs->meta_.segments, next_seq);
+    fs->node_io_ = std::dynamic_pointer_cast<LogNodeIO>(fs->meta_.io());
+    if (fs->node_io_) fs->node_io_->set_journal(fs->journal_.get());
     // Segments the mounted checkpoint no longer needs are kept until the
     // next checkpoint, so the previous checkpoint stays usable if this one
     // is damaged later. Only a filesystem too full to write frees them now.
@@ -157,14 +168,10 @@ std::unique_ptr<Filesystem> Filesystem::mount(Store& store, const Options& optio
   } guard{fs.get()};
   if (!fs->read_only_) {
     std::unique_lock lock(fs->mutex_);
-    fs->journal_->resume(end);
-    fs->journal_->set_reserve(kMinReserveSegments + kGcHeadroomSegments, kGcHeadroomSegments);
+    fs->journal_->resume(end, fs->meta_.last_txid);
+    fs->journal_->set_reserve(fs->reserve_segments(), kGcHeadroomSegments);
     // Files deleted while still open when the system went down.
-    std::vector<InodeId> orphans;
-    for (const auto& [id, inode] : fs->meta_.inodes) {
-      if (inode.nlink == 0 && id != kRootInode) orphans.push_back(id);
-    }
-    for (InodeId id : orphans) fs->maybe_free(id);
+    for (InodeId id : fs->orphans()) fs->maybe_free(id);
     fs->commit();
   }
   if (options.start_threads) fs->start();
@@ -181,6 +188,39 @@ void Filesystem::start() {
   }
   if (!background_.joinable() && !read_only_ && options_.commit_interval_s > 0) {
     background_ = std::thread([this] { background(); });
+  }
+}
+
+bool Filesystem::dedup_step(std::size_t items) {
+  struct Found {
+    InodeId ino;
+    std::uint64_t index;
+    ChunkRef ref;
+  };
+  std::vector<Found> found;
+  TreeKey from;
+  std::optional<TreeKey> next;
+  {
+    std::shared_lock lock(mutex_);
+    if (!dedup_cursor_) return false;
+    from = *dedup_cursor_;
+    next = meta_.chunks_from(from, items, [&](InodeId ino, std::uint64_t index, const ChunkRef& ref) {
+      if (ref.hash) found.push_back({ino, index, ref});
+    });
+  }
+  std::unique_lock lock(mutex_);
+  if (dedup_cursor_ != from) return dedup_cursor_.has_value();  // another step went first
+  // Only what is still there (the lock was let go in between).
+  for (const Found& f : found) {
+    if (meta_.chunk(f.ino, f.index) == f.ref) meta_.dedup.put(f.ref.hash, {f.ref.offset, f.ref.packed, f.ref.piece});
+  }
+  dedup_cursor_ = next;
+  if (!next) meta_.dedup_complete = true;
+  return next.has_value();
+}
+
+void Filesystem::rebuild_dedup() {
+  while (dedup_step(4096)) {
   }
 }
 
@@ -212,6 +252,14 @@ void Filesystem::background() {
       log_error("background commit failed", e);
     }
     try {
+      // A slice of the dedup rebuild at a time, so commits are not held up.
+      std::int64_t until = now() + 200'000'000;
+      while (dedup_step(4096) && now() < until) {
+      }
+    } catch (const std::exception& e) {
+      log_error("rebuilding the dedup index failed", e);
+    }
+    try {
       background_tier();
     } catch (const std::exception& e) {
       log_error("recompressing cold data failed", e);
@@ -237,11 +285,7 @@ void Filesystem::unmount() {
     lookups_.clear();
     opens_.clear();
   }
-  std::vector<InodeId> orphans;
-  for (const auto& [id, inode] : meta_.inodes) {
-    if (inode.nlink == 0 && id != kRootInode) orphans.push_back(id);
-  }
-  for (InodeId id : orphans) maybe_free(id);
+  for (InodeId id : orphans()) maybe_free(id);
   commit();
   checkpoint();
 }
@@ -262,16 +306,38 @@ Filesystem::~Filesystem() {
 
 // ---- helpers ---------------------------------------------------------------
 
-Inode& Filesystem::inode(InodeId ino) {
-  Inode* i = meta_.find(ino);
-  if (!i) throw_posix(ENOENT);
-  return *i;
+std::optional<InodeAttrs> Filesystem::find(InodeId ino) const {
+  if (auto it = attrs_.find(ino); it != attrs_.end()) return it->second;
+  return meta_.attrs(ino);
 }
 
-Inode& Filesystem::directory(InodeId ino) {
-  Inode& d = inode(ino);
-  if (!d.is_dir()) throw_posix(ENOTDIR);
-  return d;
+InodeAttrs Filesystem::get(InodeId ino) const {
+  std::optional<InodeAttrs> a = find(ino);
+  if (!a) throw_posix(ENOENT);
+  return *a;
+}
+
+InodeAttrs Filesystem::get_dir(InodeId ino) const {
+  InodeAttrs a = get(ino);
+  if (!a.is_dir()) throw_posix(ENOTDIR);
+  return a;
+}
+
+InodeAttrs& Filesystem::edit(InodeId ino) {
+  auto it = attrs_.find(ino);
+  if (it == attrs_.end()) {
+    std::optional<InodeAttrs> a = meta_.attrs(ino);
+    if (!a) throw_posix(ENOENT);
+    it = attrs_.emplace(ino, *a).first;
+    pending_bytes_ += kAttrOpBytes;
+  }
+  last_change_ns_ = now();
+  return it->second;
+}
+
+InodeAttrs& Filesystem::edit_dir(InodeId ino) {
+  if (!get(ino).is_dir()) throw_posix(ENOTDIR);
+  return edit(ino);
 }
 
 void Filesystem::check_writable() const {
@@ -288,16 +354,10 @@ void Filesystem::record(Op op) {
   pending_ops_.push_back(std::move(op));
 }
 
-void Filesystem::mark(InodeId ino) {
-  last_change_ns_ = now();
-  if (dirty_inodes_.insert(ino).second) pending_bytes_ += kAttrOpBytes;
-}
-
-void Filesystem::touch(Inode& i, bool content) {
+void Filesystem::touch(InodeAttrs& i, bool content) {
   std::int64_t t = now();
   i.ctime_ns = t;
   if (content) i.mtime_ns = t;
-  mark(i.id);
 }
 
 void Filesystem::count_lookup(InodeId ino) {
@@ -308,35 +368,44 @@ void Filesystem::count_lookup(InodeId ino) {
 
 void Filesystem::maybe_free(InodeId ino) {
   if (read_only_ || ino == kRootInode) return;
-  Inode* i = meta_.find(ino);
+  std::optional<InodeAttrs> i = find(ino);
   if (!i || i->nlink != 0) return;
   {
     std::lock_guard lock(counts_mutex_);
     if (lookups_.contains(ino) || opens_.contains(ino)) return;
   }
   drop_dirty(ino, 0);
-  dirty_inodes_.erase(ino);
+  attrs_.erase(ino);
   record(op::DeleteInode{ino});
+}
+
+std::vector<InodeId> Filesystem::orphans() const {
+  std::vector<InodeId> out = meta_.orphans();
+  for (const auto& [id, a] : attrs_) {
+    if (a.nlink == 0 && id != kRootInode && std::find(out.begin(), out.end(), id) == out.end()) out.push_back(id);
+  }
+  return out;
 }
 
 bool Filesystem::is_ancestor(InodeId ancestor, InodeId dir) const {
   for (InodeId at = dir;;) {
     if (at == ancestor) return true;
     if (at == kRootInode) return false;
-    const Inode* i = meta_.find(at);
+    std::optional<InodeAttrs> i = find(at);
     if (!i) return false;
     at = i->parent;
   }
 }
 
-Attr Filesystem::make_attr(const Inode& i) const {
+Attr Filesystem::make_attr(const InodeAttrs& i) const {
   Attr a;
   a.ino = i.id;
   a.mode = i.mode;
   a.nlink = i.nlink;
   a.uid = i.uid;
   a.gid = i.gid;
-  a.size = i.is_dir() ? i.entries.size() : i.size;
+  InodeCounts counts = meta_.counts(i.id);
+  a.size = i.is_dir() ? counts.entries : i.size;
   a.rdev = i.rdev;
   a.blksize = sb_.chunk_size();
   a.atime_ns = i.atime_ns;
@@ -344,11 +413,10 @@ Attr Filesystem::make_attr(const Inode& i) const {
   a.ctime_ns = i.ctime_ns;
   a.btime_ns = i.btime_ns;
   if (i.is_regular()) {
-    std::uint64_t bytes = 0;
-    for (const auto& [index, ref] : i.chunks) bytes += ref.size;
+    std::uint64_t bytes = counts.data_bytes;
     if (auto it = dirty_.find(i.id); it != dirty_.end()) {
       for (const auto& [index, data] : it->second) {
-        if (!i.chunks.contains(index)) bytes += data.size();
+        if (!meta_.chunk(i.id, index)) bytes += data.size();
       }
     }
     a.blocks = (bytes + 511) / 512;
@@ -373,17 +441,22 @@ std::shared_ptr<const Bytes> Filesystem::read_chunk(const ChunkRef& ref) {
   return std::make_shared<const Bytes>(data->begin() + ref.piece, data->begin() + ref.piece + ref.size);
 }
 
-Bytes Filesystem::load_chunk(const Inode& file, std::uint64_t index) {
-  auto it = file.chunks.find(index);
-  if (it == file.chunks.end()) return {};
-  return *read_chunk(it->second);
+Bytes Filesystem::load_chunk(InodeId ino, std::uint64_t index) {
+  std::optional<ChunkRef> ref = meta_.chunk(ino, index);
+  if (!ref) return {};
+  return *read_chunk(*ref);
 }
 
-Bytes& Filesystem::dirty_chunk(Inode& file, std::uint64_t index) {
-  auto& chunks = dirty_[file.id];
+bool Filesystem::has_data(InodeId ino, std::uint64_t index) const {
+  if (auto it = dirty_.find(ino); it != dirty_.end() && it->second.contains(index)) return true;
+  return meta_.chunk(ino, index).has_value();
+}
+
+Bytes& Filesystem::dirty_chunk(InodeId ino, std::uint64_t index) {
+  auto& chunks = dirty_[ino];
   auto it = chunks.find(index);
   if (it == chunks.end()) {
-    it = chunks.emplace(index, load_chunk(file, index)).first;
+    it = chunks.emplace(index, load_chunk(ino, index)).first;
     ++dirty_chunks_;
   }
   return it->second;
@@ -399,24 +472,20 @@ void Filesystem::drop_dirty(InodeId ino, std::uint64_t first_index) {
   if (chunks.empty()) dirty_.erase(it);
 }
 
-void Filesystem::truncate(Inode& file, std::uint64_t size) {
+void Filesystem::truncate(InodeAttrs& file, std::uint64_t size) {
   if (size > kMaxFileSize) throw_posix(EFBIG);
   if (size == file.size) return;
   const std::uint64_t cs = sb_.chunk_size();
   if (size < file.size) {
     std::uint64_t first_gone = (size + cs - 1) / cs;
-    if (file.chunks.lower_bound(first_gone) != file.chunks.end()) {
-      record(op::TruncateChunks{file.id, first_gone});
-    }
+    if (meta_.has_chunk_from(file.id, first_gone)) record(op::TruncateChunks{file.id, first_gone});
     drop_dirty(file.id, first_gone);
     // The chunk the new end falls in keeps bytes past it; rewrite it trimmed,
     // so they cannot reappear if the file grows again.
     if (size % cs != 0) {
       std::uint64_t last = size / cs;
-      bool has_data = file.chunks.contains(last) ||
-                      (dirty_.contains(file.id) && dirty_[file.id].contains(last));
-      if (has_data) {
-        Bytes& data = dirty_chunk(file, last);
+      if (has_data(file.id, last)) {
+        Bytes& data = dirty_chunk(file.id, last);
         if (data.size() > size - last * cs) data.resize(size - last * cs);
       }
     }
@@ -469,7 +538,7 @@ void Filesystem::admit(std::uint64_t bytes) {
 }
 
 bool Filesystem::checkpoints_free_space() const {
-  if (journal_->pending_free_segments() > 0) return true;
+  if (journal_->pending_free_segments() > 0 || gc_nodes_moved_) return true;
   for (const auto& [index, usage] : meta_.segments) {
     if (usage.live_bytes == 0 && index != journal_->current_index()) return true;
   }
@@ -487,7 +556,7 @@ void Filesystem::maybe_commit() {
 
 void Filesystem::commit() {
   if (read_only_ || failed_ || !journal_) return;
-  if (dirty_.empty() && pending_ops_.empty() && dirty_inodes_.empty()) return;
+  if (dirty_.empty() && pending_ops_.empty() && attrs_.empty()) return;
   try {
     struct Job {
       InodeId ino;
@@ -497,6 +566,7 @@ void Filesystem::commit() {
       EncodedChunk encoded;
       Blake3Hash id{};
       std::optional<ChunkRef> duplicate;  // of live data
+      std::optional<ChunkUser> owner;     // its one reference, if it has one (it becomes shared)
       std::optional<std::size_t> same_as;  // an earlier job in this commit
       bool packed = false;                 // stored as a piece of a pack
       ChunkRef ref;
@@ -505,7 +575,7 @@ void Filesystem::commit() {
     const std::uint64_t cs = sb_.chunk_size();
     std::vector<Job> jobs;
     for (auto& [ino, chunks] : dirty_) {
-      const Inode* file = meta_.find(ino);
+      std::optional<InodeAttrs> file = find(ino);
       if (!file) continue;
       for (auto& [index, data] : chunks) {
         std::uint64_t start = index * cs;
@@ -514,7 +584,7 @@ void Filesystem::commit() {
         // the bytes in between are zeros.
         data.resize(static_cast<std::size_t>(std::min(cs, file->size - start)), 0);
         jobs.push_back({ino, index, &data, all_zero(data), {}});
-        jobs.back().form = hot_form(policy_of(*file), sb_);
+        jobs.back().form = hot_form(policy_of(meta_, ino), sb_);
       }
     }
     auto parallel = [&](std::size_t n, const std::function<void(std::size_t)>& f) {
@@ -541,7 +611,10 @@ void Filesystem::commit() {
           job.same_as = it->second;
           continue;
         }
-        job.duplicate = find_duplicate(job.id, *job.data);
+        if (auto d = find_duplicate(job.id, *job.data)) {
+          job.duplicate = d->first;
+          job.owner = d->second;
+        }
         if (!job.duplicate) first.emplace(key, i);
       }
     }
@@ -563,19 +636,24 @@ void Filesystem::commit() {
         const Job& job = jobs[i];
         if (job.hole || job.duplicate || job.same_as || job.index != 0) continue;
         if (job.form.codec == CodecId::none) continue;  // stored raw: nothing to gain
-        const Inode* file = meta_.find(job.ino);
+        std::optional<InodeAttrs> file = find(job.ino);
         if (file->size > limit || file->size != job.data->size()) continue;
         small.push_back(i);
         small_inodes.insert(job.ino);
       }
       if (small.size() >= 2) {
         std::unordered_map<InodeId, std::pair<InodeId, std::string_view>> where;
-        for (InodeId d : dirty_inodes_) {
-          const Inode* dir = meta_.find(d);
-          if (!dir || !dir->is_dir()) continue;
-          for (const auto& [name, child] : dir->entries) {
-            if (small_inodes.contains(child)) where.try_emplace(child, d, name);
-          }
+        std::vector<std::string> names;  // (kept alive for the string_views below)
+        names.reserve(small.size());
+        for (const auto& [d, dir] : attrs_) {
+          if (!dir.is_dir()) continue;
+          meta_.entries(d, [&](std::string_view name, InodeId child) {
+            if (small_inodes.contains(child) && !where.contains(child)) {
+              names.emplace_back(name);
+              where.emplace(child, std::make_pair(d, std::string_view(names.back())));
+            }
+            return true;
+          });
         }
         auto order = [&](std::size_t i) {
           auto w = where.find(jobs[i].ino);
@@ -638,11 +716,16 @@ void Filesystem::commit() {
         }
       }
       if (job.hole) {
-        if (!meta_.find(job.ino)->chunks.contains(job.index)) continue;
+        if (!meta_.chunk(job.ino, job.index)) continue;
         op = op::RemoveChunk{job.ino, job.index};  // all zeros: store nothing
       } else if (job.duplicate || job.same_as) {
         job.ref = job.duplicate ? *job.duplicate : jobs[*job.same_as].ref;
-        op = op::SetChunkRef{job.ino, job.index, job.ref, !job.ref.packed};
+        std::optional<ChunkUser> owner;
+        if (!job.ref.packed && !meta_.users(job.ref.offset)) {
+          // Shared for the first time: name its one reference.
+          owner = job.duplicate ? job.owner : ChunkUser{jobs[*job.same_as].ino, jobs[*job.same_as].index};
+        }
+        op = op::SetChunkRef{job.ino, job.index, job.ref, !job.ref.packed, owner};
         ++dedup_hits_;
         dedup_bytes_ += job.ref.size;
       } else if (job.packed) {
@@ -657,8 +740,11 @@ void Filesystem::commit() {
       meta_.apply(op);
       ops.push_back(std::move(op));
     }
-    for (InodeId ino : dirty_inodes_) {
-      if (const Inode* i = meta_.find(ino)) ops.push_back(op::PutInode{*i});
+    for (const auto& [ino, a] : attrs_) {
+      if (!meta_.attrs(ino)) continue;  // deleted since
+      Op op = op::PutInode{a};
+      meta_.apply(op);
+      ops.push_back(std::move(op));
     }
     std::uint64_t txid = meta_.last_txid + 1;
     journal_->append_transaction(txid, ops);
@@ -673,13 +759,14 @@ void Filesystem::commit() {
   }
   dirty_.clear();
   dirty_chunks_ = 0;
-  dirty_inodes_.clear();
+  attrs_.clear();
   pending_bytes_ = 0;
   last_commit_ns_ = now();
   maybe_checkpoint();
 }
 
-std::optional<ChunkRef> Filesystem::find_duplicate(const Blake3Hash& id, ByteView data) {
+std::optional<std::pair<ChunkRef, std::optional<ChunkUser>>> Filesystem::find_duplicate(const Blake3Hash& id,
+                                                                                         ByteView data) {
   const auto size = static_cast<std::uint32_t>(data.size());
   std::uint64_t key = hash_key(id.data());
   std::optional<DedupTarget> t = meta_.dedup.find(key);
@@ -692,8 +779,11 @@ std::optional<ChunkRef> Filesystem::find_duplicate(const Blake3Hash& id, ByteVie
       store_, t->offset, sb_.segment_offset(segment) + sb_.segment_size(), usage->second.seq);
   if (!r || r->header.type != RecordType::data_chunk) return std::nullopt;
   ChunkRef ref{t->offset, static_cast<std::uint32_t>(r->stored_size()), size, t->piece, t->packed, key};
+  std::optional<ChunkUser> owner;
   try {
     DataChunkInfo info = parse_data_chunk(*r);
+    // A record not shared yet has one reference: its header's owner.
+    if (!info.pack) owner = ChunkUser{info.inode, info.file_offset / sb_.chunk_size()};
     if (info.pack != t->packed) return std::nullopt;
     if (!t->packed) {
       if (!info.blake3 || *info.blake3 != id || info.uncompressed_size != size) return std::nullopt;
@@ -707,7 +797,7 @@ std::optional<ChunkRef> Filesystem::find_duplicate(const Blake3Hash& id, ByteVie
   } catch (const Error&) {
     return std::nullopt;
   }
-  return ref;
+  return std::make_pair(ref, owner);
 }
 
 void Filesystem::maybe_checkpoint() {
@@ -715,7 +805,19 @@ void Filesystem::maybe_checkpoint() {
   std::uint64_t written = journal_->bytes_since_checkpoint();
   bool overdue = written > 0 && now() - last_checkpoint_ns_ >=
                                     std::int64_t{options_.checkpoint_interval_s} * 1'000'000'000;
-  if (written >= options_.checkpoint_bytes || overdue) checkpoint();
+  if (written >= options_.checkpoint_bytes || overdue || meta_.dirty_bytes() >= node_limit()) checkpoint();
+}
+
+std::uint64_t Filesystem::node_limit() const {
+  // Changed tree nodes are written by the next checkpoint: bounded, so that
+  // memory is, and so is the room a checkpoint needs.
+  std::uint64_t store = sb_.segment_count * sb_.segment_size();
+  return std::clamp<std::uint64_t>(store / 32, 256 << 10, kMaxDirtyNodeBytes);
+}
+
+std::uint64_t Filesystem::reserve_segments() const {
+  std::uint64_t usable = sb_.segment_size() - kSegmentHeaderSize - kSealRecordSize;
+  return kMinReserveSegments + kGcHeadroomSegments + (checkpoint_bytes_ * 3 / 2 + node_limit() + usable - 1) / usable;
 }
 
 void Filesystem::checkpoint() {
@@ -724,6 +826,7 @@ void Filesystem::checkpoint() {
   try {
     commit();
     LogPosition at = journal_->append_checkpoint(meta_);
+    gc_nodes_moved_ = false;
     journal_->flush();
     sb_.checkpoint_offset = at.offset;
     sb_.checkpoint_seq = at.seq;
@@ -731,11 +834,9 @@ void Filesystem::checkpoint() {
     if (errors_seen_) sb_.state |= state_flags::errors;
     write_superblock(store_, sb_);
     journal_->checkpoint_done(at);
-    // Keep room for the next checkpoint (it grows with the metadata).
-    std::uint64_t usable = sb_.segment_size() - kSegmentHeaderSize - kSealRecordSize;
+    // Keep room for the next checkpoint.
     checkpoint_bytes_ = meta_.encode_checkpoint().size();
-    journal_->set_reserve(kMinReserveSegments + kGcHeadroomSegments + (checkpoint_bytes_ * 3 / 2 + usable - 1) / usable,
-                          kGcHeadroomSegments);
+    journal_->set_reserve(reserve_segments(), kGcHeadroomSegments);
   } catch (const std::exception& e) {
     in_checkpoint_ = false;
     failed_ = true;
@@ -755,7 +856,7 @@ void Filesystem::sync() {
 
 void Filesystem::fsync(InodeId ino) {
   std::unique_lock lock(mutex_);
-  inode(ino);
+  get(ino);
   if (read_only_) return;
   if (failed_) throw_posix(EIO);
   commit();  // commits everything before it, not just this file: simple and stronger
@@ -765,12 +866,12 @@ void Filesystem::fsync(InodeId ino) {
 
 Attr Filesystem::getattr(InodeId ino) {
   std::shared_lock lock(mutex_);
-  return make_attr(inode(ino));
+  return make_attr(get(ino));
 }
 
 Attr Filesystem::lookup(InodeId parent, std::string_view name) {
   std::shared_lock lock(mutex_);
-  Inode& dir = directory(parent);
+  InodeAttrs dir = get_dir(parent);
   if (name.size() > kMaxNameLength) throw_posix(ENAMETOOLONG);
   InodeId ino;
   if (name == ".") {
@@ -778,11 +879,11 @@ Attr Filesystem::lookup(InodeId parent, std::string_view name) {
   } else if (name == "..") {
     ino = dir.parent;
   } else {
-    auto it = dir.entries.find(name);
-    if (it == dir.entries.end()) throw_posix(ENOENT);
-    ino = it->second;
+    std::optional<InodeId> e = meta_.entry(parent, name);
+    if (!e) throw_posix(ENOENT);
+    ino = *e;
   }
-  Attr a = make_attr(inode(ino));
+  Attr a = make_attr(get(ino));
   count_lookup(ino);
   return a;
 }
@@ -803,14 +904,15 @@ void Filesystem::forget(InodeId ino, std::uint64_t count) {
 Attr Filesystem::setattr(InodeId ino, const SetAttrRequest& r) {
   std::unique_lock lock(mutex_);
   check_writable();
-  Inode& i = inode(ino);
-  // Shrinking a file frees space, so it must work on a full filesystem too.
-  if (!r.size || *r.size >= i.size) admit(kAttrOpBytes);
-  if (r.size) {
-    if (i.is_dir()) throw_posix(EISDIR);
-    if (!i.is_regular()) throw_posix(EINVAL);
-    truncate(i, *r.size);
+  {
+    InodeAttrs i = get(ino);
+    // Shrinking a file frees space, so it must work on a full filesystem too.
+    if (!r.size || *r.size >= i.size) admit(kAttrOpBytes);
+    if (r.size && i.is_dir()) throw_posix(EISDIR);
+    if (r.size && !i.is_regular()) throw_posix(EINVAL);
   }
+  InodeAttrs& i = edit(ino);  // (after admit(), which may commit)
+  if (r.size) truncate(i, *r.size);
   if (r.mode) i.mode = (i.mode & S_IFMT) | (*r.mode & 07777);
   if (r.uid) i.uid = *r.uid;
   if (r.gid) i.gid = *r.gid;
@@ -820,7 +922,6 @@ Attr Filesystem::setattr(InodeId ino, const SetAttrRequest& r) {
   if (r.mtime == SetAttrRequest::Time::now) i.mtime_ns = t;
   if (r.mtime == SetAttrRequest::Time::set) i.mtime_ns = r.mtime_ns;
   i.ctime_ns = t;
-  mark(ino);
   Attr a = make_attr(i);
   maybe_commit();
   return a;
@@ -828,7 +929,7 @@ Attr Filesystem::setattr(InodeId ino, const SetAttrRequest& r) {
 
 std::string Filesystem::readlink(InodeId ino) {
   std::shared_lock lock(mutex_);
-  Inode& i = inode(ino);
+  InodeAttrs i = get(ino);
   if (!i.is_symlink()) throw_posix(EINVAL);
   return i.symlink;
 }
@@ -838,12 +939,13 @@ std::string Filesystem::readlink(InodeId ino) {
 Attr Filesystem::create(InodeId parent, std::string_view name, std::uint32_t mode,
                         std::uint64_t rdev, std::string_view target, const Caller& caller) {
   check_writable();
-  Inode& dir = directory(parent);
+  InodeAttrs before = get_dir(parent);
   check_name(name);
-  if (dir.entries.contains(name)) throw_posix(EEXIST);
+  if (meta_.entry(parent, name)) throw_posix(EEXIST);
   bool is_dir = S_ISDIR(mode);
-  if (is_dir && dir.nlink >= kMaxLinks) throw_posix(EMLINK);
+  if (is_dir && before.nlink >= kMaxLinks) throw_posix(EMLINK);
   admit(kAttrOpBytes * 2 + name.size() + target.size());
+  InodeAttrs& dir = edit(parent);
 
   std::int64_t t = now();
   InodeAttrs a;
@@ -865,14 +967,14 @@ Attr Filesystem::create(InodeId parent, std::string_view name, std::uint32_t mod
   a.symlink = std::string(target);
   record(op::PutInode{a});
   // A folder's policy is passed on to what is created in it.
-  if (auto policy = dir.xattrs.find(kPolicyXattr); policy != dir.xattrs.end() && !S_ISLNK(mode)) {
-    record(op::SetXattr{a.id, policy->first, policy->second});
+  if (std::optional<Bytes> policy = meta_.xattr(parent, kPolicyXattr); policy && !S_ISLNK(mode)) {
+    record(op::SetXattr{a.id, kPolicyXattr, *policy});
   }
   record(op::SetEntry{parent, std::string(name), a.id});
   if (is_dir) ++dir.nlink;
   touch(dir, true);
   count_lookup(a.id);
-  Attr result = make_attr(inode(a.id));
+  Attr result = make_attr(get(a.id));
   maybe_commit();
   return result;
 }
@@ -903,17 +1005,20 @@ Attr Filesystem::symlink(InodeId parent, std::string_view name, std::string_view
 Attr Filesystem::link(InodeId ino, InodeId new_parent, std::string_view new_name) {
   std::unique_lock lock(mutex_);
   check_writable();
-  Inode& i = inode(ino);
-  if (i.is_dir()) throw_posix(EPERM);
-  Inode& dir = directory(new_parent);
-  check_name(new_name);
-  if (dir.entries.contains(new_name)) throw_posix(EEXIST);
-  if (i.nlink >= kMaxLinks) throw_posix(EMLINK);
+  {
+    InodeAttrs i = get(ino);
+    if (i.is_dir()) throw_posix(EPERM);
+    get_dir(new_parent);
+    check_name(new_name);
+    if (meta_.entry(new_parent, new_name)) throw_posix(EEXIST);
+    if (i.nlink >= kMaxLinks) throw_posix(EMLINK);
+  }
   admit(kAttrOpBytes * 2 + new_name.size());
   record(op::SetEntry{new_parent, std::string(new_name), ino});
+  InodeAttrs& i = edit(ino);
   ++i.nlink;
   touch(i, false);
-  touch(dir, true);
+  touch(edit(new_parent), true);
   count_lookup(ino);
   Attr a = make_attr(i);
   maybe_commit();
@@ -923,38 +1028,39 @@ Attr Filesystem::link(InodeId ino, InodeId new_parent, std::string_view new_name
 void Filesystem::unlink(InodeId parent, std::string_view name) {
   std::unique_lock lock(mutex_);
   check_writable();
-  Inode& dir = directory(parent);
-  auto it = dir.entries.find(name);
-  if (it == dir.entries.end()) throw_posix(ENOENT);
-  Inode& target = inode(it->second);
-  if (target.is_dir()) throw_posix(EISDIR);
+  get_dir(parent);
+  std::optional<InodeId> e = meta_.entry(parent, name);
+  if (!e) throw_posix(ENOENT);
+  if (get(*e).is_dir()) throw_posix(EISDIR);
   // No space check: deleting is how a full filesystem gets space back. The
   // transaction is tiny and may use the reserve.
   record(op::RemoveEntry{parent, std::string(name)});
+  InodeAttrs& target = edit(*e);
   --target.nlink;
   touch(target, false);
-  touch(dir, true);
-  maybe_free(target.id);
+  touch(edit(parent), true);
+  maybe_free(*e);
   maybe_commit();
 }
 
 void Filesystem::rmdir(InodeId parent, std::string_view name) {
   std::unique_lock lock(mutex_);
   check_writable();
-  Inode& dir = directory(parent);
+  get_dir(parent);
   if (name == ".") throw_posix(EINVAL);
   if (name == "..") throw_posix(ENOTEMPTY);
-  auto it = dir.entries.find(name);
-  if (it == dir.entries.end()) throw_posix(ENOENT);
-  Inode& target = inode(it->second);
-  if (!target.is_dir()) throw_posix(ENOTDIR);
-  if (!target.entries.empty()) throw_posix(ENOTEMPTY);
+  std::optional<InodeId> e = meta_.entry(parent, name);
+  if (!e) throw_posix(ENOENT);
+  if (!get(*e).is_dir()) throw_posix(ENOTDIR);
+  if (meta_.counts(*e).entries != 0) throw_posix(ENOTEMPTY);
   record(op::RemoveEntry{parent, std::string(name)});  // no space check, as for unlink
+  InodeAttrs& target = edit(*e);
+  InodeAttrs& dir = edit(parent);
   target.nlink = 0;
   --dir.nlink;
   touch(target, false);
   touch(dir, true);
-  maybe_free(target.id);
+  maybe_free(*e);
   maybe_commit();
 }
 
@@ -964,21 +1070,24 @@ void Filesystem::rename(InodeId parent, std::string_view name, InodeId new_paren
   check_writable();
   if (flags & ~(RENAME_NOREPLACE | RENAME_EXCHANGE)) throw_posix(EINVAL);
   if ((flags & RENAME_NOREPLACE) && (flags & RENAME_EXCHANGE)) throw_posix(EINVAL);
-  Inode& src_dir = directory(parent);
-  Inode& dst_dir = directory(new_parent);
+  get_dir(parent);
+  get_dir(new_parent);
   check_name(new_name);
-  auto src_it = src_dir.entries.find(name);
-  if (src_it == src_dir.entries.end()) throw_posix(ENOENT);
-  InodeId src = src_it->second;
-  auto dst_it = dst_dir.entries.find(new_name);
-  InodeId dst = dst_it == dst_dir.entries.end() ? 0 : dst_it->second;
+  std::optional<InodeId> src_entry = meta_.entry(parent, name);
+  if (!src_entry) throw_posix(ENOENT);
+  InodeId src = *src_entry;
+  InodeId dst = meta_.entry(new_parent, new_name).value_or(0);
   if (parent == new_parent && name == new_name) return;
-  Inode& s = inode(src);
+  get(src);
   admit(kAttrOpBytes * 4 + name.size() + new_name.size());
+  // (After admit(), which may commit.)
+  InodeAttrs& src_dir = edit(parent);
+  InodeAttrs& dst_dir = edit(new_parent);
+  InodeAttrs& s = edit(src);
 
   if (flags & RENAME_EXCHANGE) {
     if (!dst) throw_posix(ENOENT);
-    Inode& d = inode(dst);
+    InodeAttrs& d = edit(dst);
     if (s.is_dir() && is_ancestor(src, new_parent)) throw_posix(EINVAL);
     if (d.is_dir() && is_ancestor(dst, parent)) throw_posix(EINVAL);
     record(op::SetEntry{parent, std::string(name), dst});
@@ -1007,16 +1116,16 @@ void Filesystem::rename(InodeId parent, std::string_view name, InodeId new_paren
   if (s.is_dir() && is_ancestor(src, new_parent)) throw_posix(EINVAL);
   if (dst == src) return;  // two links to the same file: POSIX says do nothing
   if (dst) {
-    Inode& d = inode(dst);
+    InodeAttrs d = get(dst);
     if (s.is_dir() && !d.is_dir()) throw_posix(ENOTDIR);
     if (!s.is_dir() && d.is_dir()) throw_posix(EISDIR);
-    if (d.is_dir() && !d.entries.empty()) throw_posix(ENOTEMPTY);
+    if (d.is_dir() && meta_.counts(dst).entries != 0) throw_posix(ENOTEMPTY);
   }
 
   record(op::SetEntry{new_parent, std::string(new_name), src});
   record(op::RemoveEntry{parent, std::string(name)});
   if (dst) {
-    Inode& d = inode(dst);
+    InodeAttrs& d = edit(dst);
     if (d.is_dir()) {
       d.nlink = 0;
       --dst_dir.nlink;
@@ -1041,7 +1150,7 @@ void Filesystem::rename(InodeId parent, std::string_view name, InodeId new_paren
 
 void Filesystem::open(InodeId ino) {
   std::shared_lock lock(mutex_);
-  inode(ino);
+  get(ino);
   std::lock_guard counts(counts_mutex_);
   ++opens_[ino];
 }
@@ -1060,7 +1169,7 @@ void Filesystem::release(InodeId ino) {
 
 std::size_t Filesystem::read(InodeId ino, std::uint64_t offset, MutableByteView out) {
   std::shared_lock lock(mutex_);
-  Inode& file = inode(ino);
+  InodeAttrs file = get(ino);
   if (file.is_dir()) throw_posix(EISDIR);
   if (!file.is_regular()) throw_posix(EINVAL);
   if (offset >= file.size) return 0;
@@ -1081,9 +1190,9 @@ std::size_t Filesystem::read(InodeId ino, std::uint64_t offset, MutableByteView 
       if (auto c = dirty->second.find(index); c != dirty->second.end()) source = &c->second;
     }
     if (!source) {
-      if (auto c = file.chunks.find(index); c != file.chunks.end()) {
+      if (std::optional<ChunkRef> c = meta_.chunk(ino, index)) {
         try {
-          stored = read_chunk(c->second);
+          stored = read_chunk(*c);
         } catch (const Error& e) {
           if (e.code() != Errc::corrupt) throw;
           // Report exactly what is lost; never return damaged data.
@@ -1092,7 +1201,7 @@ std::size_t Filesystem::read(InodeId ino, std::uint64_t offset, MutableByteView 
           std::fprintf(stderr, "nanoer: damaged data in inode %llu, bytes %llu-%llu: %s\n",
                        static_cast<unsigned long long>(ino),
                        static_cast<unsigned long long>(index * cs),
-                       static_cast<unsigned long long>(index * cs + c->second.size - 1), e.what());
+                       static_cast<unsigned long long>(index * cs + c->size - 1), e.what());
           throw;
         }
         source = stored.get();
@@ -1109,9 +1218,11 @@ std::size_t Filesystem::read(InodeId ino, std::uint64_t offset, MutableByteView 
 std::size_t Filesystem::write(InodeId ino, std::uint64_t offset, ByteView data) {
   std::unique_lock lock(mutex_);
   check_writable();
-  Inode& file = inode(ino);
-  if (file.is_dir()) throw_posix(EISDIR);
-  if (!file.is_regular()) throw_posix(EINVAL);
+  {
+    InodeAttrs file = get(ino);
+    if (file.is_dir()) throw_posix(EISDIR);
+    if (!file.is_regular()) throw_posix(EINVAL);
+  }
   if (data.empty()) return 0;
   if (offset > kMaxFileSize || data.size() > kMaxFileSize - offset) throw_posix(EFBIG);
   const std::uint64_t cs = sb_.chunk_size();
@@ -1124,11 +1235,12 @@ std::size_t Filesystem::write(InodeId ino, std::uint64_t offset, ByteView data) 
     std::uint64_t pos = offset + done;
     std::size_t within = static_cast<std::size_t>(pos - index * cs);
     std::size_t len = static_cast<std::size_t>(std::min<std::uint64_t>(data.size() - done, cs - within));
-    Bytes& chunk = dirty_chunk(file, index);
+    Bytes& chunk = dirty_chunk(ino, index);
     if (chunk.size() < within + len) chunk.resize(within + len, 0);
     std::memcpy(chunk.data() + within, data.data() + done, len);
     done += len;
   }
+  InodeAttrs& file = edit(ino);
   file.size = std::max(file.size, offset + data.size());
   touch(file, true);
   maybe_commit();
@@ -1138,9 +1250,9 @@ std::size_t Filesystem::write(InodeId ino, std::uint64_t offset, ByteView data) 
 void Filesystem::fallocate(InodeId ino, int mode, std::uint64_t offset, std::uint64_t length) {
   std::unique_lock lock(mutex_);
   check_writable();
-  Inode& file = inode(ino);
-  if (file.is_dir()) throw_posix(EISDIR);
-  if (!file.is_regular()) throw_posix(ENODEV);
+  InodeAttrs before = get(ino);
+  if (before.is_dir()) throw_posix(EISDIR);
+  if (!before.is_regular()) throw_posix(ENODEV);
   if (length == 0) throw_posix(EINVAL);
   if (mode & ~(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE)) throw_posix(EOPNOTSUPP);
   if (offset > kMaxFileSize || length > kMaxFileSize - offset) throw_posix(EFBIG);
@@ -1149,31 +1261,30 @@ void Filesystem::fallocate(InodeId ino, int mode, std::uint64_t offset, std::uin
   if (mode & FALLOC_FL_PUNCH_HOLE) {
     if (!(mode & FALLOC_FL_KEEP_SIZE)) throw_posix(EOPNOTSUPP);
     const std::uint64_t cs = sb_.chunk_size();
-    end = std::min(end, file.size);
+    end = std::min(end, before.size);
     for (std::uint64_t index = offset / cs; index * cs < end; ++index) {
       std::uint64_t start = index * cs;
-      std::uint64_t stop = std::min(start + cs, file.size);
+      std::uint64_t stop = std::min(start + cs, before.size);
       if (offset <= start && stop <= end) {
         // Wholly inside the hole: forget the chunk entirely.
-        if (file.chunks.contains(index)) record(op::RemoveChunk{ino, index});
+        if (meta_.chunk(ino, index)) record(op::RemoveChunk{ino, index});
         if (auto it = dirty_.find(ino); it != dirty_.end() && it->second.erase(index)) {
           --dirty_chunks_;
           if (it->second.empty()) dirty_.erase(it);
         }
         continue;
       }
-      bool has_data =
-          file.chunks.contains(index) || (dirty_.contains(ino) && dirty_[ino].contains(index));
-      if (!has_data) continue;
+      if (!has_data(ino, index)) continue;
       admit(cs + kDataChunkHeaderSize);
-      Bytes& chunk = dirty_chunk(file, index);
+      Bytes& chunk = dirty_chunk(ino, index);
       std::uint64_t a = std::max(offset, start) - start;
       std::uint64_t b = std::min<std::uint64_t>(std::min(end, stop) - start, chunk.size());
       if (a < b) std::memset(chunk.data() + a, 0, static_cast<std::size_t>(b - a));
     }
-    touch(file, true);
-  } else if (!(mode & FALLOC_FL_KEEP_SIZE) && end > file.size) {
+    touch(edit(ino), true);
+  } else if (!(mode & FALLOC_FL_KEEP_SIZE) && end > before.size) {
     // Nothing to preallocate in a compressed store: the new range is a hole.
+    InodeAttrs& file = edit(ino);
     file.size = end;
     touch(file, true);
   }
@@ -1182,35 +1293,46 @@ void Filesystem::fallocate(InodeId ino, int mode, std::uint64_t offset, std::uin
 
 std::uint64_t Filesystem::lseek(InodeId ino, std::uint64_t offset, int whence) {
   std::shared_lock lock(mutex_);
-  Inode& file = inode(ino);
+  InodeAttrs file = get(ino);
   if (!file.is_regular()) throw_posix(EINVAL);
   if (whence != SEEK_DATA && whence != SEEK_HOLE) throw_posix(EINVAL);
   if (offset >= file.size) throw_posix(ENXIO);
   const std::uint64_t cs = sb_.chunk_size();
+  const std::uint64_t first = offset / cs;
   auto dirty = dirty_.find(ino);
-  auto has_data = [&](std::uint64_t index) {
-    return file.chunks.contains(index) ||
-           (dirty != dirty_.end() && dirty->second.contains(index));
-  };
-  for (std::uint64_t index = offset / cs; index * cs < file.size; ++index) {
-    if (has_data(index) == (whence == SEEK_DATA)) return std::max(offset, index * cs);
+  if (whence == SEEK_DATA) {
+    // The first chunk with data at or after `first`, stored or not yet.
+    std::optional<std::uint64_t> next;
+    meta_.chunks(ino, first, [&](std::uint64_t index, const ChunkRef&) {
+      next = index;
+      return false;
+    });
+    if (dirty != dirty_.end()) {
+      auto it = dirty->second.lower_bound(first);
+      if (it != dirty->second.end() && (!next || it->first < *next)) next = it->first;
+    }
+    if (!next || *next * cs >= file.size) throw_posix(ENXIO);
+    return std::max(offset, *next * cs);
   }
-  if (whence == SEEK_HOLE) return file.size;  // the implicit hole at the end
-  throw_posix(ENXIO);
+  for (std::uint64_t index = first; index * cs < file.size; ++index) {
+    if (!has_data(ino, index)) return std::max(offset, index * cs);
+  }
+  return file.size;  // the implicit hole at the end
 }
 
 // ---- directories -----------------------------------------------------------
 
 std::vector<DirEntry> Filesystem::list(InodeId ino) {
   std::shared_lock lock(mutex_);
-  Inode& dir = directory(ino);
+  InodeAttrs dir = get_dir(ino);
   std::vector<DirEntry> out;
-  out.reserve(dir.entries.size() + 2);
+  out.reserve(meta_.counts(ino).entries + 2);
   out.push_back({".", ino, S_IFDIR});
   out.push_back({"..", dir.parent, S_IFDIR});
-  for (const auto& [name, child] : dir.entries) {
-    out.push_back({name, child, inode(child).mode & S_IFMT});
-  }
+  meta_.entries(ino, [&](std::string_view name, InodeId child) {
+    out.push_back({std::string(name), child, get(child).mode & S_IFMT});
+    return true;
+  });
   return out;
 }
 
@@ -1218,27 +1340,32 @@ std::vector<DirEntry> Filesystem::list(InodeId ino) {
 
 Bytes Filesystem::getxattr(InodeId ino, std::string_view name) {
   std::shared_lock lock(mutex_);
-  Inode& i = inode(ino);
+  get(ino);
   if (ino == kRootInode && name == kStatsXattr) {
     std::string text = encode_stats(space_stats_locked(false));
     return Bytes(text.begin(), text.end());
   }
-  auto it = i.xattrs.find(name);
-  if (it == i.xattrs.end()) throw_posix(ENODATA);
-  return it->second;
+  std::optional<Bytes> v = meta_.xattr(ino, name);
+  if (!v) throw_posix(ENODATA);
+  return std::move(*v);
 }
 
 std::vector<std::string> Filesystem::listxattr(InodeId ino) {
   std::shared_lock lock(mutex_);
+  get(ino);
   std::vector<std::string> names;
-  for (const auto& [name, value] : inode(ino).xattrs) names.push_back(name);
+  meta_.xattrs(ino, [&](std::string_view name, ByteView) {
+    names.emplace_back(name);
+    return true;
+  });
+  std::sort(names.begin(), names.end());
   return names;
 }
 
 void Filesystem::setxattr(InodeId ino, std::string_view name, ByteView value, int flags) {
   std::unique_lock lock(mutex_);
   check_writable();
-  Inode& i = inode(ino);
+  get(ino);
   if (name.empty()) throw_posix(EINVAL);
   if (name.size() > kMaxXattrNameLength) throw_posix(ERANGE);
   if (value.size() > kMaxXattrValueSize) throw_posix(E2BIG);
@@ -1248,22 +1375,22 @@ void Filesystem::setxattr(InodeId ino, std::string_view name, ByteView value, in
   } else if (name.starts_with(kNanoerXattrPrefix)) {
     throw_posix(EPERM);  // reserved for Nanoer
   }
-  bool exists = i.xattrs.contains(name);
+  bool exists = meta_.xattr(ino, name).has_value();
   if ((flags & XATTR_CREATE) && exists) throw_posix(EEXIST);
   if ((flags & XATTR_REPLACE) && !exists) throw_posix(ENODATA);
   admit(kAttrOpBytes + name.size() + value.size());
   record(op::SetXattr{ino, std::string(name), Bytes(value.begin(), value.end())});
-  touch(i, false);
+  touch(edit(ino), false);
   maybe_commit();
 }
 
 void Filesystem::removexattr(InodeId ino, std::string_view name) {
   std::unique_lock lock(mutex_);
   check_writable();
-  Inode& i = inode(ino);
-  if (!i.xattrs.contains(name)) throw_posix(ENODATA);
+  get(ino);
+  if (!meta_.xattr(ino, name)) throw_posix(ENODATA);
   record(op::RemoveXattr{ino, std::string(name)});
-  touch(i, false);
+  touch(edit(ino), false);
   maybe_commit();
 }
 
@@ -1280,7 +1407,7 @@ FsStats Filesystem::statfs() {
                              (journal_ ? journal_->current_remaining() : 0);
   s.free_blocks = free_bytes / kBlockSize;
   s.available_blocks = read_only_ ? 0 : available_bytes() / kBlockSize;
-  s.files = meta_.inodes.size();
+  s.files = meta_.counters.files + meta_.counters.directories + meta_.counters.other_inodes;
   s.free_files = std::uint64_t{1} << 32;
   s.name_max = kMaxNameLength;
   return s;
@@ -1289,17 +1416,20 @@ FsStats Filesystem::statfs() {
 FsInfo Filesystem::info() {
   std::shared_lock lock(mutex_);
   FsInfo info;
-  for (const auto& [id, i] : meta_.inodes) {
-    if (i.is_regular()) {
-      ++info.files;
-      info.logical_bytes += i.size;
-    } else if (i.is_dir()) {
-      ++info.directories;
-    } else {
-      ++info.other_inodes;
-    }
+  info.files = meta_.counters.files;
+  info.directories = meta_.counters.directories;
+  info.other_inodes = meta_.counters.other_inodes;
+  info.logical_bytes = meta_.counters.logical_bytes;
+  // Sizes changed since the last commit.
+  for (const auto& [id, a] : attrs_) {
+    if (!a.is_regular()) continue;
+    std::optional<InodeAttrs> stored = meta_.attrs(id);
+    std::uint64_t was = stored ? stored->size : 0;
+    info.logical_bytes = info.logical_bytes - std::min(info.logical_bytes, was) + a.size;
   }
   for (const auto& [index, usage] : meta_.segments) info.stored_bytes += usage.live_bytes;
+  info.metadata_bytes = std::min(info.stored_bytes, meta_.counters.node_bytes);
+  info.stored_bytes -= info.metadata_bytes;
   info.segments_in_use = meta_.segments.size();
   info.segments_pending_free = journal_ ? journal_->pending_free_segments() : 0;
   info.segments_free = journal_ ? journal_->free_segments() : sb_.segment_count - meta_.segments.size();

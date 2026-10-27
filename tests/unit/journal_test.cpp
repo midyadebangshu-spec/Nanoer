@@ -10,6 +10,7 @@
 
 #include "nanoer/error.h"
 #include "nanoer/io.h"
+#include "nanoer/legacy_metadata.h"
 #include "nanoer/mkfs.h"
 
 using namespace nanoer;
@@ -22,16 +23,16 @@ constexpr unsigned kShift = 20;  // 1 MiB segments, so tests cross many of them
 struct Session {
   Store& store;
   Superblock sb;
-  Metadata meta{0, kShift};
+  ReplayResult replayed;
+  Metadata& meta;
   std::unique_ptr<Journal> journal;
-  ReplayResult replayed{Metadata(0, kShift), {}, {}, 0, 0, 0, 0};
 
-  explicit Session(Store& s) : store(s), sb(load_superblock(s).sb) {
-    replayed = replay(store, sb);
-    meta = replayed.meta;
-    journal = std::make_unique<Journal>(store, sb, meta,
+  explicit Session(Store& s)
+      : store(s), sb(load_superblock(s).sb), replayed(replay(store, sb)), meta(replayed.meta) {
+    journal = std::make_unique<Journal>(store, sb, meta.segments,
                                         std::max(sb.next_segment_seq, replayed.max_seq + 1));
-    journal->resume(replayed.end);
+    if (auto io = std::dynamic_pointer_cast<LogNodeIO>(meta.io())) io->set_journal(journal.get());
+    journal->resume(replayed.end, meta.last_txid);
   }
 
   void commit(std::vector<Op> ops) {
@@ -88,15 +89,16 @@ std::unique_ptr<FaultStore> fresh_store(std::uint64_t size = 64 << 20) {
   return store;
 }
 
-Metadata replayed_meta(Store& store) { return replay(store, load_superblock(store).sb).meta; }
+// Everything replay finds, in memory (the tree itself cannot be copied).
+LegacyMetadata replayed_meta(Store& store) { return replay(store, load_superblock(store).sb).meta.to_legacy(); }
 
 }  // namespace
 
 TEST(Replay, FreshFilesystemIsAnEmptyRoot) {
   auto store = fresh_store();
   ReplayResult r = replay(*store, load_superblock(*store).sb);
-  ASSERT_EQ(r.meta.inodes.size(), 1u);
-  EXPECT_TRUE(r.meta.find(kRootInode)->is_dir());
+  ASSERT_EQ(r.meta.to_legacy().inodes.size(), 1u);
+  EXPECT_TRUE(r.meta.attrs(kRootInode)->is_dir());
   EXPECT_EQ(r.transactions, 0u);
   EXPECT_EQ(r.end.index, 0u);
   EXPECT_EQ(r.meta.segments.size(), 1u);
@@ -104,12 +106,12 @@ TEST(Replay, FreshFilesystemIsAnEmptyRoot) {
 
 TEST(Replay, TransactionsAcrossManySegments) {
   auto store = fresh_store();
-  Metadata expected{0, kShift};
+  LegacyMetadata expected{0, kShift};
   {
     Session s(*store);
     for (InodeId ino = 2; ino < 32; ++ino) s.write_file(ino, 3, ino);
     s.journal->flush();
-    expected = s.meta;
+    expected = s.meta.to_legacy();
     EXPECT_GT(s.meta.segments.size(), 5u) << "test should cross segment boundaries";
   }
   EXPECT_EQ(replayed_meta(*store), expected);
@@ -117,21 +119,21 @@ TEST(Replay, TransactionsAcrossManySegments) {
 
 TEST(Replay, RepeatedRemountsKeepEverything) {
   auto store = fresh_store();
-  Metadata expected{0, kShift};
+  LegacyMetadata expected{0, kShift};
   for (int round = 0; round < 5; ++round) {
     Session s(*store);
     for (int i = 0; i < 4; ++i) s.write_file(static_cast<InodeId>(2 + round * 4 + i), 2, round * 10 + i);
     s.journal->flush();
-    expected = s.meta;
+    expected = s.meta.to_legacy();
   }
-  Metadata back = replayed_meta(*store);
+  LegacyMetadata back = replayed_meta(*store);
   EXPECT_EQ(back, expected);
   EXPECT_EQ(back.inodes.size(), 21u);
 }
 
-TEST(Replay, LargeCheckpointSpansSegments) {
+TEST(Replay, LargeTreeIsWrittenAsNodes) {
   auto store = fresh_store();
-  Metadata expected{0, kShift};
+  LegacyMetadata expected{0, kShift};
   {
     Session s(*store);
     std::vector<Op> ops;
@@ -149,12 +151,15 @@ TEST(Replay, LargeCheckpointSpansSegments) {
     }
     s.commit(std::move(ops));
     s.checkpoint();
-    expected = s.meta;
+    expected = s.meta.to_legacy();
   }
   ReplayResult r = replay(*store, load_superblock(*store).sb);
-  EXPECT_GT(r.checkpoint_bytes, 1u << 20) << "checkpoint should be bigger than a segment";
+  // Hundreds of nodes; the checkpoint record itself stays small.
+  EXPECT_GT(r.meta.counters.node_bytes, 256u << 10);
+  EXPECT_GE(r.meta.tree().height(), 2u);
+  EXPECT_LT(r.checkpoint_bytes, 4096u);
   EXPECT_EQ(r.transactions, 0u);
-  EXPECT_EQ(r.meta.inodes, expected.inodes);
+  EXPECT_EQ(r.meta.to_legacy().inodes, expected.inodes);
   EXPECT_EQ(r.meta.last_txid, expected.last_txid);
   // The snapshot is taken before the segments it supersedes are released, so
   // after a remount those count as in use until the next checkpoint frees
@@ -167,7 +172,7 @@ TEST(Replay, LargeCheckpointSpansSegments) {
 
 TEST(Replay, DeadSegmentsAreReclaimedAndReused) {
   auto store = fresh_store();
-  Metadata expected{0, kShift};
+  LegacyMetadata expected{0, kShift};
   {
     Session s(*store);
     for (InodeId ino = 2; ino < 12; ++ino) s.write_file(ino, 4, ino);
@@ -188,7 +193,7 @@ TEST(Replay, DeadSegmentsAreReclaimedAndReused) {
       reused |= first_round.contains(index) && usage.seq > s.sb.checkpoint_seq;
     }
     EXPECT_TRUE(reused) << "freed segments should be written again";
-    expected = s.meta;
+    expected = s.meta.to_legacy();
   }
   EXPECT_EQ(replayed_meta(*store), expected);
 }
@@ -209,33 +214,33 @@ TEST(Replay, RunsOutOfSpaceCleanly) {
 TEST(Replay, PowerCutAlwaysRecoversAStateThatExisted) {
   for (std::uint64_t seed = 0; seed < 12; ++seed) {
     auto store = fresh_store();
-    std::vector<Metadata> states;  // every state from the last durable one on
+    std::vector<LegacyMetadata> states;  // every state from the last durable one on
     {
       Session s(*store);
       for (InodeId ino = 2; ino < 8; ++ino) s.write_file(ino, 2, ino);
       s.journal->flush();
-      states.push_back(s.meta);
+      states.push_back(s.meta.to_legacy());
       // More transactions that reach the store but are never flushed.
       for (InodeId ino = 8; ino < 20; ++ino) {
         s.write_file(ino, 2, ino + seed);
         s.journal->write_buffered();
-        states.push_back(s.meta);
+        states.push_back(s.meta.to_legacy());
       }
     }
     MemStore after(store->crash_image({.keep_probability = 0.6, .torn_writes = true, .seed = seed}));
-    Metadata recovered = replayed_meta(after);
+    LegacyMetadata recovered = replayed_meta(after);
     bool matches = false;
-    for (const Metadata& m : states) matches |= (recovered.inodes == m.inodes);
+    for (const LegacyMetadata& m : states) matches |= (recovered.inodes == m.inodes);
     EXPECT_TRUE(matches) << "seed " << seed << ": recovered " << recovered.inodes.size()
                          << " inodes, matching no real state";
 
     // And the recovered filesystem keeps working.
-    Metadata expected{0, kShift};
+    LegacyMetadata expected{0, kShift};
     {
       Session s(after);
       s.write_file(100, 3, 7);
       s.journal->flush();
-      expected = s.meta;
+      expected = s.meta.to_legacy();
     }
     EXPECT_EQ(replayed_meta(after), expected) << "seed " << seed;
   }

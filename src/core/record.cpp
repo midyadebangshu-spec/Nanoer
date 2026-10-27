@@ -183,4 +183,46 @@ Bytes decode_data_chunk(const Record& r) {
   }
 }
 
+// ---- tree nodes ------------------------------------------------------------
+//
+// Type-specific header: codec (1), level (1), reserved (2), count (4),
+// uncompressed size (4), reserved (4), XXH3-64 of the encoding (8), the
+// first key: object (8), kind (1), offset (8), then 7 reserved bytes.
+
+Bytes encode_tree_node_record(std::uint64_t seq, const EncodedChunk& node, const NodeInfo& info) {
+  std::uint8_t extra[kTreeNodeExtraSize] = {};
+  extra[0] = static_cast<std::uint8_t>(node.codec);
+  extra[1] = info.level;
+  store_le(extra + 4, info.count);
+  store_le(extra + 8, node.uncompressed_size);
+  store_le(extra + 16, node.xxh3);
+  store_le(extra + 24, info.first.object);
+  extra[32] = info.first.kind;
+  store_le(extra + 33, info.first.offset);
+  return encode_record(RecordType::tree_node, 0, seq, ByteView(extra, kTreeNodeExtraSize), node.payload);
+}
+
+TreeNodeRecord parse_tree_node(const Record& r) {
+  if (r.header.type != RecordType::tree_node || r.extra.size() != kTreeNodeExtraSize) {
+    throw Error(Errc::corrupt, "not a tree node record");
+  }
+  const std::uint8_t* e = r.extra.data();
+  TreeNodeRecord t;
+  std::optional<CodecId> codec = codec_from_id(e[0]);
+  if (!codec) throw Error(Errc::corrupt, "tree node: unknown codec");
+  t.codec = *codec;
+  t.info.level = e[1];
+  t.info.count = load_le<std::uint32_t>(e + 4);
+  t.uncompressed_size = load_le<std::uint32_t>(e + 8);
+  t.xxh3 = load_le<std::uint64_t>(e + 16);
+  t.info.first = {load_le<std::uint64_t>(e + 24), e[32], load_le<std::uint64_t>(e + 33)};
+  if (t.uncompressed_size > (64u << 20)) throw Error(Errc::corrupt, "tree node: too large");
+  return t;
+}
+
+Bytes decode_tree_node(const Record& r) {
+  TreeNodeRecord t = parse_tree_node(r);
+  return decode_chunk(t.codec, r.payload, t.uncompressed_size, t.xxh3);
+}
+
 }  // namespace nanoer

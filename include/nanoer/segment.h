@@ -87,6 +87,9 @@ class SegmentScanner {
   const SegmentHeader& header() const { return *header_; }
 
   std::optional<Record> next();
+  // The next record's header only: its payload is neither read nor checked
+  // (Record::payload stays empty). A damaged header still ends the scan.
+  std::optional<Record> next_header();
 
   // Where the next record would go: just after the last intact record.
   std::uint64_t end_offset() const { return next_; }

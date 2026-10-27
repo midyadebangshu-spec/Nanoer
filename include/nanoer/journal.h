@@ -18,6 +18,7 @@
 #include "nanoer/codec.h"
 #include "nanoer/error.h"
 #include "nanoer/format.h"
+#include "nanoer/legacy_metadata.h"
 #include "nanoer/metadata.h"
 #include "nanoer/record.h"
 #include "nanoer/segment.h"
@@ -54,6 +55,22 @@ class ReplayError : public Error {
   std::uint64_t txid_;
 };
 
+class Journal;
+
+// Tree nodes in the log: read from the store, written through the journal.
+class LogNodeIO final : public NodeIO {
+ public:
+  LogNodeIO(Store& store, const Superblock& sb) : store_(store), sb_(sb) {}
+  void set_journal(Journal* journal) { journal_ = journal; }
+  Bytes read(const NodeRef& ref, std::uint64_t seq) override;
+  NodeRef write(ByteView encoded, const NodeInfo& info) override;
+
+ private:
+  Store& store_;
+  const Superblock sb_;  // a copy: only the geometry is used, which never changes
+  Journal* journal_ = nullptr;
+};
+
 // A position in the log.
 struct LogPosition {
   std::uint64_t index = 0;   // segment
@@ -64,15 +81,16 @@ struct LogPosition {
 
 class Journal {
  public:
-  // `meta.segments` is the set of segments in use; the journal adds the
+  // `segments` is the set of segments in use; the journal adds the
   // segments it starts and allocates only segments outside that set.
-  Journal(Store& store, const Superblock& sb, Metadata& meta, std::uint64_t next_seq);
+  Journal(Store& store, const Superblock& sb, std::map<std::uint64_t, SegmentUsage>& segments,
+          std::uint64_t next_seq);
 
   // Starts a brand-new log (mkfs).
   void start();
   // Continues after replay: seals the replayed log at `end` and moves to a
   // fresh segment, so nothing is ever appended after a possibly torn tail.
-  void resume(const LogPosition& end);
+  void resume(const LogPosition& end, std::uint64_t last_txid);
 
   // With `blake3`, the record carries the data's identity and the returned
   // reference its dedup key.
@@ -83,13 +101,20 @@ class Journal {
   // and payload, the current segment's sequence number). Returns where.
   // `urgent`: may use one of the reserve segments. Throws Error(no_space)
   // before writing anything if there is no room.
-  std::uint64_t append_copy(const Record& record, bool urgent);
+  // `owner`: the user the copy's header names instead (not for packs).
+  std::uint64_t append_copy(const Record& record, bool urgent, const std::optional<ChunkUser>& owner = std::nullopt);
   // GC: a pack built again from the live pieces of an old one.
   ChunkRef append_repacked(const EncodedChunk& pack, bool urgent);
   LogPosition append_transaction(std::uint64_t txid, const std::vector<Op>& ops);
-  // Writes a complete snapshot of `meta`, split into parts as needed.
-  // Returns where its first part starts (what the superblock points to).
-  LogPosition append_checkpoint(const Metadata& meta);
+  // A metadata tree node (compressed). Like checkpoints, it may use the
+  // reserve: nodes are written by checkpoints, which free space.
+  NodeRef append_node(ByteView encoded, const NodeInfo& info);
+  // Writes the tree's changed nodes, then the checkpoint record (split into
+  // parts as needed). Returns where its first part starts (what the
+  // superblock points to).
+  LogPosition append_checkpoint(Metadata& meta);
+  // A filesystem from before M6: a full snapshot (mkfs of old formats, tests).
+  LogPosition append_legacy_checkpoint(const LegacyMetadata& meta);
 
   void write_buffered();  // hand appended records to the store
   void flush();           // and make them durable
@@ -133,6 +158,7 @@ class Journal {
   std::size_t max_transaction_payload() const;
 
  private:
+  LogPosition append_checkpoint_stream(ByteView stream, std::uint64_t txid);
   // `keep_free`: refuse to start a segment unless more than this many
   // are free (the reserve for normal writes, 0 for what frees space).
   LogPosition append_record(RecordType type, std::uint8_t flags, ByteView extra, ByteView payload,
@@ -144,7 +170,7 @@ class Journal {
 
   Store& store_;
   const Superblock& sb_;
-  Metadata& meta_;
+  std::map<std::uint64_t, SegmentUsage>& segments_;
   std::uint64_t next_seq_;
   std::uint64_t reserve_ = 0;
   std::uint64_t gc_reserve_ = 0;  // what GC leaves free when space is urgent
@@ -164,6 +190,9 @@ struct LogDamage {
 
 struct ReplayResult {
   Metadata meta;
+  // The filesystem predates the metadata tree: `meta` was converted in
+  // memory (so it can only be mounted read-only), and this is what was read.
+  std::optional<LegacyMetadata> legacy;
   LogPosition checkpoint;          // where the checkpoint replay started from begins
   LogPosition end;                 // where the intact log ends
   std::uint64_t max_seq = 0;       // highest sequence number of any segment header found
@@ -181,6 +210,8 @@ struct ReplayResult {
 // in ReplayResult::damage rather than thrown.
 // `stop_before_txid` ends the replay just before that transaction (fsck).
 ReplayResult replay(Store& store, const Superblock& sb,
-                    std::uint64_t stop_before_txid = UINT64_MAX);
+                    std::uint64_t stop_before_txid = UINT64_MAX, const BTree::Options& tree = {});
+// The Metadata options a superblock's features call for.
+Metadata::Options metadata_options(const Superblock& sb, const BTree::Options& tree = {});
 
 }  // namespace nanoer

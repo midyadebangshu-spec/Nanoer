@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <optional>
 
+#include "nanoer/btree.h"
 #include "nanoer/bytes.h"
 #include "nanoer/checksum.h"
 #include "nanoer/codec.h"
@@ -17,6 +18,7 @@ enum class RecordType : std::uint8_t {
   metadata_log = 2,  // one transaction of metadata operations
   checkpoint = 3,    // one part of a metadata snapshot
   segment_seal = 4,  // the segment is finished; the log continues elsewhere
+  tree_node = 5,     // a node of the metadata tree (M6)
 };
 
 inline constexpr std::uint32_t kRecordMagic = 0x4345524e;  // "NREC" on disk
@@ -94,5 +96,21 @@ DataChunkInfo parse_data_chunk(const Record& record);
 
 // Decompresses and verifies a data chunk record. Throws Error(corrupt).
 Bytes decode_data_chunk(const Record& record);
+
+// Tree nodes (docs/format.md §9): the node's encoding, compressed, with
+// what it is (level, first key, count) in the type-specific header.
+inline constexpr std::size_t kTreeNodeExtraSize = 48;
+
+struct TreeNodeRecord {
+  NodeInfo info;
+  CodecId codec{};
+  std::uint32_t uncompressed_size = 0;
+  std::uint64_t xxh3 = 0;  // of the encoding
+};
+
+Bytes encode_tree_node_record(std::uint64_t seq, const EncodedChunk& node, const NodeInfo& info);
+// Throws Error(corrupt).
+TreeNodeRecord parse_tree_node(const Record& record);
+Bytes decode_tree_node(const Record& record);
 
 }  // namespace nanoer
