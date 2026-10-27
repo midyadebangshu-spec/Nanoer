@@ -15,6 +15,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -105,6 +106,11 @@ class Metadata {
   // Every record with a refs item is listed in `shared`, with one
   // reference or more.
   LegacyMetadata to_legacy() const;
+  // fsck of a tree that cannot be read whole (as of the last flush): what
+  // is still readable. `problem` hears of each unreadable node (and of the
+  // items left out); `node` sees every node named, readable or not.
+  LegacyMetadata salvage(const std::function<void(const std::string&)>& problem,
+                         const std::function<void(const NodeRef&)>& node) const;
 
   // Applies one change. Throws Error(corrupt) if it does not fit the current
   // state (during replay that means the log is damaged).

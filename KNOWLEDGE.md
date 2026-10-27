@@ -506,6 +506,26 @@ so the tree is tested in memory and the filesystem stores nodes in its log.
   said fsck streams the tree in key order): it keeps every existing check
   and repair working unchanged for now; streaming, if 1M-file
   measurements show it is needed, comes with step 3's tree checks.
+- **Damage in the tree (step 3).** A node that cannot be read is
+  `TreeDamage`. Replay turns it into a damaged checkpoint, and so does a
+  root that cannot be read at mount (it is read then on purpose), so the
+  mount falls back to the previous checkpoint as before M6: the root is
+  new in every checkpoint, so that always helps for it. Any other node is
+  usually shared by both checkpoints (copy on write), so `fsck` walks the
+  whole tree of the checkpoint it uses (every record against its node,
+  levels, key ranges, no node twice) and, when no checkpoint can be read
+  whole, *salvages* the newest: the nodes it can still read are kept, the
+  existing checks remove entries to lost inodes and put files without a
+  directory in `lost+found`, and the tree is written again. That came out
+  of a test: the older path (search the segments for any readable
+  checkpoint) found mkfs's empty one, and its log ran into the same
+  damaged node, losing almost everything. `fsck` also checks the derived
+  items against the files: counts, totals, unlinked inodes,
+  back-references (a mismatch is repaired by writing the tree again).
+  Tests: `tests/unit/tree_check_test.cpp` (a damaged root, a damaged
+  shared leaf, a node whose header disagrees, each derived item wrong).
+  Not covered: a node damaged after mount is found when read (`EIO` for
+  that operation), not at mount.
 - **Filesystems from before M6** (no `metadata_tree`) are replayed as
   before into the in-memory form, converted to a tree in memory, and
   mounted read-only until upgraded; their checkpoints stay version 1 or 2.
@@ -1921,6 +1941,7 @@ rejected.
 | 2026-10-27 | GC reads record headers only, and leaves a segment whose scan stops before its seal | a damaged header hides the records after it: collecting the segment would lose them (a bug of the first port, caught by the damage test) | scanning whole records (slower, and stopped silently at damage) |
 | 2026-10-27 | The dedup index rebuilt after mount in steps (4,096 items, 200 ms slices), capped at 128 MiB (new keys left out when full) | no index in the checkpoint; mount stays fast; RAM bounded | storing the index in the tree (a write per chunk); rebuilding it during mount (slow mounts) |
 | 2026-10-27 | `fsck` materializes the tree into the M2–M5 in-memory form and repairs by writing a whole new tree | every check and repair of M3–M5 keeps working; offline only; memory proportional to the filesystem | streaming the tree in key order (the plan's risk table; later, if 1M-file measurements need it) |
+| 2026-10-27 | A damaged tree node falls back to the previous checkpoint (mount reads the root to see); `fsck --repair` salvages the newest checkpoint's readable nodes before searching segments for an older checkpoint | the root differs between checkpoints, other nodes are shared: falling back helps only for the root, and an older checkpoint's log runs into the same damage (measured in a test: almost everything lost) | reading every node at mount (slow mounts); duplicating nodes (twice the metadata) |
 | 2026-10-27 | M5 proposed without an engine read-ahead (pending approval) | measured: the engine streams at 2,000 MB/s, a mount at 808 MB/s, so FUSE sets the speed | parallel prefetch into the safe space (STAGE1_PLAN's original M5 item) |
 
 ---

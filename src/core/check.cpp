@@ -4,6 +4,7 @@
 #include <bit>
 #include <map>
 #include <deque>
+#include <functional>
 #include <numeric>
 #include <optional>
 #include <set>
@@ -31,6 +32,8 @@ int FsckReport::exit_code() const {
 }
 
 namespace {
+
+[[noreturn]] void corrupt(const std::string& what) { throw Error(Errc::corrupt, what); }
 
 std::string range(std::uint64_t first, std::uint64_t length) {
   return "bytes " + std::to_string(first) + "-" + std::to_string(first + length - 1);
@@ -194,6 +197,7 @@ class Checker {
     if (!loaded_) return;
     log();
     if (!meta_) return;
+    derived();
     tree();
     space();
     if (options_.repair) repair();
@@ -276,10 +280,16 @@ class Checker {
                 "); run with --repair to search the segments for the newest readable checkpoint");
           return;
         }
-        rescue_superblocks(store_, report_, sb_);
-        loaded_ = load_superblock(store_);
-        sb_ = loaded_->sb;
-        replayed_ = replay_carefully(sb_);
+        // With the metadata tree, the damage is usually in nodes both
+        // checkpoints share (copy on write): what is still readable in the
+        // newest tree is far more than an older checkpoint found by
+        // scanning would give (its log runs into the same damage).
+        if (!salvage(loaded_->sb)) {
+          rescue_superblocks(store_, report_, sb_);
+          loaded_ = load_superblock(store_);
+          sb_ = loaded_->sb;
+          replayed_ = replay_carefully(sb_);
+        }
         rewrite_both_ = true;
       }
       new_checkpoint_ = true;
@@ -293,28 +303,180 @@ class Checker {
                              std::to_string(replayed_->meta.last_txid));
       new_checkpoint_ = true;
     }
+    meta_ = std::move(loaded_meta_);
+  }
+
+  // Replays from the checkpoint `sb` points to and reads the whole tree
+  // into memory (fsck checks everything at once). A tree that cannot be
+  // read whole makes the checkpoint unusable (CheckpointError): the
+  // previous one, whose tree copy on write kept, is tried instead.
+  ReplayResult replay_carefully(const Superblock& sb) {
+    ReplayResult r = [&] {
+      try {
+        return replay(store_, sb);
+      } catch (const ReplayError& e) {
+        error(std::string("the log contradicts itself at ") + e.what());
+        report_.lost.push_back("every change from transaction " + std::to_string(e.txid()) + " on");
+        new_checkpoint_ = true;
+        return replay(store_, sb, e.txid());
+      }
+    }();
     try {
-      meta_ = materialize(*replayed_);
+      if (has_metadata_tree(sb)) walk_nodes(r);
+      loaded_meta_ = materialize(r);
       // The tree's nodes hold space too.
-      replayed_->meta.tree().for_each_node([&](const NodeRef& ref) {
-        node_live_[replayed_->meta.segment_of(ref.offset)] += ref.stored_size;
+      node_live_.clear();
+      r.meta.tree().for_each_node([&](const NodeRef& ref) {
+        node_live_[r.meta.segment_of(ref.offset)] += ref.stored_size;
       });
     } catch (const Error& e) {
       if (e.code() != Errc::corrupt) throw;
-      error(std::string("the metadata tree is damaged: ") + e.what());
-      meta_.reset();
+      throw CheckpointError(std::string("its metadata tree is damaged: ") + e.what());
     }
+    return r;
   }
 
-  ReplayResult replay_carefully(const Superblock& sb) {
+  // The last resort, when no checkpoint can be read whole: the tree of the
+  // newest one has damage that the older ones share (copy on write keeps
+  // unchanged nodes). Keeps what is still readable in it; the checks that
+  // follow then drop entries to inodes that were lost, and put files whose
+  // directory was lost in lost+found. The log after it is given up.
+  bool salvage(const Superblock& sb) {
+    if (!has_metadata_tree(sb)) return false;
     try {
-      return replay(store_, sb);
-    } catch (const ReplayError& e) {
-      error(std::string("the log contradicts itself at ") + e.what());
-      report_.lost.push_back("every change from transaction " + std::to_string(e.txid()) + " on");
-      new_checkpoint_ = true;
-      return replay(store_, sb, e.txid());
+      replayed_ = replay(store_, sb, 0);  // the checkpoint alone (its root must be readable)
+    } catch (const Error& e) {
+      if (e.code() != Errc::corrupt) throw;
+      return false;
     }
+    sb_ = sb;
+    std::vector<std::string> problems;
+    node_live_.clear();
+    loaded_meta_ = replayed_->meta.salvage([&](const std::string& p) { problems.push_back(p); },
+                                           [&](const NodeRef& ref) {
+                                             node_live_[replayed_->meta.segment_of(ref.offset)] += ref.stored_size;
+                                           });
+    for (const std::string& p : problems) error("salvaging the metadata tree: " + p);
+    report_.lost.push_back("whatever was in the unreadable parts of the metadata tree (files found without their "
+                           "directory are in lost+found)");
+    report_.lost.push_back("every change after transaction " + std::to_string(replayed_->meta.last_txid));
+    if (!loaded_meta_->find(kRootInode)) {
+      Inode& root = loaded_meta_->inodes[kRootInode];
+      root.id = kRootInode;
+      root.mode = S_IFDIR | 0755;
+      root.nlink = 2;
+      root.parent = kRootInode;
+      error("the root directory was lost; made an empty one");
+    }
+    salvaged_ = true;
+    return true;
+  }
+
+  // Every node of the checkpoint's tree, from the root: each record intact
+  // and what its header says about the node true, levels decreasing by one,
+  // keys in order and within the range the parent gives the node. Throws
+  // Error(corrupt) at the first problem.
+  void walk_nodes(const ReplayResult& r) {
+    const NodeRef root = r.meta.tree().root();
+    if (!root) return;
+    std::unordered_set<std::uint64_t> seen;
+    struct Bound {
+      std::optional<TreeKey> low, high;  // first key exactly; keys below high
+    };
+    std::function<void(const NodeRef&, std::optional<unsigned>, const Bound&)> visit =
+        [&](const NodeRef& ref, std::optional<unsigned> level, const Bound& bound) {
+          auto where = [&] { return "the tree node at byte " + std::to_string(ref.offset); };
+          if (!seen.insert(ref.offset).second) corrupt(where() + " is in the tree twice");
+          if (ref.offset < sb_.data_start) corrupt(where() + " lies before the data area");
+          std::uint64_t seg = r.meta.segment_of(ref.offset);
+          auto usage = r.meta.segments.find(seg);
+          if (usage == r.meta.segments.end() || seg >= sb_.segment_count) {
+            corrupt(where() + " is in a segment not in use");
+          }
+          Record rec = read_record(store_, ref.offset, sb_.segment_offset(seg) + sb_.segment_size(),
+                                   usage->second.seq);
+          if (rec.header.type != RecordType::tree_node || rec.stored_size() != ref.stored_size) {
+            corrupt(where() + " is not the record its parent names");
+          }
+          TreeNodeRecord t = parse_tree_node(rec);
+          BTree::Decoded d = BTree::decode(decode_tree_node(rec));
+          if (t.info.level != d.info.level || t.info.count != d.info.count ||
+              (d.info.count && !(t.info.first == d.info.first))) {
+            corrupt(where() + ": its record header disagrees with it");
+          }
+          if (level && d.info.level != *level) corrupt(where() + " is at the wrong level");
+          if (d.keys.empty()) {
+            if (ref != root || d.info.level != 0) corrupt(where() + " is empty");
+            return;
+          }
+          if (bound.low && !(d.keys.front() == *bound.low)) corrupt(where() + " does not start at its parent's key");
+          if (bound.high && !(d.keys.back() < *bound.high)) corrupt(where() + " reaches past its neighbour");
+          for (std::size_t i = 0; i < d.children.size(); ++i) {
+            Bound b{d.keys[i], i + 1 < d.keys.size() ? std::optional(d.keys[i + 1]) : bound.high};
+            visit(d.children[i], d.info.level - 1u, b);
+          }
+        };
+    visit(root, std::nullopt, {});
+  }
+
+  // Phase 2b (with the metadata tree): what the tree keeps besides the
+  // files themselves, derived from them, must agree with them. The repair
+  // writes the tree again, which derives it all afresh.
+  void derived() {
+    if (!has_metadata_tree(sb_) || salvaged_) return;  // (a salvaged tree is written again anyway)
+    const Metadata& m = replayed_->meta;
+    auto wrong = [&](const std::string& what) {
+      error(what);
+      new_checkpoint_ = true;
+    };
+    MetaCounters want;
+    std::size_t bad_counts = 0;
+    std::set<InodeId> orphans;
+    std::map<std::uint64_t, std::vector<ChunkUser>> users;
+    std::set<std::uint64_t> packs;
+    for (const auto& [id, inode] : meta_->inodes) {
+      InodeCounts c;
+      c.entries = inode.entries.size();
+      for (const auto& [index, ref] : inode.chunks) {
+        c.data_bytes += ref.size;
+        users[ref.offset].push_back({id, index});
+        if (ref.packed) packs.insert(ref.offset);
+      }
+      if (m.counts(id) != c) ++bad_counts;
+      if (inode.is_regular()) {
+        ++want.files;
+        want.logical_bytes += inode.size;
+      } else if (inode.is_dir()) {
+        ++want.directories;
+      } else {
+        ++want.other_inodes;
+      }
+      if (inode.nlink == 0 && id != kRootInode) orphans.insert(id);
+    }
+    for (const auto& [index, bytes] : node_live_) want.node_bytes += bytes;
+    if (bad_counts) wrong(std::to_string(bad_counts) + " inodes' entry or data counts are wrong");
+    if (!(m.counters == want)) wrong("the filesystem's totals (files, directories, sizes, tree size) are wrong");
+    std::vector<InodeId> listed = m.orphans();
+    if (std::set<InodeId>(listed.begin(), listed.end()) != orphans) wrong("the list of unlinked inodes is wrong");
+    // Back-references: a pack, and a record with several users, lists
+    // exactly its users; a record once shared may list its last one.
+    auto order = [](const ChunkUser& a, const ChunkUser& b) {
+      return std::pair(a.ino, a.index) < std::pair(b.ino, b.index);
+    };
+    std::size_t bad_refs = 0;
+    std::set<std::uint64_t> with_refs;
+    m.for_each_shared([&](std::uint64_t offset, const std::vector<ChunkUser>& list) {
+      with_refs.insert(offset);
+      std::vector<ChunkUser> a = list, b = users.contains(offset) ? users.at(offset) : std::vector<ChunkUser>{};
+      std::sort(a.begin(), a.end(), order);
+      std::sort(b.begin(), b.end(), order);
+      if (a != b) ++bad_refs;
+      return true;
+    });
+    for (const auto& [offset, list] : users) {
+      if ((list.size() > 1 || packs.contains(offset)) && !with_refs.contains(offset)) ++bad_refs;
+    }
+    if (bad_refs) wrong(std::to_string(bad_refs) + " records' lists of users are wrong");
   }
 
   // Phase 3.
@@ -707,6 +869,7 @@ class Checker {
   Superblock sb_;
   std::optional<ReplayResult> replayed_;
   std::optional<LegacyMetadata> meta_;
+  std::optional<LegacyMetadata> loaded_meta_;  // what the last replay_carefully read
   std::map<std::uint64_t, std::uint64_t> node_live_;  // segment -> bytes of tree nodes in it
   std::vector<Op> fixes_;
   std::unordered_map<InodeId, std::string> paths_;
@@ -714,6 +877,7 @@ class Checker {
   std::unordered_map<std::uint64_t, RecordCheck> records_;
   std::deque<std::uint64_t> packs_;
   bool new_checkpoint_ = false;
+  bool salvaged_ = false;
   bool rewrite_both_ = false;
   bool clear_errors_flag_ = false;
 };

@@ -22,6 +22,7 @@ add_executable(nanoer_unit_tests
   unit/btree_test.cpp
   unit/policy_test.cpp
   unit/tier_test.cpp
+  unit/tree_check_test.cpp
   unit/record_test.cpp
   unit/segment_test.cpp
   unit/stats_test.cpp

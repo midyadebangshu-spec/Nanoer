@@ -157,7 +157,15 @@ BTree::~BTree() = default;
 
 BTree::ConstNodePtr BTree::load(const NodeRef& ref) const {
   if (ConstNodePtr n = cache_->get(ref.offset)) return n;
-  Decoded d = decode(store_.read(ref));
+  Decoded d;
+  try {
+    d = decode(store_.read(ref));
+  } catch (const TreeDamage&) {
+    throw;
+  } catch (const Error& e) {
+    if (e.code() != Errc::corrupt) throw;  // (an I/O error is not damage)
+    throw TreeDamage("tree node at byte " + std::to_string(ref.offset) + ": " + e.what());
+  }
   auto node = std::make_shared<Node>();
   node->level = d.info.level;
   node->keys = std::move(d.keys);
@@ -526,6 +534,27 @@ void BTree::for_each_node(const std::function<void(const NodeRef&)>& fn) const {
     visit(*load(root_ref_), &root_ref_, fn);
   }
   for (const NodeRef& r : released_) fn(r);
+}
+
+void BTree::salvage(const std::function<void(const TreeKey&, ByteView)>& item,
+                    const std::function<void(const NodeRef&)>& node,
+                    const std::function<void(const NodeRef&, const std::string&)>& damaged) const {
+  std::function<void(const NodeRef&)> visit = [&](const NodeRef& ref) {
+    node(ref);
+    ConstNodePtr n;
+    try {
+      n = load(ref);
+    } catch (const TreeDamage& e) {
+      damaged(ref, e.what());
+      return;
+    }
+    if (n->leaf()) {
+      for (std::size_t i = 0; i < n->count(); ++i) item(n->keys[i], n->values[i]);
+    } else {
+      for (const Node::Child& c : n->children) visit(c.ref);
+    }
+  };
+  if (root_ref_) visit(root_ref_);
 }
 
 unsigned BTree::height() const {

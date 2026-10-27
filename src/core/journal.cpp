@@ -460,6 +460,9 @@ ReplayResult replay(Store& store, const Superblock& sb, std::uint64_t stop_befor
     if (tree) {
       snapshot.emplace(Metadata::decode_checkpoint(stream, sb.data_start, sb.segment_shift, options,
                                                    std::make_shared<LogNodeIO>(store, sb)));
+      // The root, read now: damage there makes this checkpoint unusable
+      // (the rest of the tree is read as needed; fsck reads all of it).
+      (void)snapshot->tree().height();
     } else {
       legacy.emplace(LegacyMetadata::decode_checkpoint(stream, sb.data_start, sb.segment_shift,
                                                        has_shared_records(sb), has_cold_data(sb)));
@@ -496,6 +499,9 @@ ReplayResult replay(Store& store, const Superblock& sb, std::uint64_t stop_befor
             Decoder in(r->payload);
             for (std::uint32_t i = 0; i < count; ++i) meta.apply(decode_op(in));
             if (!in.done()) corrupt("trailing bytes in a transaction");
+          } catch (const TreeDamage& e) {
+            // Not the transaction's fault: the checkpoint's tree is damaged.
+            throw CheckpointError(std::string("log: the checkpoint's metadata tree is damaged: ") + e.what());
           } catch (const Error& e) {
             throw ReplayError(id, "transaction " + std::to_string(id) + ": " + e.what());
           }

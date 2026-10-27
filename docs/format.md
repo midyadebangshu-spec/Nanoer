@@ -602,13 +602,22 @@ it. It is lost without a report. A writer narrows this window by
 committing again soon (every later transaction claims the earlier ones).
 
 **Checkpoint fallback.** If the checkpoint the newest superblock points to
-cannot be read (step 3), a reader uses the other slot, if it is valid,
+cannot be read (step 3), or (with `metadata_tree`) its tree's root node
+cannot, or a node read while replaying cannot, a reader uses the other slot, if it is valid,
 older and of the same filesystem, and reads its checkpoint and the log
 after it instead. The transactions after the older checkpoint lead to the
 same state as the damaged one, provided the segments they are in were not
 reused (§10.4). If neither checkpoint can be read, `fsck --repair`
 searches every segment for checkpoint part 0 records, newest `txid` first,
 and uses the first one that reads and replays cleanly.
+
+With `metadata_tree`, consecutive checkpoints share every node that did
+not change, so a damaged node other than the root is usually in both.
+`fsck --repair` then *salvages* the newest checkpoint instead, if its root
+can be read: it keeps every item in the nodes it can read, gives up the
+nodes it cannot and the log after the checkpoint, and repairs the rest as
+any other damage (entries to lost inodes removed, inodes without a
+directory moved to `lost+found`); then it writes the tree again.
 
 ### 10.3 Continuing the log after mount
 

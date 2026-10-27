@@ -759,13 +759,14 @@ Metadata Metadata::from_legacy(const LegacyMetadata& old, const Options& options
   return m;
 }
 
-LegacyMetadata Metadata::to_legacy() const {
-  LegacyMetadata m(data_start_, segment_shift_, options_.shared_records, options_.cold_data);
-  m.segments = segments;
-  m.next_inode = next_inode;
-  m.last_txid = last_txid;
+namespace {
+
+// Builds the in-memory form from the items, in key order.
+struct LegacyBuilder {
+  LegacyMetadata& m;
   Inode* inode = nullptr;
-  tree_->scan({}, kMaxTreeKey, [&](const TreeKey& k, ByteView v) {
+
+  bool add(const TreeKey& k, ByteView v) {
     if (k.kind == item_kind::refs) {
       if (!(k.object & kRefsObject) || k.offset != 0) corrupt("misplaced refs item");
       m.shared[k.object & ~kRefsObject] = decode_refs(v).count;
@@ -812,7 +813,40 @@ LegacyMetadata Metadata::to_legacy() const {
         corrupt("an item of unknown kind");
     }
     return true;
-  });
+  }
+};
+
+}  // namespace
+
+LegacyMetadata Metadata::to_legacy() const {
+  LegacyMetadata m(data_start_, segment_shift_, options_.shared_records, options_.cold_data);
+  m.segments = segments;
+  m.next_inode = next_inode;
+  m.last_txid = last_txid;
+  LegacyBuilder b{m};
+  tree_->scan({}, kMaxTreeKey, [&](const TreeKey& k, ByteView v) { return b.add(k, v); });
+  return m;
+}
+
+LegacyMetadata Metadata::salvage(const std::function<void(const std::string&)>& problem,
+                                 const std::function<void(const NodeRef&)>& node) const {
+  LegacyMetadata m(data_start_, segment_shift_, options_.shared_records, options_.cold_data);
+  m.segments = segments;
+  m.next_inode = next_inode;
+  m.last_txid = last_txid;
+  LegacyBuilder b{m};
+  std::uint64_t skipped = 0;
+  tree_->salvage(
+      [&](const TreeKey& k, ByteView v) {
+        try {
+          b.add(k, v);
+        } catch (const Error& e) {
+          if (e.code() != Errc::corrupt) throw;
+          ++skipped;
+        }
+      },
+      node, [&](const NodeRef&, const std::string& what) { problem(what); });
+  if (skipped) problem(std::to_string(skipped) + " items that cannot be used (damaged, or of an inode lost with its node)");
   return m;
 }
 

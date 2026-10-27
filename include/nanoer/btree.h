@@ -20,8 +20,16 @@
 #include <vector>
 
 #include "nanoer/bytes.h"
+#include "nanoer/error.h"
 
 namespace nanoer {
+
+// A node that cannot be read or decoded: damage in the tree as of the last
+// flush (for Nanoer, the checkpoint the tree was loaded from).
+class TreeDamage : public Error {
+ public:
+  explicit TreeDamage(const std::string& message) : Error(Errc::corrupt, message) {}
+};
 
 struct TreeKey {
   std::uint64_t object = 0;
@@ -93,6 +101,12 @@ class BTree {
   // Every node on disk whose space the tree holds: those it uses, and those
   // replaced since the last flush (released by the next one). For fsck.
   void for_each_node(const std::function<void(const NodeRef&)>& fn) const;
+  // fsck of a damaged tree (as of the last flush): every item still
+  // readable, in key order, skipping the nodes that cannot be read
+  // (`damaged` is told of each). `node` sees every node named, readable
+  // or not.
+  void salvage(const std::function<void(const TreeKey&, ByteView)>& item, const std::function<void(const NodeRef&)>& node,
+               const std::function<void(const NodeRef&, const std::string&)>& damaged) const;
 
   // GC: whether the node at `ref`, described by `info`, is part of the tree
   // (as of the last flush); if so, marks it and its parents dirty, so that
