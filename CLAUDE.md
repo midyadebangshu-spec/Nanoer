@@ -61,7 +61,7 @@ cmake --preset fuzz && cmake --build --preset fuzz                          # Cl
 # The first directory is where libFuzzer writes new inputs: never the seeds.
 mkdir -p build/corpus/parse && ./build/fuzz/fuzz/fuzz_parse -max_total_time=60 build/corpus/parse fuzz/seeds/parse
 ctest --preset release -L integration      # real FUSE mounts (needs /dev/fuse; root for all tests)
-NANOER_EXHAUSTIVE=1 ./build/release/tests/nanoer_unit_tests --gtest_filter='Crash.*'  # every crash point (~15 min)
+NANOER_EXHAUSTIVE=1 ./build/release/tests/nanoer_unit_tests --gtest_filter='Crash.*'  # every crash point (~2 h; run the 5 tests in parallel)
 ```
 
 Check that a test filter actually matches before trusting a pass:

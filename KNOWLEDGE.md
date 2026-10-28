@@ -1730,6 +1730,25 @@ support, loop devices; `btrfs-progs` and `fio` installed), so the stage 1
 comparison can be run for real rather than estimated; GitHub is reachable
 (`git clone`), kernel.org is not.
 
+### 2026-10-28: every crash point on the metadata tree (M6 step 3)
+
+`NANOER_EXHAUSTIVE=1`, release build, this VM (4 cores), each test alone;
+every image is checked by `fsck` (which now walks the whole tree) and
+mounted.
+
+| Test | Crash images | Time |
+|---|---:|---:|
+| `EveryCrashPointRecoversARealState` | 46,636 | 871 s |
+| `GarbageCollectionIsCrashSafe` | 191,673 | 3,398 s |
+| `RecompressingColdDataIsCrashSafe` | 111,866 | 2,156 s |
+| `CrashesDuringMountAreSafeToo` | — | 14 s |
+| `DiskErrorsNeverLeaveInconsistentState` | — | 81 s |
+
+All pass. About 1 h 50 min in total (the nightly job allows 4 h); the
+GC and cold-data variants take most of it. The sampled runs on every push
+take as long as before M6 (34 s for the first test, measured against the
+M5 build).
+
 ### 2026-10-27: M5, cold data on real mounts
 
 Release build, image files on the VM's disk, 4 cores, default mount
