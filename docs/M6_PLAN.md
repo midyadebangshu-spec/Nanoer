@@ -1,7 +1,9 @@
 # M6 plan: metadata on disk, format migration, benchmark report
 
 **Status: APPROVED 2026-10-27** with the recommended answer to every
-decision in §12; in progress. Part of stage 1
+decision in §12; in progress. Changed 2026-10-29 (approved): a streaming
+`fsck` is added as step 5 (§10); steps 1–3 built an `fsck` that loads the
+whole tree into memory. Part of stage 1
 ([`STAGE1_PLAN.md`](STAGE1_PLAN.md)); the last milestone of the stage.
 
 ## 1. Goal
@@ -224,9 +226,15 @@ docs/format.md, docs/BENCHMARKS.md, KNOWLEDGE.md, README.md
 3. **Safety:** crash points, `fsck` for the tree, fuzzing; the format
    document.
 4. **Upgrade and discard.**
-5. **Scale and speed:** the 1M-file measurements, the workloads against M5.
-6. **The benchmark report.**
-7. Documentation and the report to you.
+5. **Streaming `fsck`** (added 2026-10-29): walk the tree in key order
+   with per-record and per-inode counts only, and repair by changing
+   items in the tree, instead of loading everything into memory (about
+   860 MiB for 1M files × 4 chunks, so a boot-time check could fail on a
+   small machine).
+6. **Scale and speed:** the 1M-file measurements (including `fsck`), the
+   workloads against M5.
+7. **The benchmark report.**
+8. Documentation and the report to you.
 
 Steps 1–3 are the largest and riskiest part of stage 1; I report after
 step 3, before upgrade and benchmarks. If a step shows the plan needs to
@@ -240,7 +248,7 @@ change, I stop and bring it to you first.
 | Small-file workloads get slower (a lookup may now read a node) | the node cache; measured against M5 (§1.3); a related file's items share leaves |
 | Dedup finds fewer duplicates right after mount | the index is a hint; rebuilt in the background; measured (how long, on 4M chunks) |
 | Back-references cost space and writes for shared data | only for packs and shared records, which are a minority (§14: 2,082 shared records in `/usr`); measured |
-| `fsck` of a huge filesystem needs much memory | it streams the tree in key order; its counts are per record, as now; measured at 1M files |
+| `fsck` of a huge filesystem needs much memory | step 5: it streams the tree in key order; its counts are per record, as now; measured at 1M files (steps 1–3 load it all: about 400 bytes per file and 125 per chunk) |
 | Upgrade needs room for a second copy of the metadata | checked before starting, with the amount stated |
 | Benchmarks on a noisy VM | medians and spreads, several runs, differences below the noise called so |
 | M6 is large | the order above keeps a working filesystem at every step; the report after step 3 |
