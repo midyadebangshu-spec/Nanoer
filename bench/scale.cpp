@@ -154,7 +154,8 @@ int measure(const std::string& path) {
     }
   }
   report("stat every file, read 1 in 100", now_s() - t);
-  std::printf("  %llu files\n", static_cast<unsigned long long>(seen));
+  std::printf("  %llu files, %llu bytes read\n", static_cast<unsigned long long>(seen),
+              static_cast<unsigned long long>(read));
 
   // A checkpoint after one small change.
   auto change = [&](long n) {
