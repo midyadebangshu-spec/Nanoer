@@ -8,14 +8,19 @@
 #include <fuse_lowlevel.h>
 
 #include <cerrno>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <malloc.h>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include <sys/stat.h>
@@ -511,6 +516,27 @@ std::optional<std::uint64_t> parse_size(std::string_view text) {
   }
 }
 
+// Memory freed by the cache, the dedup index and the request threads goes
+// back to the system (docs/M6_PLAN.md, done-when 1). glibc gives each thread
+// that allocates its own arena (up to 8 per CPU) and keeps what is freed in
+// it: with 16 request threads, a mount of 1M files held 1.4 GiB where the
+// budgets come to 512 MiB. Two arenas, and trimming them every 2 seconds,
+// keep it near 600 MiB, and reads no slower (KNOWLEDGE.md §14).
+constexpr int kArenas = 2;
+constexpr auto kTrimInterval = std::chrono::seconds(2);
+
+std::jthread start_trimming() {
+  return std::jthread([](std::stop_token stop) {
+    std::mutex m;
+    std::condition_variable_any wake;
+    std::unique_lock lock(m);
+    while (!stop.stop_requested()) {
+      wake.wait_for(lock, stop, kTrimInterval, [] { return false; });  // woken only by stop
+      malloc_trim(0);
+    }
+  });
+}
+
 // Escapes a value for a FUSE -o option list.
 std::string escape_option(std::string_view value) {
   std::string out;
@@ -524,6 +550,7 @@ std::string escape_option(std::string_view value) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  mallopt(M_ARENA_MAX, kArenas);
   std::vector<std::string_view> args(argv + 1, argv + argc);
   std::vector<std::string> positional;
   std::vector<std::string> fuse_options = {"default_permissions", "subtype=nanoer"};
@@ -647,6 +674,7 @@ int main(int argc, char** argv) {
     if (fuse_session_mount(se, mountpoint.c_str()) == 0) {
       if (fuse_daemonize(foreground) == 0) {
         context.fs->start();
+        std::jthread trimming = start_trimming();
         fuse_loop_config* config = fuse_loop_cfg_create();
         fuse_loop_cfg_set_clone_fd(config, 0);
         fuse_loop_cfg_set_max_threads(config, 16);

@@ -2311,6 +2311,56 @@ mount: `nanoer info` on the 1M-file image 82 → 11 MiB (replay no longer
 holds a whole segment), `nanoer stats` (a mount and a walk of every file)
 437 → 304 MiB (the node cache now keeps to its budget).
 
+### 2026-10-29: 1M files on a real mount (M6 step 6)
+
+`bench/scale.sh` on an image made by `nanoer-scale make` (1M files of four
+128 KiB chunks, every chunk different, 488 GiB logical, 1 GB on disk),
+release build, `nanoerfs` with the default budgets: safe space 256 MiB,
+metadata cache 64 MiB, dedup index at most 128 MiB, unwritten data at most
+64 MiB (512 MiB in all). Resident memory of `nanoerfs` (VmRSS):
+
+| Stage | Before | Two arenas | Two arenas, trimmed every 2 s |
+|---|---:|---:|---:|
+| after mount (0.10–0.15 s) | 5 MiB | 5 MiB | 6 MiB |
+| 30 s later (dedup index rebuilt) | 435 MiB | 201 MiB | 200 MiB |
+| after `find` of every file (43–50 s) | 579 MiB | 290 MiB | 254 MiB |
+| after reading 1 in 100 files whole | 1,301 MiB | 646 MiB | **559 MiB** (peak 610) |
+| after writing 1,000 files of 300 KB | 1,372 MiB | 676 MiB | **628 MiB** (peak 632) |
+
+```mermaid
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#4C78A8, #F58518"}}}}%%
+xychart-beta
+    title "nanoerfs with 1M files, MiB (bars: before, line: now)"
+    x-axis ["mounted", "dedup rebuilt", "after find", "after reads", "after writes"]
+    y-axis "MiB" 0 --> 1400
+    bar [5, 435, 579, 1301, 1372]
+    line [6, 200, 254, 559, 628]
+```
+
+Where it went: massif on the in-process run (`nanoer-scale measure`, no
+FUSE) shows the heap at 513 MB with every budget full: the safe space
+(268 MB of decompressed chunks), the dedup index (134 MB), unwritten data
+(41 MB), tree nodes (≈ 60 MB). On a mount glibc gave each of the 16
+request threads its own arena and kept what was freed in it, doubling
+the total; with 4 arenas it was 572–642 MiB, with 2 and `malloc_trim`
+559–628 MiB, and `find` and the reads took no longer (43 against 50 s, 24 against 36 s). The rest is the kernel's
+lookups (an entry per inode it caches, ≈ 40 bytes; the kernel forgets
+them under memory pressure), the FUSE threads' 1 MiB buffers, and copies of
+packed pieces. A 100,000-file image of small packed files: 414 MiB after
+reading, 516 after writing. The dedup index briefly holds its old and new
+table while it grows (peak 264 MiB at rebuild).
+
+Measured in-process on the same image: mount 0.13 s; dedup rebuild
+3.6 s; a checkpoint after 1 change writes 0.02 MiB, after 10,000 changes
+6.6 MiB in 0.14 s; mount after a crash with 2,000 changes in the log 0.07 s.
+`nanoer stats` on this image no longer keeps an entry per record (only
+for packs and shared records): ≈ 460 MiB less at 4M chunks.
+
+**Against the target** (budgets of safe space, metadata cache and dedup
+plus 64 MiB = 512 MiB): reads stay within 47 MiB of it; after writes it is
+116 MiB over, of which up to 64 MiB is unwritten data, a budget the
+target left out.
+
 ### 2026-10-27: M5, cold data on real mounts
 
 Release build, image files on the VM's disk, 4 cores, default mount
@@ -2607,6 +2657,7 @@ rejected.
 | 2026-10-29 | `nanoer upgrade` reads the tree back and compares it before switching; single-user records whose header names another chunk get a refs item; test images made by the real M2–M5 builds over FUSE, kept in the repository (xz) with manifests | the switch-over is the only irreversible step, so it comes after a full check; GC needs every record's user; images from the real builds test what users actually have, not what today's code thinks old code wrote | converting in place (no going back after a crash); images made by today's code with old feature bits (would miss old encodings and behaviours) |
 | 2026-10-29 | Streaming `fsck`: one pass in key order with 48 bytes per inode and 24 per entry; single-user records checked against their header instead of a table of records; repairs as item changes, then a second pass rebuilds everything derived; a checkpoint without a transaction | measured 9× less memory at 1M files (149 against 1,374 MiB) and 2.8× faster; the header rule is the one GC already depends on | external sorting of a full reference table (more I/O, more code); keeping the in-memory check (≈ 860 MiB+ for a full Linux system at boot) |
 | 2026-10-29 | The node cache counts a node's memory, not its encoded size; replay scans past the log's end 1 MiB at a time | measured: a 64 MiB cache held ≈ 170 MiB, and every mount briefly held a whole segment twice (≈ 124 MiB) | — |
+| 2026-10-29 | `nanoerfs` limits glibc to 2 malloc arenas and calls `malloc_trim` every 2 s; `nanoer stats` keeps a map entry only for packs and shared records | measured on 1M files: 1,372 → 628 MiB resident (§14), `find` and reads no slower; 4 arenas kept 60–90 MiB more | jemalloc or tcmalloc (a new dependency); fewer FUSE threads (slower parallel reads); trimming after every request (cost on every call) |
 | 2026-10-27 | M5 proposed without an engine read-ahead (pending approval) | measured: the engine streams at 2,000 MB/s, a mount at 808 MB/s, so FUSE sets the speed | parallel prefetch into the safe space (STAGE1_PLAN's original M5 item) |
 
 ---

@@ -123,6 +123,9 @@ SpaceStats Filesystem::space_stats_locked(bool by_codec) {
     bool cold = false;
     std::set<std::pair<std::uint32_t, std::uint32_t>> pieces;
   };
+  // Packs and shared records, which several chunks refer to; any other
+  // record has one, and is counted as the walk meets it (so the memory this
+  // takes does not grow with the filesystem).
   std::unordered_map<std::uint64_t, Use> uses;
   meta_.for_each_inode([&](const InodeAttrs& a) {
     InodeAttrs inode = find(a.id).value_or(a);  // with changes not committed yet
@@ -139,26 +142,7 @@ SpaceStats Filesystem::space_stats_locked(bool by_codec) {
     }
     return true;
   });
-  meta_.for_each_chunk([&](InodeId, std::uint64_t, const ChunkRef& ref) {
-    {
-      s.referenced_bytes += ref.size;
-      Use& u = uses[ref.offset];
-      u.stored = ref.stored_size;
-      u.packed = ref.packed;
-      ++u.refs;
-      u.ref_bytes += ref.size;
-      u.cold |= ref.cold;
-      if (ref.cold) s.cold_bytes += ref.size;
-      if (ref.packed) {
-        u.pieces.emplace(ref.piece, ref.size);
-        ++s.packed_files;
-      } else {
-        u.size = ref.size;
-      }
-    }
-    return true;
-  });
-  for (const auto& [offset, u] : uses) {
+  auto record = [&](std::uint64_t offset, const Use& u) {
     ++s.records;
     s.stored_bytes += u.stored;
     if (u.cold) s.cold_stored_bytes += u.stored;
@@ -193,7 +177,27 @@ SpaceStats Filesystem::space_stats_locked(bool by_codec) {
       c.data_bytes += data;
       c.stored_bytes += u.stored;
     }
-  }
+  };
+  meta_.for_each_chunk([&](InodeId, std::uint64_t, const ChunkRef& ref) {
+    s.referenced_bytes += ref.size;
+    if (ref.cold) s.cold_bytes += ref.size;
+    if (ref.packed) ++s.packed_files;
+    Use one;
+    Use& u = ref.packed || meta_.users(ref.offset) ? uses[ref.offset] : one;
+    u.stored = ref.stored_size;
+    u.packed = ref.packed;
+    ++u.refs;
+    u.ref_bytes += ref.size;
+    u.cold |= ref.cold;
+    if (ref.packed) {
+      u.pieces.emplace(ref.piece, ref.size);
+    } else {
+      u.size = ref.size;
+    }
+    if (&u == &one) record(ref.offset, one);
+    return true;
+  });
+  for (const auto& [offset, u] : uses) record(offset, u);
 
   s.segment_bytes = sb_.segment_size() - kSegmentHeaderSize - kSealRecordSize;
   s.segments = sb_.segment_count;
