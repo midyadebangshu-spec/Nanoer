@@ -24,11 +24,13 @@ add_executable(nanoer_unit_tests
   unit/policy_test.cpp
   unit/tier_test.cpp
   unit/tree_check_test.cpp
+  unit/upgrade_test.cpp
   unit/record_test.cpp
   unit/segment_test.cpp
   unit/stats_test.cpp
 )
 target_link_libraries(nanoer_unit_tests PRIVATE nanoer_core nanoer_warnings GTest::gtest_main)
+target_compile_definitions(nanoer_unit_tests PRIVATE NANOER_TEST_IMAGES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/images")
 gtest_discover_tests(nanoer_unit_tests DISCOVERY_TIMEOUT 60)
 
 # The command-line tools, run end to end.
@@ -48,6 +50,9 @@ if(NANOER_BUILD_FUSE)
   set(TOOLS_DIR $<TARGET_FILE_DIR:nanoerfs>)
   add_test(NAME integration_posix COMMAND ${RUN_MOUNTED} ${TOOLS_DIR} posix $<TARGET_FILE:nanoer_posix_tests>)
   add_test(NAME integration_fsx COMMAND ${RUN_MOUNTED} ${TOOLS_DIR} fsx)
+  # Filesystems made by M2-M5 builds, upgraded.
+  add_test(NAME integration_upgrade
+    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/integration/upgrade.sh ${TOOLS_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/images)
   # A tree nothing else writes to while the test runs (not the source tree,
   # where builds may be running).
   add_test(NAME integration_persist COMMAND ${RUN_MOUNTED} ${TOOLS_DIR} persist /usr/include)
@@ -68,7 +73,7 @@ if(NANOER_BUILD_FUSE)
     "FSX_OPS=20000;NANOER_MOUNT_OPTS=cold_after=0,idle=0;NANOER_MKFS_OPTS=--size 64M --segment-size 4M")
   set_tests_properties(integration_kill_cold PROPERTIES ENVIRONMENT
     "NANOER_MOUNT_OPTS=cold_after=0,idle=0")
-  set_tests_properties(integration_posix integration_fsx integration_persist integration_kill
+  set_tests_properties(integration_posix integration_fsx integration_upgrade integration_persist integration_kill
                        integration_fsx_small integration_kill_small integration_fsx_cold
                        integration_kill_cold PROPERTIES
     SKIP_RETURN_CODE 77 LABELS integration RUN_SERIAL TRUE TIMEOUT 1200)

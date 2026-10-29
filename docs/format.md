@@ -134,6 +134,16 @@ three. A filesystem without `metadata_tree` (made before M6) is read by
 loading its whole checkpoint into memory, as before; writers mount it
 read-only until it is upgraded.
 
+**Upgrading** (`nanoer upgrade`) a filesystem without `metadata_tree`:
+replay it (§10.2), write its metadata as a tree (§9.2) into free segments
+after the end of its log (sealed there, §10.3), then a version 3
+checkpoint, flush, and write a superblock with all three incompat features
+set, pointing at that checkpoint. Records a dedup share left with a single
+user whose header names another chunk (§8, *back-references*) get a refs
+item. Until that superblock is written, nothing the old filesystem uses
+has changed; a crash before it leaves the old filesystem, after it the
+upgraded one.
+
 ## 4. Segments
 
 A segment is a fixed-size, append-only region. It holds a 4096-byte header

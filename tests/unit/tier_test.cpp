@@ -84,6 +84,15 @@ struct Files {
     if (d.size() < at + bytes.size()) d.resize(at + bytes.size());
     std::copy(bytes.begin(), bytes.end(), d.begin() + static_cast<std::ptrdiff_t>(at));
   }
+  void remove(Filesystem& fs, const std::string& name) {
+    for (auto it = names.begin(); it != names.end(); ++it) {
+      if (it->second != name) continue;
+      fs.unlink(kRootInode, name);
+      data.erase(it->first);
+      names.erase(it);
+      return;
+    }
+  }
   void check(Filesystem& fs) const {
     for (const auto& [ino, expected] : data) {
       Bytes got(expected.size());
@@ -378,6 +387,25 @@ TEST(Tier, NotOnFilesystemsWithoutTheFeature) {
   EXPECT_FALSE(fs->info().cold_data);
   fs->collect_garbage();
   EXPECT_EQ(fs->info().tier.chunks, 0u);
+  files.check(*fs);
+}
+
+TEST(Tier, ColdDataWithoutAnIdentityCanBeMoved) {
+  // Without dedup, data has no BLAKE3 identity; cold, its references still
+  // need SetChunkRef when GC moves it (a bug from M5 to M6 step 4: GC used
+  // SetChunk, which cannot say cold, and every collection failed).
+  auto store = std::make_unique<MemStore>(96 << 20);
+  make_filesystem(*store, {.segment_shift = 22, .dedup = false});
+  std::mt19937_64 rng(12);
+  Files files;
+  auto fs = Filesystem::mount(*store, options());
+  for (int i = 0; i < 12; ++i) files.create(*fs, "f" + std::to_string(i), log_text(rng, 8 * kChunk));
+  fs->sync();
+  EXPECT_GT(fs->recompress_cold(0), 0u);
+  for (int i = 0; i < 12; i += 2) files.remove(*fs, "f" + std::to_string(i));
+  fs->sync();
+  EXPECT_NO_THROW(fs->collect_garbage(0.97));
+  EXPECT_GT(fs->info().gc.records_copied, 0u);
   files.check(*fs);
 }
 

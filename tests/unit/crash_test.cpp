@@ -28,6 +28,8 @@
 #include "nanoer/fs.h"
 #include "nanoer/io.h"
 #include "nanoer/mkfs.h"
+#include "nanoer/upgrade.h"
+#include "test_images.h"
 
 using namespace nanoer;
 
@@ -536,5 +538,60 @@ TEST(Crash, DiskErrorsNeverLeaveInconsistentState) {
         check_image(r, crash.image([](std::size_t) { return 0; }), syncs,
                     "after a disk error at event " + std::to_string(fail_at));
     if (state.empty()) return;
+  }
+}
+
+// nanoer upgrade cut short at every point: the image holds either the old
+// filesystem, whole and as it was (mounted read-only), or the upgraded one,
+// with the same files; fsck finds nothing wrong in either.
+TEST(Crash, UpgradeIsCrashSafe) {
+  for (const std::string& name : kOldImages) {
+    SCOPED_TRACE(name);
+    Bytes original = load_test_image(name);
+    std::string expected;
+    {
+      MemStore s(original);
+      auto fs = Filesystem::mount(s, options());
+      ASSERT_TRUE(fs->read_only());
+      expected = dump(*fs);
+      fs->abandon();
+    }
+    RecordingStore store(original);
+    upgrade(store);
+    const auto& events = store.events();
+    ASSERT_GT(events.size(), 3u);
+    // An upgrade is a handful of writes: every crash point, every variant.
+    CrashImages crash(store);
+    std::size_t checked = 0, old = 0, upgraded = 0;
+    for (std::size_t n = 0; n <= events.size(); ++n) {
+      crash.advance_to(n);
+      std::vector<std::function<std::size_t(std::size_t)>> variants = {
+          [](std::size_t) { return std::size_t{0}; },        // every unflushed write lost
+          [](std::size_t) { return SIZE_MAX; },               // all of them kept
+          [&](std::size_t i) { return i + 1 == crash.pending() ? std::size_t{512} : SIZE_MAX; },  // the last torn
+      };
+      for (std::size_t i = 0; i < crash.pending(); ++i) {
+        variants.push_back([i](std::size_t j) { return j == i ? SIZE_MAX : 0; });  // only one kept
+      }
+      for (const auto& keep : variants) {
+        Bytes image = crash.image(keep);
+        std::string what = "after " + std::to_string(n) + " of " + std::to_string(events.size()) + " writes";
+        {
+          MemStore offline(image);
+          FsckReport report = fsck(offline, {});
+          ASSERT_TRUE(report.errors.empty()) << what << ": " << report.errors.front();
+        }
+        MemStore s(std::move(image));
+        auto fs = Filesystem::mount(s, options());
+        ASSERT_EQ(dump(*fs), expected) << what;
+        (fs->read_only() ? old : upgraded)++;
+        fs->abandon();
+        ++checked;
+      }
+    }
+    std::cout << "[ crash ] upgrade of " << name << ": " << checked << " crash images over " << events.size()
+              << " writes and flushes: " << old << " the old filesystem, " << upgraded << " the upgraded one\n";
+    EXPECT_GT(old, 0u);
+    EXPECT_GT(upgraded, 0u);
   }
 }

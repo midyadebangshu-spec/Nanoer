@@ -679,6 +679,44 @@ segment, and frees the old one. The selection policy matters: "greedy"
 (least live data) versus "cost-benefit" (also weighs data age, from Sprite
 LFS). GC must respect dedup reference counts and run when the disk is idle.
 
+**Old filesystems: `nanoer upgrade` (M6 step 4).** A filesystem made by
+M2–M5 mounts read-only (with a message); `nanoer upgrade IMAGE` replays it,
+writes its metadata as a tree into free segments after its log, reads the
+tree back and compares it, and only then writes the superblock that
+switches over. It refuses (changing nothing) a filesystem that recorded
+damage or whose log is damaged, and one without room (it says how many
+segments it needs). M2 and M3 filesystems get shared records and cold data
+too.
+
+- **Records whose header names another file.** When dedup shares a record
+  and its first user later goes away, the remaining user is not the one
+  the header names; M4/M5 did not mind (their metadata was all in memory),
+  but GC on the tree finds a single user from the header. Upgrade reads
+  each single-user record's header and gives the mismatches a refs item.
+  Without it nothing is lost (the record's space still counts, so its
+  segment is never freed), but that segment could never be collected:
+  a test that disabled this step still passed on content, so the test
+  checks the refs items directly.
+- **Test images made by the real old builds** (`tests/images`, by
+  `make_images.sh` over each build's own FUSE mount, from commits
+  `e19be0e` M2, `a44188c` M3, `47cb8aa` M4, `43c5ae1` M5; 145–510 KB each,
+  xz): directories, small, multi-chunk, sparse and all-zero files, hard
+  links, a symlink, a FIFO, xattrs, a rename and a delete; M4 and M5 also
+  dedup copies, packs and the case above; M5 also a `max` folder and cold
+  data. Each ends with an fsynced write and `kill -9`, so the upgrade
+  replays a log after the checkpoint. A manifest made over the old mount
+  (inode numbers, modes, owners, links, sizes, times, content hashes,
+  xattrs) must match read-only before, after the upgrade, and after GC and
+  recompressing everything (`tests/integration/upgrade.sh`).
+- **A crash at every write of each upgrade, every variant** (34–40 images
+  per image): each is either the old filesystem, whole, or the upgraded
+  one, with the same files, and `fsck`-clean.
+- **A bug from M5 found by it:** GC re-pointed a cold reference to data
+  without a dedup identity (a `--no-dedup` filesystem, or data from before
+  dedup) with SetChunk, which cannot carry the cold flag, so every
+  collection after recompressing such data failed. Fixed (SetChunkRef),
+  with a test that fails without the fix.
+
 **Giving space back: discard (M6 step 4).** Freed segments used to stay
 allocated in the layer below: an image file only grew (3.1 GiB allocated
 for 1.5 GiB of data after M5's recompression, §14), and an SSD kept
@@ -2508,6 +2546,7 @@ rejected.
 | 2026-10-29 | Diagrams and charts in this file as Mermaid (flowcharts, sequence and state diagrams, a timeline, a quadrant chart, bar and line charts, a pie chart), each next to the table it shows; tables stay the exact record; checked by rendering every block | the user's request; Mermaid is text (diffs, reviews), GitHub draws it, nothing to regenerate | images made with a plotting library (binary files, a script to keep in sync, matplotlib not installed); ASCII art (no charts) |
 | 2026-10-29 | Streaming `fsck` added to M6 as step 5, after upgrade and discard (approved by the user) | the in-memory `fsck` of steps 1–3 needs about 400 bytes per file and 125 per chunk (≈ 860 MiB for 1M files × 4 chunks); stage 2 checks the root filesystem at boot, possibly on a small machine; streaming needs ≈ 20–40 bytes per chunk and inode | keeping the in-memory `fsck` until step 6's measurements (they would only confirm it); doing it before upgrade |
 | 2026-10-29 | Discard queued when a segment becomes free, given back 16 segments per background tick; at mount every free segment with an intact header is queued | free segments are exactly those the log may overwrite, so zeroing them is as safe as writing them; the header scan at mount finds those freed before a crash at no extra cost | discarding inline at each checkpoint (a slow device would stall commits); discarding every free segment at every mount (TRIM of a whole disk each time) |
+| 2026-10-29 | `nanoer upgrade` reads the tree back and compares it before switching; single-user records whose header names another chunk get a refs item; test images made by the real M2–M5 builds over FUSE, kept in the repository (xz) with manifests | the switch-over is the only irreversible step, so it comes after a full check; GC needs every record's user; images from the real builds test what users actually have, not what today's code thinks old code wrote | converting in place (no going back after a crash); images made by today's code with old feature bits (would miss old encodings and behaviours) |
 | 2026-10-27 | M5 proposed without an engine read-ahead (pending approval) | measured: the engine streams at 2,000 MB/s, a mount at 808 MB/s, so FUSE sets the speed | parallel prefetch into the safe space (STAGE1_PLAN's original M5 item) |
 
 ---

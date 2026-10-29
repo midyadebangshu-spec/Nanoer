@@ -29,6 +29,7 @@
 #include "nanoer/fs.h"
 #include "nanoer/io.h"
 #include "nanoer/segment.h"
+#include "nanoer/upgrade.h"
 
 using namespace nanoer;
 using namespace nanoer::tools;
@@ -66,6 +67,9 @@ void usage(std::ostream& out) {
          "                            (not mounted), or the mount point of a mounted filesystem\n"
          "      --codecs                also break stored data down by codec (reads every\n"
          "                              record header; not for a mount point)\n"
+         "  upgrade TARGET            convert a filesystem made before the metadata tree (M2 to\n"
+         "                            M5) so it can be written again (it must not be mounted);\n"
+         "                            a crash part-way leaves the old filesystem as it was\n"
          "  version                   print the version\n"
          "\n"
          "fsck exit codes: 0 clean, 1 errors fixed, 4 errors left, 8 could not run.\n"
@@ -274,6 +278,23 @@ int cmd_gc(const std::vector<std::string_view>& args) {
     std::cout << after.gc.damaged << " damaged records were left in place; run nanoer fsck\n";
     return 1;
   }
+  return 0;
+}
+
+int cmd_upgrade(const std::vector<std::string_view>& args) {
+  if (args.size() != 1 || args[0].empty() || args[0][0] == '-') return fail(kProgram, "upgrade needs one TARGET");
+  std::string target(args[0]);
+  auto store = FileStore::open(target, FileStore::Mode::read_write);
+  UpgradeReport r = upgrade(*store);
+  if (r.already) {
+    std::cout << target << ": already up to date\n";
+    return 0;
+  }
+  std::cout << target << ": upgraded: " << r.inodes << " inodes and " << r.chunks << " chunks moved from a "
+            << format_size(r.old_checkpoint) << " checkpoint into a " << format_size(r.node_bytes)
+            << " metadata tree";
+  if (r.named_users) std::cout << "; " << r.named_users << " shared records given a list of users";
+  std::cout << "\n";
   return 0;
 }
 
@@ -627,6 +648,7 @@ int main(int argc, char** argv) {
     if (command == "stats") return cmd_stats(args);
     if (command == "tier") return cmd_tier(args);
     if (command == "policy") return cmd_policy(args);
+    if (command == "upgrade") return cmd_upgrade(args);
     if (command == "version") {
       std::cout << "nanoer " NANOER_VERSION " (format " << kVersionMajor << "." << kVersionMinor << ")\n";
       return 0;

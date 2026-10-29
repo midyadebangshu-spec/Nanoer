@@ -306,7 +306,7 @@ bool Filesystem::gc_apply(const GcPlan& plan, std::vector<GcRead>& reads, bool u
       ref.offset = copy.offset;
       ref.stored_size = copy.stored_size;
       if (reads[i].repacked) ref.piece = reads[i].pieces.at(ref.piece);
-      if (!ref.packed && !ref.hash) {
+      if (!ref.packed && !ref.hash && !ref.cold) {  // (SetChunk carries none of these)
         record(op::SetChunk{users[k].ino, users[k].index, ref});
       } else {
         // The first reference claims the copy; the others share it.
