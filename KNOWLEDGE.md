@@ -51,13 +51,30 @@ is ever fully extracted to disk.
 | 2 | Whole OS: compressed read-only system image + writable Nanoer layer, booted from initramfs | user space + boot |
 | 3 | Kernel driver (C or Rust) using the same on-disk format, for full speed | kernel |
 
+```mermaid
+timeline
+    title Nanoer roadmap
+    section Stage 1, user space with FUSE
+        M1 foundation : codecs, chunks, records, checksums
+        M2 working filesystem : log, checkpoints, nanoerfs
+        M3 crash safety : every crash point, fsck
+        M4 space : GC, dedup, small-file packs, stats
+        M5 cold data : recompression, folder policies, 2Q cache
+        M6 metadata on disk : B+tree, upgrade, benchmark report
+    section Stage 2
+        Whole OS : read-only system image + writable Nanoer layer
+    section Stage 3
+        Kernel driver : C or Rust, same on-disk format
+```
+
 Linux first. Windows and macOS come later.
 
-**Status:** stage 1, milestones **M1 (foundation)** and **M2 (working
-filesystem)** complete (2026-10-24). `nanoerfs` mounts a Nanoer store
-through FUSE as a normal read-write folder; data and metadata survive
-unmounting and power cuts. Next: M3, crash safety proven under every
-possible power cut, and `nanoer fsck`.
+**Status:** stage 1. Milestones **M1 to M5** are complete: `nanoerfs`
+mounts a Nanoer store through FUSE as a normal read-write folder that
+survives every power cut, with `fsck`, garbage collection, dedup, packing
+of small files and recompression of cold data. **M6** (metadata on disk
+in a B+tree, upgrades of older filesystems, the benchmark report) is in
+progress: steps 1–3 of 7 are done (2026-10-28).
 
 **Saving 37.5 % of the disk (800 → 500) needs an average compression ratio of
 1.6 : 1.** That is realistic for OS files, applications, code and documents
@@ -124,6 +141,29 @@ Every codec trades **ratio** against **compression speed** against
 **decompression speed**. For a filesystem, **decompression speed matters most**,
 because data is read far more often than it is written. That is why zstd and
 LZ4 dominate modern filesystems.
+
+Measured on Linux system files (§14, 2026-10-24): each codec as a point,
+right for faster decompression (MB/s ÷ 3,500), up for more space saved
+(0 at 45 % saved, 1 at 65 %).
+
+```mermaid
+quadrantChart
+    title Space saved against decompression speed
+    x-axis Slow to decompress --> Fast to decompress
+    y-axis Saves less --> Saves more
+    quadrant-1 fast and small
+    quadrant-2 small but slow
+    quadrant-3 neither
+    quadrant-4 fast but larger
+    lz4 0: [0.92, 0.16]
+    lz4 9: [0.96, 0.49]
+    zstd 1: [0.31, 0.63]
+    zstd 3: [0.30, 0.70]
+    zstd 9: [0.28, 0.80]
+    zstd 19: [0.22, 0.89]
+    lzma 1: [0.01, 0.92]
+    lzma 6: [0.01, 0.98]
+```
 
 ---
 
@@ -225,6 +265,20 @@ Btrfs uses a similar heuristic.
 A single compressed stream must be decoded from the beginning. Splitting data
 into **independently compressed chunks** makes any byte reachable by
 decompressing only one chunk. This is the foundation of live extraction.
+
+```mermaid
+flowchart LR
+    R["read 4 KiB at byte 300,000"] --> I["chunk index = 300,000 ÷ 131,072 = 2"]
+    subgraph F["a file, cut on a fixed 128 KiB grid"]
+        C0["chunk 0"]
+        C1["chunk 1"]
+        C2["chunk 2"]
+        C3["chunk 3: a hole, never stored"]
+    end
+    I --> C2
+    C2 --> D["decompress chunk 2 only, into the safe space"]
+    D --> O["copy out the 4 KiB asked for"]
+```
 
 **Chunk size is the central trade-off:**
 
@@ -338,6 +392,21 @@ cold-data recompaction.
 - **Off switches:** `mkfs.nanoer --no-dedup` (a compat preference bit) and
   `-o nodedup`. Filesystems without shared records (M3) never dedup.
 
+How a commit decides, for each dirty chunk:
+
+```mermaid
+flowchart TD
+    A["dirty chunk"] --> B["BLAKE3 of its data"]
+    B --> C{"first 8 bytes in the dedup index,<br/>or earlier in this commit?"}
+    C -- no --> W["compress and write a new record,<br/>BLAKE3 in its header"]
+    C -- yes --> D{"full BLAKE3 in that record's<br/>header the same?"}
+    D -- no --> W
+    D -- yes --> E{"record still indexed when<br/>the operation is applied?"}
+    E -- no --> W
+    E -- yes --> S["one more reference to it (share)"]
+    W --> X["index: key → new record"]
+```
+
 ---
 
 ## 7. Storage engine design
@@ -370,6 +439,23 @@ The byte-level specification is `docs/format.md`. Its main design choices:
 - **Data chunks record their owner** (inode, file offset), so `fsck` and GC
   can identify a chunk from a segment scan alone.
 
+```mermaid
+flowchart TB
+    subgraph S["the store"]
+        direction LR
+        SB0["superblock<br/>slot 0"] --- SB1["superblock<br/>slot 1"] --- GAP["reserved<br/>to 1 MiB"] --- G0["segment 0"] --- G1["segment 1"] --- GN["… segment N−1"]
+    end
+    subgraph SEG["a segment, 64 MiB by default"]
+        direction LR
+        H["header: UUID,<br/>index, sequence"] --- R1["record"] --- R2["record"] --- R3["…"] --- SEAL["seal: where the<br/>log continues"]
+    end
+    subgraph REC["a record, 8-byte aligned"]
+        direction LR
+        CH["common header<br/>32 bytes, CRC"] --- TH["type header: data, transaction,<br/>checkpoint, seal, tree node"] --- PL["payload,<br/>CRC"]
+    end
+    S ~~~ SEG ~~~ REC
+```
+
 ### 7.1 Why not update compressed data in place
 
 Compressed sizes change with content. Rewriting a chunk in place usually does
@@ -397,6 +483,17 @@ Rosenblum & Ousterhout, 1991; F2FS on flash). Benefits:
 Cost: space from deleted or overwritten data must be reclaimed by **garbage
 collection** (§7.6).
 
+In Nanoer one log runs through the segments in any order, linked by
+seals; a reused segment gets a higher sequence number:
+
+```mermaid
+flowchart LR
+    A["segment 3<br/>sequence 7"] -- "seal: go to 0, seq 8" --> B["segment 0<br/>sequence 8"]
+    B -- "seal: go to 5, seq 9" --> C["segment 5<br/>sequence 9"]
+    C --> D["end of the log:<br/>first record not intact"]
+    E["segment 1, sequence 4:<br/>left from earlier use,<br/>never entered"]
+```
+
 ### 7.4 Journaling and write-ahead logging (WAL)
 
 Before metadata changes are applied, a description of them is written to a
@@ -414,6 +511,25 @@ lookups take only a few disk reads even with billions of entries. A
 **CoW B+tree** ("shadowing", Ohad Rodeh, 2008, the basis of Btrfs) changes a
 leaf by writing a new leaf and new copies of its parents up to a new root,
 then atomically switches the root pointer.
+
+```mermaid
+flowchart TD
+    subgraph OLD["checkpoint K"]
+        R1["root"] --> A1["inner A"]
+        R1 --> B1["inner B"]
+        A1 --> L1["leaf 1"]
+        A1 --> L2["leaf 2"]
+        B1 --> L3["leaf 3"]
+    end
+    subgraph NEW["K+1, after leaf 3 changed"]
+        R2["root′"] --> A1
+        R2 --> B2["inner B′"]
+        B2 --> L4["leaf 3′"]
+    end
+```
+
+Only the changed leaf and its parents are written again; everything else
+is shared, and the old tree stays whole until its space is reused.
 
 **Why not an embedded database?** SQLite (public domain) and LMDB (OpenLDAP
 licence) are excellent, but stage 3 needs the same format inside the kernel,
@@ -445,6 +561,17 @@ so the tree is tested in memory and the filesystem stores nodes in its log.
 
 **As built (M6 step 2): the filesystem's metadata on the tree**
 (`src/core/metadata.cpp`, format: `docs/format.md` §9.2).
+
+```mermaid
+flowchart TD
+    CP["checkpoint record: root, counters, segment table"] --> ROOT["root node"]
+    ROOT --> I1["inner node"]
+    ROOT --> I2["inner node"]
+    I1 --> LA["leaf: inode 1 and its items"]
+    I1 --> LB["leaf: inodes 2 to 40"]
+    I2 --> LC["leaf: … orphans (object 0) at the front,<br/>refs items (object 2^63 + offset) at the end"]
+    LB --> K["items of inode 7, in key order:<br/>(7, inode) attributes<br/>(7, counts) entries, data bytes<br/>(7, xattr, hash of name)<br/>(7, entry, hash of name) for a directory<br/>(7, chunk, 0), (7, chunk, 1) … for a file"]
+```
 
 - **Items.** Every inode, directory entry, chunk reference and xattr is
   an item; an inode's items share its number as `object`, so one scan
@@ -494,9 +621,10 @@ so the tree is tested in memory and the filesystem stores nodes in its log.
   whose live bytes are all nodes on their way out counts as emptied
   (else GC's count of emptied segments, which decides when it asks for
   checkpoints, missed them; caught by the TSan run, whose timing put
-  nodes in the victims). Open: in the GC churn test
-  (160 MiB rewritten over 6–7 MiB live), write amplification rose from 2.1
-  to 3.0 with the tree; to be explained with step 5's measurements.
+  nodes in the victims). In the GC churn test (160 MiB rewritten over
+  6–7 MiB live), write amplification is 3.0 with the tree, as in M4
+  (§14); a figure of 2.1 seen during the port came from the buggy first
+  version, which skipped records.
 - **The dedup index** is no longer in the checkpoint: it starts empty at
   mount and is filled from the chunk items in the background, 4,096 items
   per step under the shared lock, inserted under the exclusive lock only if
@@ -550,6 +678,19 @@ segments with a low live-data fraction, copies their live chunks into a new
 segment, and frees the old one. The selection policy matters: "greedy"
 (least live data) versus "cost-benefit" (also weighs data age, from Sprite
 LFS). GC must respect dedup reference counts and run when the disk is idle.
+
+A segment's life:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Free
+    Free --> Written: the log enters it (new sequence number)
+    Written --> InUse: sealed
+    InUse --> InUse: data in it dies (overwrites, deletes)
+    InUse --> Dead: GC copies its live records away, or all of them die
+    Dead --> Released: a checkpoint (K) is durable
+    Released --> Free: the next checkpoint (K+1) is durable
+```
 
 ### 7.7 Hot/cold tiering (Nanoer-specific)
 
@@ -677,6 +818,21 @@ policies never share a pack, and `none` files are not packed. `nanoer
 policy [-r] PATH [POLICY]` shows or sets it on a mount; `nanoer stats`
 shows space by policy.
 
+Data over its life, as built in M5:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Hot: written (zstd 1, small files packed)
+    Hot --> Hot: rewritten
+    Hot --> Cold: unchanged for 7 days and filesystem idle
+    state Cold {
+        [*] --> Recompressed: zstd 9 (zstd 19 under max) saves at least 3 %
+        [*] --> MarkedInPlace: it would not (media, random data)
+    }
+    Cold --> Hot: written again
+    Cold --> Cold: GC moves it, as it is
+```
+
 ### 7.8 Small files
 
 A 300-byte file in a 4 KiB block wastes 93 %. Solutions: **inline** tiny
@@ -715,6 +871,16 @@ memory) than packing them.
   visits their segment for other reasons; a test also showed GC never
   visits the segment being written.
 
+```mermaid
+flowchart LR
+    F1["a.h, 3 KiB"] --> P["pack: up to 64 KiB of data,<br/>compressed as one record"]
+    F2["b.h, 9 KiB"] --> P
+    F3["c.h, 1 KiB"] --> P
+    P --> RA["a.h → piece at 0"]
+    P --> RB["b.h → piece at 3 KiB"]
+    P --> RC["c.h → piece at 12 KiB"]
+```
+
 ### 7.9 Crash consistency and `fsync`
 
 POSIX promises durability only after `fsync`/`fdatasync`. The classic way
@@ -730,7 +896,65 @@ the missing chunk and never reaches the transaction. A crash therefore
 always recovers a state that really existed, even if the disk reorders
 writes. One `fdatasync` at the end makes the whole commit durable.
 
+```mermaid
+sequenceDiagram
+    participant FS as filesystem
+    participant L as log (in memory)
+    participant D as disk
+    FS->>L: append the data chunks of the commit
+    FS->>L: append one transaction naming them
+    L->>D: write everything (any order the disk likes)
+    L->>D: one flush
+    Note over D: after a crash, replay stops at the first record<br/>not intact: a transaction is only reached<br/>if every chunk before it is there
+    FS->>L: checkpoint (later): changed tree nodes, then the checkpoint record
+    L->>D: write, flush
+    FS->>D: superblock pointing at the checkpoint, flush
+```
+
 ### 7.10 How the M2 engine works
+
+How the pieces fit (as of M6):
+
+```mermaid
+flowchart TD
+    APP["programs"] --> VFS["kernel VFS and page cache"]
+    VFS --> FUSE["FUSE module, /dev/fuse"]
+    FUSE --> NFS["nanoerfs (libfuse low-level API)"]
+    NFS --> FSL["Filesystem: POSIX semantics → operations"]
+    FSL --> SAFE["safe space: decompressed chunks, 2Q cache"]
+    FSL --> POOL["thread pool: BLAKE3, compression"]
+    FSL --> META["Metadata: the B+tree, its node cache"]
+    FSL --> J["Journal: the log"]
+    META --> J
+    J --> ST["Store: image file or block device"]
+    SAFE --> ST
+    BG["background: commits, checkpoints,<br/>GC, recompressing cold data,<br/>rebuilding the dedup index"] --> FSL
+```
+
+A read and a write:
+
+```mermaid
+sequenceDiagram
+    participant P as program
+    participant F as Filesystem
+    participant C as safe space
+    participant S as store
+    P->>F: read(file, offset, 4 KiB)
+    F->>F: chunk = offset ÷ chunk size, its record from the metadata
+    F->>C: cached?
+    alt cached
+        C-->>F: decompressed chunk
+    else not cached
+        F->>S: read the record, check its CRCs
+        F->>F: decompress, check the XXH3 of the data
+        F->>C: keep it
+    end
+    F-->>P: the bytes asked for
+    P->>F: write(file, offset, data)
+    F->>F: change the whole chunk in memory (dirty)
+    Note over F: commit: on fsync, every 5 s, or 64 MiB dirty
+    F->>S: data records, then one transaction, one flush
+```
 
 - **One log for everything.** Data chunks, metadata transactions,
   checkpoint parts and segment seals are appended to a single log that runs
@@ -886,6 +1110,27 @@ codes follow e2fsck: 0 clean, 1 repaired, 4 errors left, 8 could not run.
 every point, crafted inconsistencies for each `fsck` repair, random damage,
 an image fuzzer, and `kill -9` on a real mount.
 
+How mount and `fsck` find a state to use (M3, with M6's tree):
+
+```mermaid
+flowchart TD
+    A["newest valid superblock"] --> B{"its checkpoint readable?<br/>(M6: and its tree's root)"}
+    B -- yes --> R["replay the transactions after it"]
+    B -- no --> C{"the other slot's (older) checkpoint?"}
+    C -- yes --> R
+    C -- no --> D["fsck --repair only:"]
+    D --> E{"newest checkpoint's root readable?<br/>(M6)"}
+    E -- yes --> SV["salvage: keep every readable node,<br/>drop the rest and the log after it"]
+    E -- no --> SC["search all segments for checkpoints,<br/>newest first"]
+    R --> X{"a node damaged during replay (M6)?"}
+    X -- yes --> C
+    X -- no --> Y{"a later intact record claims<br/>a lost transaction?"}
+    Y -- yes --> RO["damaged log: read-only,<br/>run fsck"]
+    Y -- no --> OK["mount read-write"]
+    SV --> FIX["fsck repairs the rest:<br/>lost+found, counts, space"]
+    SC --> FIX
+```
+
 ### 7.12 Garbage collection (M4)
 
 **What it does.** It picks segments with little live data, copies their
@@ -898,6 +1143,23 @@ transaction (SetChunk, or SetChunkRef for shared records and packs).
 
 **A step, in three phases**, so that foreground work waits as little as
 possible:
+
+```mermaid
+sequenceDiagram
+    participant G as GC
+    participant M as metadata
+    participant S as store
+    Note over G,M: phase 1, shared lock
+    G->>M: choose victims (cost-benefit, or greedy when short of space)
+    G->>S: scan the victims' record headers (M6: headers only)
+    G->>M: who uses each record (its header, or its refs item)
+    Note over G,S: phase 2, no lock
+    G->>S: read the live records, check them
+    Note over G,M: phase 3, exclusive lock
+    G->>S: append the copies
+    G->>M: re-point the chunks that still refer to the old place, commit
+    Note over S: two checkpoints later, the emptied victims are free
+```
 
 1. under the shared lock: choose victims and list every chunk referring
    into them (one pass over the metadata);
@@ -988,6 +1250,18 @@ for neighbouring reads.
   (a pack; the 1 MiB cold units first built, where each request
   decompressed the whole unit: §7.7).
 
+The simplified 2Q, as built:
+
+```mermaid
+flowchart LR
+    N["chunk read for the first time"] --> FIFO["FIFO: seen once<br/>(up to ¼ of the budget)"]
+    FIFO -- "asked for again" --> LRU["LRU: seen repeatedly"]
+    LRU -- "asked for again" --> LRU
+    FIFO -- "oldest, when full" --> OUT["evicted"]
+    LRU -- "least recent, when full" --> OUT
+    SCAN["a scan: every chunk seen once"] -.-> FIFO
+```
+
 ### 8.3 Interaction with the kernel page cache
 
 The kernel already caches file pages that FUSE returns. Decompressed data may
@@ -1028,10 +1302,18 @@ links, extended attributes (xattrs; SELinux and capabilities live there),
 
 Merged into Linux 2.6.14 (2005), by Miklos Szeredi.
 
-```
-program ──read()──► kernel VFS ──► fuse kernel module ──► /dev/fuse ──► nanoerfs (user space, C++)
-                                                                         │ decompress chunk
-program ◄─────────── data ◄──────── kernel page cache ◄──────────────────┘
+```mermaid
+sequenceDiagram
+    participant P as program
+    participant K as kernel VFS and FUSE module
+    participant N as nanoerfs (user space, C++)
+    P->>K: read()
+    K->>K: page cache hit? then answer at once
+    K->>N: request through /dev/fuse
+    N->>N: find the chunk, decompress it (safe space)
+    N-->>K: the data
+    K->>K: keep it in the page cache
+    K-->>P: the data
 ```
 
 - **libfuse 3** offers a *high-level* (path-based) API and a *low-level*
@@ -1450,6 +1732,15 @@ container), compressed in independent chunks. Stored-raw fallback applied.
 | 128 KiB | 35.9 % | 31.5 % |
 | 4 MiB | 35.5 % | 29.9 % |
 
+```mermaid
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#4C78A8, #F58518"}}}}%%
+xychart-beta
+    title "Stored, % of original (lower is better)"
+    x-axis ["zlib 6, 128 KiB", "LZMA 1, 128 KiB", "zlib 6, 4 MiB", "LZMA 1, 4 MiB"]
+    y-axis "Stored %" 0 --> 40
+    bar [35.9, 31.5, 35.5, 29.9]
+```
+
 **Conclusions:** system files compress well, so 800 → 500 GB is achievable
 for OS and application data. (This sample was later found to be skewed
 toward a few large files; the 2026-10-24 C++ benchmark is the reference.) Bigger chunks help only slightly, so
@@ -1472,6 +1763,25 @@ incompressible chunks stored raw. Release build, Intel Xeon @ 2.80 GHz
 | zstd | 19 | 37.2 % | 2 | 782 |
 | lzma | 1 | 36.7 % | 13 | 41 |
 | lzma | 6 | 35.5 % | 4 | 42 |
+
+```mermaid
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#4C78A8, #F58518"}}}}%%
+xychart-beta
+    title "Stored, % of original (lower is better)"
+    x-axis ["lz4 0", "lz4 9", "zstd 1", "zstd 3", "zstd 9", "zstd 19", "lzma 1", "lzma 6"]
+    y-axis "Stored %" 0 --> 60
+    bar [51.9, 45.2, 42.5, 41.0, 39.0, 37.2, 36.7, 35.5]
+```
+
+```mermaid
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#4C78A8, #F58518"}}}}%%
+xychart-beta
+    title "Speed, MB/s: bars decompress, line compress"
+    x-axis ["lz4 0", "lz4 9", "zstd 1", "zstd 3", "zstd 9", "zstd 19", "lzma 1", "lzma 6"]
+    y-axis "MB/s" 0 --> 3500
+    bar [3218, 3373, 1099, 1055, 976, 782, 41, 42]
+    line [365, 32, 248, 188, 51, 2, 13, 4]
+```
 
 **Conclusions:**
 - Even the fastest setting (LZ4) stores OS files at about half their size,
@@ -1503,6 +1813,15 @@ files:
 | Nanoer (actual blocks of the image file) | **32 MB** |
 | Nanoer stored data | 29.0 MiB = **30.5 %** of logical |
 
+```mermaid
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#4C78A8, #F58518"}}}}%%
+xychart-beta
+    title "Disk used for 95.3 MiB of OS-like files, MB"
+    x-axis ["ext4", "Nanoer (image file)"]
+    y-axis "MB" 0 --> 120
+    bar [110, 32]
+```
+
 That is **71 % less disk** than ext4 for OS-like content, well past the
 37.5 % the 800 → 500 GB goal needs.
 
@@ -1525,6 +1844,17 @@ is empty):
 | `grep -r`, cold | 0.74 | 1.7 |
 | `tar` the tree, cold | 0.24 | 0.88 |
 | `rm -rf` everything | 2.1 | 1.1 |
+
+Nanoer's time as a multiple of ext4's (1 = as fast; from the table above):
+
+```mermaid
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#4C78A8, #F58518"}}}}%%
+xychart-beta horizontal
+    title "Nanoer (M2) time ÷ ext4 time"
+    x-axis ["untar", "copy 512 MB", "copy video", "git clone", "cmake", "compile", "git status", "find", "grep warm", "read 512 MB cold", "decode video cold", "grep cold", "tar cold", "rm -rf"]
+    y-axis "× ext4" 0 --> 8
+    bar [2.4, 2.2, 1.0, 3.5, 1.1, 1.0, 3.0, 6.5, 7.8, 1.7, 1.0, 2.3, 3.7, 0.5]
+```
 
 **Conclusions:**
 - **CPU-bound work is unaffected** (compiling, video decoding), and the
@@ -1565,12 +1895,31 @@ disk, 4-core VM, the same commands in the same order, page cache warm.
 | `cp -a` time | 124.6 s | 116.6 s |
 | `nanoerfs` memory after the copy | 304 MiB | 347 MiB |
 
+```mermaid
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#4C78A8, #F58518"}}}}%%
+xychart-beta
+    title "Stored, % of logical (lower is better)"
+    x-axis ["/usr, M3", "/usr, M4", "duplicates, M3", "duplicates, M4"]
+    y-axis "Stored %" 0 --> 45
+    bar [38.7, 37.4, 31.7, 22.0]
+```
+
 `nanoer stats` on M4's copy: holes and zeros 24.4 MiB, dedup 125.7 MiB
 (2.8 % of logical, 2,082 records shared), compression 2.6 GiB, 64,352
 small files in 2,900 packs, 44,278 records; dedup index 90,629 contents in
 2.0 MiB; metadata about 35.6 MiB. The pre-plan model (§14 below)
 predicted 38.7 % for M3, exactly, and about 37.3 % for M4. Most of the
 memory both use is the safe-space cache (256 MiB).
+
+Where M4's saving on `/usr` comes from (`nanoer stats`, MiB):
+
+```mermaid
+pie showData
+    title Saved on a 4.4 GiB copy of /usr
+    "compression" : 2662
+    "dedup" : 125.7
+    "holes and zeros" : 24.4
+```
 
 **A duplicate-heavy set**, 218 MiB: `/usr/include` twice, the Python 3.11
 and 3.12 standard libraries, and this repository cloned three times:
@@ -1600,6 +1949,15 @@ is noisy: one M3 compile took 37.9 s, another 15.9 s):
 | `tar` the tree, cold | 1.16 | 1.23 |
 | `rm -rf` everything | 1.54 | 1.57 |
 
+```mermaid
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#4C78A8, #F58518"}}}}%%
+xychart-beta horizontal
+    title "M4 time ÷ M3 time (1 = unchanged)"
+    x-axis ["untar", "copy 512 MB", "copy video", "git clone", "cmake", "compile", "git status", "find", "grep warm", "read 512 MB cold", "decode video cold", "grep cold", "tar cold", "rm -rf"]
+    y-axis "× M3" 0 --> 1.8
+    bar [1.09, 1.57, 0.83, 1.21, 1.06, 1.11, 1.00, 0.90, 1.04, 1.07, 1.08, 0.94, 1.06, 1.02]
+```
+
 **Conclusions:**
 - On an OS tree M4 saves 3 % (as measured before planning); on data with
   copies, 31 %. The ratio lever left for stage 1 is M5's recompression of
@@ -1622,6 +1980,15 @@ of 16 KiB, debug build:
 | GC copied | 319 MiB: write amplification 3.0 (greedy, at ≈78 % utilisation) |
 | after `collect_garbage` | 9 segments in use for 7.06 segments of live data (1.27×) |
 
+```mermaid
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#4C78A8, #F58518"}}}}%%
+xychart-beta
+    title "GC under random rewrites, MiB"
+    x-axis ["live data", "rewritten by the test", "copied by GC"]
+    y-axis "MiB" 0 --> 350
+    bar [7, 160, 319]
+```
+
 Before M4 the same workload fails within one pass over the files.
 
 ### 2026-10-27: live reads and writes on a mounted filesystem (M4)
@@ -1637,6 +2004,15 @@ Safe space 50 MiB, release build, this VM:
 | 120 s 720p video (39 MiB): seek to 1:30, play 5 s, cold | 601 ms |
 | the whole video decoded | 4.3 s |
 | `fsck --deep` afterwards | clean (16,689 chunks) |
+
+```mermaid
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#4C78A8, #F58518"}}}}%%
+xychart-beta
+    title "Live reads and edits, ms"
+    x-axis ["30-byte edit", "cold 1 MiB read at 1 GiB", "video: seek, play 5 s"]
+    y-axis "ms" 0 --> 650
+    bar [7, 92, 601]
+```
 
 **Conclusion:** live extraction works as intended: a read decompresses only
 the chunks it touches, and memory stays within the safe space whatever the
@@ -1657,6 +2033,18 @@ file size.
 | lzma 1 | 36.0 % | 33.7 % | 8 | 43 |
 | lzma 6 | 34.5 % | 31.8 % | 3 | 45 |
 
+Bars: 128 KiB chunks; line: 1 MiB units.
+
+```mermaid
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#4C78A8, #F58518"}}}}%%
+xychart-beta
+    title "Stored, % of original, by unit size"
+    x-axis ["lz4 0", "lz4 9", "zstd 1", "zstd 3", "zstd 9", "zstd 19", "lzma 1", "lzma 6"]
+    y-axis "Stored %" 0 --> 55
+    bar [50.0, 43.3, 41.1, 39.6, 37.6, 35.9, 36.0, 34.5]
+    line [49.4, 42.2, 40.1, 37.2, 35.3, 33.2, 33.7, 31.8]
+```
+
 **Conclusion:** zstd 9 in 1 MiB units stores 14 % less than today's zstd 1
 in 128 KiB chunks and decompresses just as fast; zstd 19 gains two points
 more at 3 MB/s (two days per 500 GB on three cores); LZMA reads 25× slower.
@@ -1674,6 +2062,15 @@ Same VM, cold caches, 1 GiB files:
 | mounted, incompressible data (stored raw) | 468 |
 | mounted, log data, `cat \| sha256sum` | 234 |
 | `sha256sum` alone, from memory | 310 |
+
+```mermaid
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#4C78A8, #F58518"}}}}%%
+xychart-beta horizontal
+    title "Streaming reads, MB/s"
+    x-axis ["zstd 1 decompression alone", "engine alone, no FUSE", "mounted, log data, dd", "mounted, incompressible", "mounted, cat | sha256sum", "sha256sum alone"]
+    y-axis "MB/s" 0 --> 5000
+    bar [4643, 2000, 808, 468, 234, 310]
+```
 
 **Conclusion:** decompression is not the bottleneck: FUSE's request round
 trips are (808 against 2,000 MB/s). An engine read-ahead decompressing in
@@ -1700,6 +2097,24 @@ chunk through a 1 MiB cache (nearly every level missing), CPU only:
 | 32 KiB, zstd 1 | 109.0 MiB | 19.0 | 3 | 249.0 µs | 1.23 |
 | 64 KiB, zstd 1 | 108.6 MiB | 19.0 | 3 | 422.9 µs | 1.02 |
 
+```mermaid
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#4C78A8, #F58518"}}}}%%
+xychart-beta
+    title "Metadata of 1M files on disk, MiB"
+    x-axis ["4 KiB raw", "16 KiB raw", "4 KiB zstd", "8 KiB zstd", "16 KiB zstd", "32 KiB zstd", "64 KiB zstd"]
+    y-axis "MiB" 0 --> 280
+    bar [261.7, 253.6, 129.4, 118.3, 112.2, 109.0, 108.6]
+```
+
+```mermaid
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#4C78A8, #F58518"}}}}%%
+xychart-beta
+    title "Cold lookup, µs of CPU"
+    x-axis ["4 KiB raw", "16 KiB raw", "4 KiB zstd", "8 KiB zstd", "16 KiB zstd", "32 KiB zstd", "64 KiB zstd"]
+    y-axis "µs" 0 --> 450
+    bar [44.8, 114.6, 65.0, 90.1, 146.7, 249.0, 422.9]
+```
+
 **Conclusions:** compression halves the metadata on disk (and what a cold
 lookup reads); beyond 16 KiB nodes save little space but cost more per
 miss. 16 KiB with zstd 1 is confirmed (decision 2 of the M6 plan). A miss
@@ -1720,6 +2135,27 @@ is the process's resident growth:
 | 1M files × 1 chunk (131 GB) | 486 MiB | 59.5 MiB | 1.17 s | 5.38 s |
 | 100k files × 40 chunks (524 GB) | 531 MiB | 87.3 MiB | 0.47 s | 5.05 s |
 | 1M files × 4 chunks (524 GB) | 857 MiB | 122.4 MiB | 1.90 s | 12.01 s |
+
+Bars: RAM; line: checkpoint size.
+
+```mermaid
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#4C78A8, #F58518"}}}}%%
+xychart-beta
+    title "In-memory metadata (before M6), MiB"
+    x-axis ["100k × 1 chunk", "1M × 1 chunk", "100k × 40 chunks", "1M × 4 chunks"]
+    y-axis "MiB" 0 --> 900
+    bar [50, 486, 531, 857]
+    line [5.8, 59.5, 87.3, 122.4]
+```
+
+```mermaid
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#4C78A8, #F58518"}}}}%%
+xychart-beta
+    title "Mount (decoding the checkpoint), seconds"
+    x-axis ["100k × 1 chunk", "1M × 1 chunk", "100k × 40 chunks", "1M × 4 chunks"]
+    y-axis "s" 0 --> 13
+    bar [0.27, 5.38, 5.05, 12.01]
+```
 
 **Conclusion:** about 400 bytes per file and 125 per chunk, without limit;
 every checkpoint rewrites all of it (GC needs two), and mounting decodes
@@ -1744,6 +2180,15 @@ mounted.
 | `CrashesDuringMountAreSafeToo` | — | 14 s |
 | `DiskErrorsNeverLeaveInconsistentState` | — | 81 s |
 
+```mermaid
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#4C78A8, #F58518"}}}}%%
+xychart-beta horizontal
+    title "Exhaustive crash runs, seconds"
+    x-axis ["every crash point", "with GC", "with cold data", "during mount", "disk errors"]
+    y-axis "s" 0 --> 3500
+    bar [871, 3398, 2156, 14, 81]
+```
+
 All pass. About 1 h 50 min in total (the nightly job allows 4 h); the
 GC and cold-data variants take most of it. The sampled runs on every push
 take as long as before M6 (34 s for the first test, measured against the
@@ -1765,6 +2210,16 @@ options (safe space 256 MiB). Cold data made with `nanoer tier --age 0`
 | hot, `max` policy (zstd 3) | 1.6 GiB = 35.7 % | 44,619 | — |
 | **cold, `max` policy (zstd 19 per chunk)** | **1.4 GiB = 31.4 %** | 44,619 | 638.8 s (≈ 7 MB/s) |
 | cold, `max` policy, 1 MiB units with zstd 19 (dropped) | 1.3 GiB = 29.6 % | 19,199 | 562.8 s |
+
+```mermaid
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#4C78A8, #F58518"}}}}%%
+xychart-beta horizontal
+    title "/usr stored, % of logical"
+    x-axis ["hot (M4)", "cold, default", "cold, 1 MiB units (dropped)", "hot, max", "cold, max", "cold, max, units (dropped)"]
+    y-axis "Stored %" 0 --> 40
+    bar [37.4, 33.6, 32.3, 35.7, 31.4, 29.6]
+```
+
 Per chunk, 3,945 records were only marked (no 3 % gain) and 2,816 packs
 of small files were packed again. Afterwards `nanoer gc` copied 46 MiB and
 freed 16 more segments, and `fsck --deep` was clean. The image file grew
@@ -1780,6 +2235,27 @@ reads of the log:
 | hot | 449 MB/s | 387 MB/s | 0.86 / 0.64 / 2.48 ms |
 | **cold, per chunk** | **428 MB/s** | 624 MB/s | **0.74 / 0.60 / 1.67 ms** |
 | cold, 1 MiB units (dropped) | 306 MB/s | 454 MB/s | 1.95 / 1.94 / 5.56 ms |
+
+```mermaid
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#4C78A8, #F58518"}}}}%%
+xychart-beta
+    title "Log text, sequential read, MB/s"
+    x-axis ["hot", "cold, per chunk", "units (dropped)"]
+    y-axis "MB/s" 0 --> 500
+    bar [449, 428, 306]
+```
+
+Bars: mean; line: p99.
+
+```mermaid
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#4C78A8, #F58518"}}}}%%
+xychart-beta
+    title "Random 4 KiB reads, ms"
+    x-axis ["hot", "cold, per chunk", "units (dropped)"]
+    y-axis "ms" 0 --> 6
+    bar [0.86, 0.74, 1.95]
+    line [2.48, 1.67, 5.56]
+```
 
 (The random data is incompressible: it is only marked cold, so its two
 rows differ by noise alone, which shows how noisy this VM is.) The log
@@ -1809,6 +2285,18 @@ the safe space, 1 MiB after every four working-set reads:
 | 256 MiB | hot | 58.9 % | **98.8 %** | 503 → 122 ms | 462 → 475 MB/s |
 | 256 MiB | 1 MiB units | 96.3 % | 96.3 % | 409 → 396 ms | 514 → 514 MB/s |
 
+Bars: LRU; line: 2Q.
+
+```mermaid
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#4C78A8, #F58518"}}}}%%
+xychart-beta
+    title "Working set kept through a scan, %"
+    x-axis ["64 MiB, hot", "64 MiB, 1 MiB units", "256 MiB, hot", "256 MiB, 1 MiB units"]
+    y-axis "%" 0 --> 100
+    bar [60.0, 87.1, 58.9, 96.3]
+    line [100, 82.2, 98.8, 96.3]
+```
+
 The first run of this benchmark showed an 8 MiB cache where 64 MiB was
 configured: the shard bug of §8.2, fixed before these numbers.
 
@@ -1831,6 +2319,15 @@ record header (with BLAKE3), 8-byte alignment.
 | Nanoer as in M3 | 1,760 MiB | 38.7 % |
 | + dedup of identical chunks (BLAKE3) | 1,719 MiB | 37.8 % (−2.3 %) |
 
+```mermaid
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#4C78A8, #F58518"}}}}%%
+xychart-beta
+    title "/usr (4,549 MiB of files) stored, MiB"
+    x-axis ["ext4", "Nanoer as in M3", "+ dedup"]
+    y-axis "MiB" 0 --> 5000
+    bar [4738, 1760, 1719]
+```
+
 107,636 chunks (78 holes), 91,028 unique; 124 MiB of logical data is in
 whole-file duplicates.
 
@@ -1843,6 +2340,18 @@ packs of 32/64/128 KiB, each pack compressed as one chunk:
 | 4 KiB | 47,470 | 57.4 MiB | 30.9 MiB | 16.7 | 15.8 | 15.3 |
 | 16 KiB | 64,442 | 198.4 MiB | 82.9 MiB | 62.2 | 58.1 | 55.6 |
 | 32 KiB | 70,188 | 322.9 MiB | 126.5 MiB | 105.9 | 98.1 | 93.6 |
+
+Bars: one by one; line: in 64 KiB packs.
+
+```mermaid
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#4C78A8, #F58518"}}}}%%
+xychart-beta
+    title "Small files stored, MiB"
+    x-axis ["up to 2 KiB", "up to 4 KiB", "up to 16 KiB", "up to 32 KiB"]
+    y-axis "MiB" 0 --> 130
+    bar [17.2, 30.9, 82.9, 126.5]
+    line [7.3, 15.8, 58.1, 98.1]
+```
 
 Per core, on 128 KiB chunks of random data: a zstd level 1 attempt
 3,636 MiB/s, an LZ4 attempt 4,651 MiB/s, a byte-entropy estimate on a
@@ -1867,6 +2376,15 @@ Per core, on 128 KiB chunks of random data: a zstd level 1 attempt
 |---|---|
 | H.264 MP4, 9.6 MiB, 1 MiB chunks, zlib / bz2 / lzma | 99.8–99.9 % (9 of 10 chunks stored raw) |
 | Uncompressed AVI (synthetic test pattern), 16.5 MiB, lzma | 0.8 % (unrealistically good; real raw footage compresses far less) |
+
+```mermaid
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#4C78A8, #F58518"}}}}%%
+xychart-beta
+    title "Stored, % of original"
+    x-axis ["H.264 MP4", "raw AVI (synthetic)"]
+    y-axis "Stored %" 0 --> 100
+    bar [99.9, 0.8]
+```
 
 **Conclusion:** already-encoded media does not compress. The stored-raw
 fallback is essential.
@@ -1966,6 +2484,7 @@ rejected.
 | 2026-10-27 | The dedup index rebuilt after mount in steps (4,096 items, 200 ms slices), capped at 128 MiB (new keys left out when full) | no index in the checkpoint; mount stays fast; RAM bounded | storing the index in the tree (a write per chunk); rebuilding it during mount (slow mounts) |
 | 2026-10-27 | `fsck` materializes the tree into the M2–M5 in-memory form and repairs by writing a whole new tree | every check and repair of M3–M5 keeps working; offline only; memory proportional to the filesystem | streaming the tree in key order (the plan's risk table; later, if 1M-file measurements need it) |
 | 2026-10-27 | A damaged tree node falls back to the previous checkpoint (mount reads the root to see); `fsck --repair` salvages the newest checkpoint's readable nodes before searching segments for an older checkpoint | the root differs between checkpoints, other nodes are shared: falling back helps only for the root, and an older checkpoint's log runs into the same damage (measured in a test: almost everything lost) | reading every node at mount (slow mounts); duplicating nodes (twice the metadata) |
+| 2026-10-29 | Diagrams and charts in this file as Mermaid (flowcharts, sequence and state diagrams, a timeline, a quadrant chart, bar and line charts, a pie chart), each next to the table it shows; tables stay the exact record; checked by rendering every block | the user's request; Mermaid is text (diffs, reviews), GitHub draws it, nothing to regenerate | images made with a plotting library (binary files, a script to keep in sync, matplotlib not installed); ASCII art (no charts) |
 | 2026-10-27 | M5 proposed without an engine read-ahead (pending approval) | measured: the engine streams at 2,000 MB/s, a mount at 808 MB/s, so FUSE sets the speed | parallel prefetch into the safe space (STAGE1_PLAN's original M5 item) |
 
 ---
