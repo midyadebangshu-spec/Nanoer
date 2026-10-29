@@ -2377,6 +2377,54 @@ plus 64 MiB = 512 MiB): reads stay within 47 MiB of it; after writes it is
 116 MiB over, of which up to 64 MiB is unwritten data, a budget the
 target left out.
 
+### 2026-10-29: the M2/M4 workloads against M5 (M6 step 6)
+
+`bench/workloads_vs.sh`, the M5 build against this one, a fresh 16 GiB
+image each time, 3 rounds alternating which goes first; medians (seconds)
+and ranges. Before: the tree as of step 5; after: the speed-ups of §7.5
+(range erase, the inode cache, values in place, leaves in one buffer).
+
+| Workload | M5 | M6 before | ÷ M5 | M6 after | ÷ M5 |
+|---|---:|---:|---:|---:|---:|
+| untar 104 MB | 4.46 | 4.85 | 1.09 | 4.49 | 1.00 |
+| copy 512 MB incompressible | 1.73 | 1.80 | 1.04 | 1.72 | 1.04 |
+| git clone | 0.66 | 0.80 | 1.21 | 0.78 | 1.07 |
+| cmake configure | 0.86 | 0.93 | 1.08 | 0.87 | 1.05 |
+| compile Nanoer | 21.28 | 21.69 | 1.02 | 20.38 | 1.02 |
+| find | 0.13 | 0.15 | 1.15 | 0.13 | 1.08 |
+| grep -r (warm) | 0.63 | 0.65 | 1.03 | 0.59 | 1.04 |
+| read 512 MB (cold) | 0.65 | 0.61 | 0.94 | 0.59 | 0.97 |
+| grep -r (cold) | 1.26 | 1.21 | 0.96 | 1.09 | 0.90 |
+| tar the tree (cold) | 0.76 | 0.77 | 1.01 | 0.76 | 1.19 |
+| rm -rf | 0.98 | 1.18 | 1.20 | 1.11 | 1.13 |
+
+(M5's medians are from each run's own M5 rounds; the "after" ratios use
+the second run's: untar 4.50, clone 0.73, configure 0.83, compile 19.97,
+find 0.12, warm grep 0.57, cold read 0.61, cold grep 1.21, tar 0.64, rm 0.98.)
+
+```mermaid
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#4C78A8, #F58518"}}}}%%
+xychart-beta
+    title "M6 ÷ M5 (bars: before the speed-ups, line: after; 1.10 is the target)"
+    x-axis ["untar", "clone", "configure", "compile", "find", "tar (cold)", "rm -rf"]
+    y-axis "ratio" 0.8 --> 1.3
+    bar [1.09, 1.21, 1.08, 1.02, 1.15, 1.01, 1.20]
+    line [1.00, 1.07, 1.05, 1.02, 1.08, 1.19, 1.13]
+```
+
+Five rounds of the metadata workloads alone (untar, clone, `find`
+after dropping caches, `rm -rf`): `rm -rf` +21 % before, +12 % after;
+`find` +24 % then +2 %; clone and untar within noise; with glibc's
+arenas unlimited, `rm -rf` was no faster (the arena change is not the
+cause). In the engine (callgrind, 5,000 small files): deleting one
+42,000 → 21,000 instructions (M5: 5,200), creating one 17,000 (M5: 8,000).
+
+**Against the target** (within 10 % of M5): met by everything but
+`rm -rf` (+13 %) and the cold `tar` of this run (+19 %; +1 % in the
+first run, M5's spread there is 0.64–0.69 s, and cold reads load tree
+nodes from disk that M5 had in memory). Most of `rm -rf`'s remaining cost
+is the list of a pack's users, rewritten whole for each piece removed.
+
 ### 2026-10-27: M5, cold data on real mounts
 
 Release build, image files on the VM's disk, 4 cores, default mount
@@ -2674,6 +2722,7 @@ rejected.
 | 2026-10-29 | Streaming `fsck`: one pass in key order with 48 bytes per inode and 24 per entry; single-user records checked against their header instead of a table of records; repairs as item changes, then a second pass rebuilds everything derived; a checkpoint without a transaction | measured 9× less memory at 1M files (149 against 1,374 MiB) and 2.8× faster; the header rule is the one GC already depends on | external sorting of a full reference table (more I/O, more code); keeping the in-memory check (≈ 860 MiB+ for a full Linux system at boot) |
 | 2026-10-29 | The node cache counts a node's memory, not its encoded size; replay scans past the log's end 1 MiB at a time | measured: a 64 MiB cache held ≈ 170 MiB, and every mount briefly held a whole segment twice (≈ 124 MiB) | — |
 | 2026-10-29 | `nanoerfs` limits glibc to 2 malloc arenas and calls `malloc_trim` every 2 s; `nanoer stats` keeps a map entry only for packs and shared records | measured on 1M files: 1,372 → 628 MiB resident (§14), `find` and reads no slower; 4 arenas kept 60–90 MiB more | jemalloc or tcmalloc (a new dependency); fewer FUSE threads (slower parallel reads); trimming after every request (cost on every call) |
+| 2026-10-29 | Small metadata operations made cheaper: values read in place, an inode's items removed by one range erase, the last 4,096 decoded inodes cached (≈ 450 KiB), one-byte varints inline, a leaf's values in one buffer | measured: `rm -rf` 21 % slower than M5 and `find` 24 %, the engine's deletion 8× M5's cost; now +13 % and +8 % (+2 % in the 5-round run) | a whole-inode cache in front of the tree (unbounded memory); smaller nodes (shallower shifts, deeper trees); leaving it at +21 % |
 | 2026-10-27 | M5 proposed without an engine read-ahead (pending approval) | measured: the engine streams at 2,000 MB/s, a mount at 808 MB/s, so FUSE sets the speed | parallel prefetch into the safe space (STAGE1_PLAN's original M5 item) |
 
 ---

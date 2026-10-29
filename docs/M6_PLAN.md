@@ -233,7 +233,12 @@ docs/format.md, docs/BENCHMARKS.md, KNOWLEDGE.md, README.md
    860 MiB for 1M files × 4 chunks, so a boot-time check could fail on a
    small machine).
 6. **Scale and speed:** the 1M-file measurements (including `fsck`), the
-   workloads against M5.
+   workloads against M5. (Measured 2026-10-29, KNOWLEDGE.md §14: mount
+   0.13 s, a checkpoint after 1 change 0.02 MiB; `nanoerfs` with 1M files
+   559 MiB after reads and 628 after writes, after limiting glibc's
+   arenas (1,372 before); the workloads within 10 % of M5 except `rm -rf`
+   (+13 %) and one cold `tar` (+19 %) after making small operations
+   cheaper.)
 7. **The benchmark report.**
 8. Documentation and the report to you.
 
