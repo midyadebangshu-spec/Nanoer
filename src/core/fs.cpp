@@ -231,6 +231,13 @@ std::size_t Filesystem::discard_freed(std::size_t max) {
   return journal_->discard_some(max);
 }
 
+void Filesystem::checkpoint_now() {
+  std::unique_lock lock(mutex_);
+  if (read_only_) return;
+  if (failed_) throw_posix(EIO);
+  checkpoint();
+}
+
 void Filesystem::rebuild_dedup() {
   while (dedup_step(4096)) {
   }

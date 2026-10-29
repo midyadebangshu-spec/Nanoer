@@ -44,6 +44,7 @@ target_compile_options(nanoer_warnings INTERFACE
   $<$<BOOL:${NANOER_WERROR}>:-Werror>)
 
 add_subdirectory(src)
+add_subdirectory(bench)
 
 if(NANOER_BUILD_TESTS)
   enable_testing()

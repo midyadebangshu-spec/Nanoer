@@ -211,6 +211,9 @@ class Filesystem {
   // chunks in the background (duplicates written before are missed until
   // then). This fills it now: tests and tools.
   void rebuild_dedup();
+  // Commits, then writes a checkpoint now (tools and benchmarks; the
+  // filesystem does it by itself when the log has grown or time has passed).
+  void checkpoint_now();
   // Gives up to `max` freed segments back to the layer below now (the
   // background does it a few at a time). Returns how many.
   std::size_t discard_freed(std::size_t max = SIZE_MAX);
