@@ -137,6 +137,18 @@ void FileStore::flush() {
   }
 }
 
+void FileStore::discard(std::uint64_t offset, std::uint64_t length) {
+  if (read_only_ || length == 0) return;
+  check_range(offset, length);
+  if (block_device_) {
+    std::uint64_t range[2] = {offset, length};
+    (void)::ioctl(fd_, BLKDISCARD, &range);  // (unsupported: nothing to reclaim)
+  } else {
+    (void)::fallocate(fd_, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, static_cast<off_t>(offset),
+                      static_cast<off_t>(length));
+  }
+}
+
 // ---- MemStore --------------------------------------------------------------
 
 void MemStore::read(std::uint64_t offset, MutableByteView out) {
@@ -149,6 +161,12 @@ void MemStore::write(std::uint64_t offset, ByteView data) {
   std::lock_guard lock(mutex_);
   check_range(offset, data.size());
   std::copy(data.begin(), data.end(), data_.begin() + static_cast<std::ptrdiff_t>(offset));
+}
+
+void MemStore::discard(std::uint64_t offset, std::uint64_t length) {
+  std::lock_guard lock(mutex_);
+  check_range(offset, length);
+  std::fill_n(data_.begin() + static_cast<std::ptrdiff_t>(offset), length, 0);
 }
 
 Bytes MemStore::image() const {
@@ -183,6 +201,13 @@ void FaultStore::write(std::uint64_t offset, ByteView data) {
   ++writes_;
   std::copy(data.begin(), data.end(), current_.begin() + static_cast<std::ptrdiff_t>(offset));
   pending_.emplace_back(offset, Bytes(data.begin(), data.end()));
+}
+
+void FaultStore::discard(std::uint64_t offset, std::uint64_t length) {
+  std::lock_guard lock(mutex_);
+  check_range(offset, length);
+  std::fill_n(current_.begin() + static_cast<std::ptrdiff_t>(offset), length, 0);
+  pending_.emplace_back(offset, Bytes(length, 0));
 }
 
 void FaultStore::flush() {

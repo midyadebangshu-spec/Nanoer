@@ -94,9 +94,31 @@ std::size_t Journal::max_transaction_payload() const {
 std::uint64_t Journal::allocate(std::uint64_t keep_free) {
   if (free_segments() <= keep_free) throw Error(Errc::no_space, "the filesystem is full");
   for (std::uint64_t i = 0; i < sb_.segment_count; ++i) {
-    if (!segments_.contains(i) && !pending_free_.contains(i)) return i;
+    if (!segments_.contains(i) && !pending_free_.contains(i)) {
+      discard_.erase(i);  // written again instead
+      return i;
+    }
   }
   throw Error(Errc::no_space, "the filesystem is full");
+}
+
+void Journal::queue_discard(const std::vector<std::uint64_t>& written) {
+  if (!discard_on_) return;
+  for (std::uint64_t i : written) {
+    if (i < sb_.segment_count && !segments_.contains(i) && !pending_free_.contains(i)) discard_.insert(i);
+  }
+}
+
+std::size_t Journal::discard_some(std::size_t max) {
+  std::size_t n = 0;
+  while (n < max && !discard_.empty()) {
+    std::uint64_t i = *discard_.begin();
+    discard_.erase(discard_.begin());
+    store_.discard(sb_.segment_offset(i), sb_.segment_size());
+    ++n;
+    ++discarded_;
+  }
+  return n;
 }
 
 void Journal::open_segment(std::uint64_t index) {
@@ -254,6 +276,8 @@ void Journal::flush() {
 }
 
 void Journal::checkpoint_done(const LogPosition& start) {
+  // Released at the previous checkpoint: free now.
+  if (discard_on_) discard_.insert(pending_free_.begin(), pending_free_.end());
   pending_free_.clear();
   for (auto it = segments_.begin(); it != segments_.end();) {
     const auto& [index, usage] = *it;
@@ -271,6 +295,7 @@ void Journal::release_after_mount(const LogPosition& start, std::uint64_t log_en
   for (auto it = segments_.begin(); it != segments_.end();) {
     const auto& [index, usage] = *it;
     if (usage.live_bytes == 0 && usage.seq < start.seq && index != log_end_index) {
+      if (discard_on_) discard_.insert(index);
       it = segments_.erase(it);
     } else {
       ++it;
@@ -413,8 +438,12 @@ ReplayResult replay(Store& store, const Superblock& sb, std::uint64_t stop_befor
   // Sequence numbers must only ever grow, including past segments that were
   // started but never linked into the log, so look at every header.
   std::uint64_t max_seq = 0;
+  std::vector<std::uint64_t> written;
   for (std::uint64_t i = 0; i < sb.segment_count; ++i) {
-    if (auto h = read_segment_header(store, sb, i)) max_seq = std::max(max_seq, h->seq);
+    if (auto h = read_segment_header(store, sb, i)) {
+      max_seq = std::max(max_seq, h->seq);
+      written.push_back(i);
+    }
   }
 
   LogPosition start{(sb.checkpoint_offset - sb.data_start) >> sb.segment_shift, sb.checkpoint_seq,
@@ -524,7 +553,8 @@ ReplayResult replay(Store& store, const Superblock& sb, std::uint64_t stop_befor
     mem.account_nodes = false;
     snapshot.emplace(Metadata::from_legacy(*legacy, mem, std::make_shared<MemNodeIO>()));
   }
-  ReplayResult result{std::move(*snapshot), std::move(legacy), start, {}, max_seq, transactions, 0, stream.size(), {}};
+  ReplayResult result{std::move(*snapshot), std::move(legacy), start, {}, max_seq, transactions, 0, stream.size(), {},
+                      std::move(written)};
   Metadata& meta = result.meta;
   result.end = stopped ? *stopped : reader.position();
   result.log_bytes = reader.bytes() - checkpoint_log_bytes;

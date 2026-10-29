@@ -679,6 +679,27 @@ segment, and frees the old one. The selection policy matters: "greedy"
 (least live data) versus "cost-benefit" (also weighs data age, from Sprite
 LFS). GC must respect dedup reference counts and run when the disk is idle.
 
+**Giving space back: discard (M6 step 4).** Freed segments used to stay
+allocated in the layer below: an image file only grew (3.1 GiB allocated
+for 1.5 GiB of data after M5's recompression, §14), and an SSD kept
+treating them as live. Now a segment that becomes free is queued, and the
+background gives back 16 per second: `fallocate(PUNCH_HOLE)` on an image
+file, `BLKDISCARD` on a block device (errors ignored: it is a hint).
+
+- **Safety comes from what "free" already means:** only a segment the log
+  could write over at that moment is discarded, so zeroing it loses
+  nothing a checkpoint or its fallback needs; one the log takes back is
+  dropped from the queue (all under the filesystem's lock).
+- **Segments freed just before a crash** are not forgotten: mount already
+  reads every segment header, so every free segment whose header is still
+  intact is queued. Once discarded its header reads as zeros, so it is not
+  queued again.
+- **Tests:** the crash workload with GC gives segments back, recorded in
+  64 KiB pieces that a power cut may keep or lose one by one; every crash
+  point recovers. On a real image file, 9 segments of 1 MiB given back
+  took the allocated size from 10.2 MiB to 2.0 MiB. `-o nodiscard` turns it
+  off.
+
 A segment's life:
 
 ```mermaid
@@ -2486,6 +2507,7 @@ rejected.
 | 2026-10-27 | A damaged tree node falls back to the previous checkpoint (mount reads the root to see); `fsck --repair` salvages the newest checkpoint's readable nodes before searching segments for an older checkpoint | the root differs between checkpoints, other nodes are shared: falling back helps only for the root, and an older checkpoint's log runs into the same damage (measured in a test: almost everything lost) | reading every node at mount (slow mounts); duplicating nodes (twice the metadata) |
 | 2026-10-29 | Diagrams and charts in this file as Mermaid (flowcharts, sequence and state diagrams, a timeline, a quadrant chart, bar and line charts, a pie chart), each next to the table it shows; tables stay the exact record; checked by rendering every block | the user's request; Mermaid is text (diffs, reviews), GitHub draws it, nothing to regenerate | images made with a plotting library (binary files, a script to keep in sync, matplotlib not installed); ASCII art (no charts) |
 | 2026-10-29 | Streaming `fsck` added to M6 as step 5, after upgrade and discard (approved by the user) | the in-memory `fsck` of steps 1–3 needs about 400 bytes per file and 125 per chunk (≈ 860 MiB for 1M files × 4 chunks); stage 2 checks the root filesystem at boot, possibly on a small machine; streaming needs ≈ 20–40 bytes per chunk and inode | keeping the in-memory `fsck` until step 6's measurements (they would only confirm it); doing it before upgrade |
+| 2026-10-29 | Discard queued when a segment becomes free, given back 16 segments per background tick; at mount every free segment with an intact header is queued | free segments are exactly those the log may overwrite, so zeroing them is as safe as writing them; the header scan at mount finds those freed before a crash at no extra cost | discarding inline at each checkpoint (a slow device would stall commits); discarding every free segment at every mount (TRIM of a whole disk each time) |
 | 2026-10-27 | M5 proposed without an engine read-ahead (pending approval) | measured: the engine streams at 2,000 MB/s, a mount at 808 MB/s, so FUSE sets the speed | parallel prefetch into the safe space (STAGE1_PLAN's original M5 item) |
 
 ---

@@ -39,6 +39,7 @@ static_assert(kPackSize <= 65536);
 // live data out of a victim, and write the checkpoints that free it, even
 // when the filesystem is full.
 constexpr std::uint64_t kGcHeadroomSegments = 2;
+constexpr std::size_t kDiscardBatch = 16;  // segments given back per background tick
 constexpr std::uint64_t kMaxDirtyNodeBytes = 32 << 20;
 
 std::int64_t now() { return static_cast<std::int64_t>(now_ns()); }
@@ -132,6 +133,7 @@ std::unique_ptr<Filesystem> Filesystem::mount(Store& store, const Options& optio
   LogPosition end = replayed->end;
   LogPosition checkpoint = replayed->checkpoint;
   std::uint64_t next_seq = std::max(sb.next_segment_seq, replayed->max_seq + 1);
+  std::vector<std::uint64_t> written = std::move(replayed->written);
   std::unique_ptr<Filesystem> fs(new Filesystem(store, sb, std::move(*replayed), options, read_only));
   fs->damage_ = damage;
   fs->meta_.dedup.set_limit(options.dedup_memory);
@@ -144,6 +146,7 @@ std::unique_ptr<Filesystem> Filesystem::mount(Store& store, const Options& optio
     fs->journal_ = std::make_unique<Journal>(store, fs->sb_, fs->meta_.segments, next_seq);
     fs->node_io_ = std::dynamic_pointer_cast<LogNodeIO>(fs->meta_.io());
     if (fs->node_io_) fs->node_io_->set_journal(fs->journal_.get());
+    if (options.discard) fs->journal_->enable_discard();
     // Segments the mounted checkpoint no longer needs are kept until the
     // next checkpoint, so the previous checkpoint stays usable if this one
     // is damaged later. Only a filesystem too full to write frees them now.
@@ -170,6 +173,9 @@ std::unique_ptr<Filesystem> Filesystem::mount(Store& store, const Options& optio
     std::unique_lock lock(fs->mutex_);
     fs->journal_->resume(end, fs->meta_.last_txid);
     fs->journal_->set_reserve(fs->reserve_segments(), kGcHeadroomSegments);
+    // Free segments that may still hold data (freed before a crash, or
+    // while discard was off): discarded in the background.
+    fs->journal_->queue_discard(written);
     // Files deleted while still open when the system went down.
     for (InodeId id : fs->orphans()) fs->maybe_free(id);
     fs->commit();
@@ -219,6 +225,12 @@ bool Filesystem::dedup_step(std::size_t items) {
   return next.has_value();
 }
 
+std::size_t Filesystem::discard_freed(std::size_t max) {
+  std::unique_lock lock(mutex_);
+  if (read_only_ || failed_ || !journal_) return 0;
+  return journal_->discard_some(max);
+}
+
 void Filesystem::rebuild_dedup() {
   while (dedup_step(4096)) {
   }
@@ -250,6 +262,12 @@ void Filesystem::background() {
       maybe_checkpoint();
     } catch (const std::exception& e) {
       log_error("background commit failed", e);
+    }
+    try {
+      // Freed segments given back to the layer below, a few at a time.
+      discard_freed(kDiscardBatch);
+    } catch (const std::exception& e) {
+      log_error("discarding free segments failed", e);
     }
     try {
       // A slice of the dedup rebuild at a time, so commits are not held up.
@@ -1446,6 +1464,10 @@ FsInfo Filesystem::info() {
   info.read_errors = read_errors_;
   info.log_damaged = damage_.found;
   info.checkpoint_fallback = checkpoint_fallback_;
+  if (journal_) {
+    info.segments_discarded = journal_->discarded_segments();
+    info.discard_queued = journal_->discard_queued();
+  }
   info.segment_bytes = sb_.segment_size() - kSegmentHeaderSize - kSealRecordSize;
   info.gc = gc_stats_;
   info.tier = tier_stats_;

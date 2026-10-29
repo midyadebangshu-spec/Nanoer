@@ -29,6 +29,11 @@ struct FilesystemTestAccess {
     fs.meta_.dedup.put(key, target);
   }
   static const Metadata& metadata(Filesystem& fs) { return fs.meta_; }
+  static void checkpoint(Filesystem& fs) {
+    std::unique_lock lock(fs.mutex_);
+    fs.commit();
+    fs.checkpoint();
+  }
   // A file's committed chunks.
   static std::map<std::uint64_t, ChunkRef> chunks(Filesystem& fs, InodeId ino) {
     std::shared_lock lock(fs.mutex_);

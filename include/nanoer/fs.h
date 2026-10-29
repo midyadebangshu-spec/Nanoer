@@ -120,6 +120,8 @@ struct FsInfo {
   std::uint64_t read_errors = 0;     // reads that met damaged data
   bool log_damaged = false;          // replay found damage (mounted read-only)
   bool checkpoint_fallback = false;  // the newest checkpoint was damaged; mounted from the previous
+  std::uint64_t segments_discarded = 0;  // free segments given back to the layer below, since mounting
+  std::uint64_t discard_queued = 0;      // free segments still to give back
 };
 
 class Filesystem {
@@ -138,6 +140,7 @@ class Filesystem {
     // policy's setting; `max` folders use at most a day.
     std::int64_t cold_after_s = 7 * 24 * 60 * 60;
     bool dedup = true;  // store identical chunks once (needs shared records, and no no_dedup preference)
+    bool discard = true;  // give freed segments back (holes in an image file, TRIM); -o nodiscard
     std::uint64_t dedup_memory = 128 << 20;  // the dedup index's limit (beyond it: missed duplicates)
     bool read_only = false;
     bool count_lookups = true;  // FUSE lookup counting (in-process users turn it off)
@@ -208,6 +211,9 @@ class Filesystem {
   // chunks in the background (duplicates written before are missed until
   // then). This fills it now: tests and tools.
   void rebuild_dedup();
+  // Gives up to `max` freed segments back to the layer below now (the
+  // background does it a few at a time). Returns how many.
+  std::size_t discard_freed(std::size_t max = SIZE_MAX);
   bool read_only() const { return read_only_; }
   std::uint32_t chunk_size() const { return sb_.chunk_size(); }
   const Superblock& superblock() const { return sb_; }

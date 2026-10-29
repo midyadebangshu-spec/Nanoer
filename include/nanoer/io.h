@@ -28,6 +28,14 @@ class Store {
   virtual void write(std::uint64_t offset, ByteView data) = 0;
   // Returns once everything written so far survives a power cut.
   virtual void flush() = 0;
+  // The range's contents are no longer needed: the layer below may reclaim
+  // its space (a hole in an image file, TRIM on an SSD). Reads of it then
+  // return zeros, or the old contents if the layer below ignores it. A
+  // hint: errors are not reported. Nothing by default.
+  virtual void discard(std::uint64_t offset, std::uint64_t length) {
+    (void)offset;
+    (void)length;
+  }
 
   Bytes read(std::uint64_t offset, std::size_t size);
 
@@ -55,6 +63,8 @@ class FileStore final : public Store {
   void read(std::uint64_t offset, MutableByteView out) override;
   void write(std::uint64_t offset, ByteView data) override;
   void flush() override;
+  // Punches a hole in an image file, BLKDISCARD on a block device.
+  void discard(std::uint64_t offset, std::uint64_t length) override;
   using Store::read;
 
   bool is_block_device() const { return block_device_; }
@@ -79,6 +89,7 @@ class MemStore final : public Store {
   void read(std::uint64_t offset, MutableByteView out) override;
   void write(std::uint64_t offset, ByteView data) override;
   void flush() override {}
+  void discard(std::uint64_t offset, std::uint64_t length) override;  // zeros
   using Store::read;
 
   Bytes image() const;
@@ -99,6 +110,8 @@ class FaultStore final : public Store {
   void read(std::uint64_t offset, MutableByteView out) override;
   void write(std::uint64_t offset, ByteView data) override;
   void flush() override;
+  // Zeros, like a write of zeros that a power cut may or may not keep.
+  void discard(std::uint64_t offset, std::uint64_t length) override;
   using Store::read;
 
   struct CrashOptions {

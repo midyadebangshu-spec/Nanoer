@@ -644,6 +644,12 @@ slot points to, should the newest superblock write be torn. Therefore:
 - Each time a segment is (re)started it gets a new, higher sequence number,
   so records left from its earlier use can never be mistaken for current
   ones (§5.2).
+- A free segment may be **discarded**: a writer tells the layer below that
+  its contents are no longer needed (a hole punched in an image file,
+  TRIM on a device), so it may read back as zeros, in whole or in part.
+  Only segments a writer could write over at that moment are discarded,
+  so this needs no format change, and a reader treats a segment whose
+  header is zeros as free, like any other without a valid header.
 
 ## 11. A new filesystem
 

@@ -72,6 +72,18 @@ class RecordingStore final : public Store {
     fail_if_due();
     events_.push_back({true, 0, {}});
   }
+  // Zeros, in 64 KiB pieces that a power cut may keep or lose one by one
+  // (a disk may apply part of a discard).
+  void discard(std::uint64_t offset, std::uint64_t length) override {
+    check_range(offset, length);
+    constexpr std::uint64_t kPiece = 64 << 10;
+    for (std::uint64_t at = offset; at < offset + length; at += kPiece) {
+      std::uint64_t n = std::min(kPiece, offset + length - at);
+      fail_if_due();
+      std::fill_n(current_.begin() + static_cast<std::ptrdiff_t>(at), n, 0);
+      events_.push_back({false, at, Bytes(n, 0)});
+    }
+  }
   using Store::read;
 
   // From event number `n` on (counting from 0), every write and flush fails.
@@ -258,7 +270,10 @@ void workload(Filesystem& fs, const std::function<void()>& synced, Extra extra =
     if (step % 4 == 3) {
       fs.sync();
       synced();
-      if (gc && step % 24 == 23) fs.collect_garbage(0.97);
+      if (gc && step % 24 == 23) {
+        fs.collect_garbage(0.97);
+        fs.discard_freed();  // and a crash at every point of giving segments back
+      }
       if (extra == Extra::tier && step % 24 == 11) fs.recompress_cold(0);
     }
   }
@@ -303,6 +318,7 @@ Recording record_workload(Extra extra = Extra::none) {
     EXPECT_GT(info.dedup_hits, 20u) << "the workload must make dedup share data";
     EXPECT_GT(info.gc.records_copied, 100u) << "the workload must make GC move data";
     EXPECT_GE(info.gc.segments_emptied, 1u);
+    EXPECT_GT(info.segments_discarded, 0u) << "the workload must give segments back";
   }
   // A segment is (re)started when its header block is written.
   const Superblock& sb = fs->superblock();

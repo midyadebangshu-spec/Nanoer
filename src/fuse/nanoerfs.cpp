@@ -480,9 +480,11 @@ void usage(std::ostream& out) {
          "\n"
          "Options:\n"
          "  -o safe_space=SIZE   decompressed-chunk cache (default 256M)\n"
+         "  -o metadata_cache=SIZE  cache of metadata tree nodes (default 64M)\n"
          "  -o commit=SECONDS    commit interval (default 5)\n"
          "  -o ro                read-only\n"
          "  -o nodedup           do not deduplicate new data\n"
+         "  -o nodiscard         do not give freed space back (holes, TRIM)\n"
          "  -o cold_after=AGE    recompress data of files unchanged this long (7d, 12h, 30m,\n"
          "                       90s; never: not at all). Default 7d\n"
          "  -o idle=SECONDS      background work (garbage collection, recompressing cold\n"
@@ -555,6 +557,12 @@ int main(int argc, char** argv) {
         options.gc_idle_s = static_cast<unsigned>(*v);
       } else if (opt == "nodedup") {
         options.dedup = false;
+      } else if (opt == "nodiscard") {
+        options.discard = false;
+      } else if (opt.starts_with("metadata_cache=")) {
+        auto v = parse_size(opt.substr(15));
+        if (!v || *v < (1 << 20)) return false;
+        options.metadata_cache = *v;
       } else if (opt == "ro") {
         options.read_only = true;
         fuse_options.emplace_back("ro");

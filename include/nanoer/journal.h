@@ -136,6 +136,21 @@ class Journal {
   // written, so no older checkpoint can be fallen back to any more.
   void release_after_mount(const LogPosition& start, std::uint64_t log_end_index);
 
+  // Discard (docs/M6_PLAN.md §5): a segment that becomes free is queued, and
+  // discard_some() tells the store it is no longer needed. Only free
+  // segments are queued (a free segment is one the log may write over at
+  // any time, so zeroing it loses nothing), and one the log takes back is
+  // dropped from the queue. Off until enabled.
+  void enable_discard() { discard_on_ = true; }
+  // At mount: the free segments among `written` (those whose header is
+  // still intact, so they may hold data: freed before a crash, or before
+  // discard was enabled).
+  void queue_discard(const std::vector<std::uint64_t>& written);
+  // Discards up to `max` queued segments; returns how many.
+  std::size_t discard_some(std::size_t max);
+  std::size_t discard_queued() const { return discard_.size(); }
+  std::uint64_t discarded_segments() const { return discarded_; }
+
   // Normal appends leave this many free segments untouched, so a checkpoint
   // (which is what frees space) can always be written.
   // `gc_segments` of them may be used by garbage collection when space is
@@ -178,6 +193,9 @@ class Journal {
   std::uint64_t appended_txid_ = 0;  // newest transaction appended
   std::uint64_t durable_txid_ = 0;   // newest transaction made durable by a flush
   std::set<std::uint64_t> pending_free_;
+  bool discard_on_ = false;
+  std::set<std::uint64_t> discard_;
+  std::uint64_t discarded_ = 0;
   std::optional<SegmentWriter> writer_;
 };
 
@@ -202,6 +220,9 @@ struct ReplayResult {
   // Set when intact records after the end show that durable transactions
   // were lost: the log was damaged, and the state is only a prefix.
   LogDamage damage;
+  // Segments whose header is intact (this filesystem's): any of them that
+  // is free may still hold old records (discard).
+  std::vector<std::uint64_t> written;
 };
 
 // Reads the latest checkpoint and replays the log after it. Throws
