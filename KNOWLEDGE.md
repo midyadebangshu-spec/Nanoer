@@ -659,6 +659,35 @@ flowchart TD
   shared leaf, a node whose header disagrees, each derived item wrong).
   Not covered: a node damaged after mount is found when read (`EIO` for
   that operation), not at mount.
+- **Streaming `fsck` (step 5, `src/core/check_tree.cpp`).** The first
+  `fsck` on the tree (steps 2–3) loaded all of it into the in-memory form
+  of M2–M5: about 400 bytes per file and 125 per chunk. Now it reads the
+  tree once in key order, so each inode's items arrive together, and keeps
+  only a 48-byte record per inode and a 24-byte one per directory entry
+  (directory, child, name hash), plus lists of users for packs and shared
+  records. What makes that enough: a record without a list of users must
+  name its one chunk in its header (the invariant GC already relies on),
+  so no table of every record is needed; a record with a dedup identity
+  used by a chunk its header does not name is shared and has merely lost
+  its list (a derived fix), one without an identity belongs to another
+  file (the chunk is dropped). Directories, links, unlinked inodes and
+  lost+found are worked out from the two tables: a directory is reachable
+  if the chain of entries keeping it leads to `/`, anything else if a
+  reachable directory names it. Paths are looked up only for messages.
+  Repairs change items in the tree directly; a second read then rebuilds
+  everything derived (counts, the unlinked list, lists of users, totals,
+  the space of every segment, nodes included), and a checkpoint writes only
+  the changed nodes, with no transaction, so a crash before its superblock
+  leaves the filesystem as it was. Still in memory: filesystems from
+  before the tree (they need an upgrade to be written anyway), salvaging a
+  damaged tree, and rebuilding lost superblocks (both rare and explicit).
+  Measured (§14): 1M files, 149 MiB against 1,374 MiB, and 2.8× faster.
+  Two things the measurement found on the way, fixed for every mount: the
+  node cache counted nodes by their encoded size, while decoded they take
+  about 2.6× that (a 64 MiB cache held about 170 MiB); it now counts the
+  memory. And replay read the rest of the last segment (up to 64 MiB) into
+  memory, then copied it, to look for damage beyond the log's end: it now
+  reads 1 MiB at a time.
 - **Filesystems from before M6** (no `metadata_tree`) are replayed as
   before into the in-memory form, converted to a tree in memory, and
   mounted read-only until upgraded; their checkpoints stay version 1 or 2.
@@ -2253,6 +2282,35 @@ GC and cold-data variants take most of it. The sampled runs on every push
 take as long as before M6 (34 s for the first test, measured against the
 M5 build).
 
+### 2026-10-29: streaming `fsck` (M6 step 5)
+
+Images made in-process (`chunk_shift` 12 so files of 5,000 bytes have two
+chunks and are not packed; distinct text in each; 5,000 files per
+directory), release build, peak resident memory of `nanoer fsck` (check
+only); "before" is the previous commit (`89e76d4`), which loaded the tree
+into memory. The 1M-file image takes 1.3 GB.
+
+| Image | `fsck` before | `fsck` now | `--deep` before | `--deep` now |
+|---|---:|---:|---:|---:|
+| 200,000 files, 400,000 chunks | 337 MiB, 2.1 s | **86 MiB**, 1.2 s | 337 MiB, 5.0 s | 86 MiB, 4.3 s |
+| 1,000,000 files, 2,000,000 chunks | 1,374 MiB, 18.1 s | **149 MiB**, 6.5 s | 1,374 MiB, 32.3 s | 149 MiB, 20.9 s |
+
+```mermaid
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#4C78A8, #F58518"}}}}%%
+xychart-beta
+    title "fsck peak memory, MiB (bars: before, line: streaming)"
+    x-axis ["200k files", "1M files"]
+    y-axis "MiB" 0 --> 1400
+    bar [337, 1374]
+    line [86, 149]
+```
+
+About 80 bytes per file now (2 chunks each), on top of about 70 MiB that
+does not grow (the node cache, buffers). The same build's fixes for every
+mount: `nanoer info` on the 1M-file image 82 → 11 MiB (replay no longer
+holds a whole segment), `nanoer stats` (a mount and a walk of every file)
+437 → 304 MiB (the node cache now keeps to its budget).
+
 ### 2026-10-27: M5, cold data on real mounts
 
 Release build, image files on the VM's disk, 4 cores, default mount
@@ -2547,6 +2605,8 @@ rejected.
 | 2026-10-29 | Streaming `fsck` added to M6 as step 5, after upgrade and discard (approved by the user) | the in-memory `fsck` of steps 1–3 needs about 400 bytes per file and 125 per chunk (≈ 860 MiB for 1M files × 4 chunks); stage 2 checks the root filesystem at boot, possibly on a small machine; streaming needs ≈ 20–40 bytes per chunk and inode | keeping the in-memory `fsck` until step 6's measurements (they would only confirm it); doing it before upgrade |
 | 2026-10-29 | Discard queued when a segment becomes free, given back 16 segments per background tick; at mount every free segment with an intact header is queued | free segments are exactly those the log may overwrite, so zeroing them is as safe as writing them; the header scan at mount finds those freed before a crash at no extra cost | discarding inline at each checkpoint (a slow device would stall commits); discarding every free segment at every mount (TRIM of a whole disk each time) |
 | 2026-10-29 | `nanoer upgrade` reads the tree back and compares it before switching; single-user records whose header names another chunk get a refs item; test images made by the real M2–M5 builds over FUSE, kept in the repository (xz) with manifests | the switch-over is the only irreversible step, so it comes after a full check; GC needs every record's user; images from the real builds test what users actually have, not what today's code thinks old code wrote | converting in place (no going back after a crash); images made by today's code with old feature bits (would miss old encodings and behaviours) |
+| 2026-10-29 | Streaming `fsck`: one pass in key order with 48 bytes per inode and 24 per entry; single-user records checked against their header instead of a table of records; repairs as item changes, then a second pass rebuilds everything derived; a checkpoint without a transaction | measured 9× less memory at 1M files (149 against 1,374 MiB) and 2.8× faster; the header rule is the one GC already depends on | external sorting of a full reference table (more I/O, more code); keeping the in-memory check (≈ 860 MiB+ for a full Linux system at boot) |
+| 2026-10-29 | The node cache counts a node's memory, not its encoded size; replay scans past the log's end 1 MiB at a time | measured: a 64 MiB cache held ≈ 170 MiB, and every mount briefly held a whole segment twice (≈ 124 MiB) | — |
 | 2026-10-27 | M5 proposed without an engine read-ahead (pending approval) | measured: the engine streams at 2,000 MB/s, a mount at 808 MB/s, so FUSE sets the speed | parallel prefetch into the safe space (STAGE1_PLAN's original M5 item) |
 
 ---

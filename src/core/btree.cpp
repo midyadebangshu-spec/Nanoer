@@ -69,9 +69,26 @@ constexpr std::size_t kMaxValue = 16 << 20;
 
 struct BTree::Cache {
   explicit Cache(std::uint64_t limit) : budget(limit) {}
+
+  // The memory a decoded node takes, which is what the budget counts (its
+  // encoded size is several times less: every value is a vector of its own).
+  static std::uint64_t memory_of(const Node& n) {
+    auto heap = [](std::uint64_t size) { return size ? (size + 8 + 15) & ~std::uint64_t{15} : 0; };  // as malloc
+    std::uint64_t m = heap(sizeof(Node)) + 64 /* shared_ptr, cache entry */ +
+                      heap(n.keys.capacity() * sizeof(TreeKey)) + heap(n.values.capacity() * sizeof(Bytes)) +
+                      heap(n.children.capacity() * sizeof(Node::Child));
+    for (const Bytes& v : n.values) m += heap(v.capacity());
+    return m;
+  }
+
   std::uint64_t budget;
   std::mutex mutex;
-  std::list<std::pair<std::uint64_t, ConstNodePtr>> lru;  // most recent first
+  struct Entry {
+    std::uint64_t offset;
+    ConstNodePtr node;
+    std::uint64_t memory;
+  };
+  std::list<Entry> lru;  // most recent first
   std::unordered_map<std::uint64_t, decltype(lru)::iterator> index;
   std::uint64_t bytes = 0;
   std::uint64_t hits = 0, misses = 0;
@@ -85,17 +102,18 @@ struct BTree::Cache {
     }
     ++hits;
     lru.splice(lru.begin(), lru, it->second);
-    return it->second->second;
+    return it->second->node;
   }
   void put(std::uint64_t offset, ConstNodePtr node) {
+    std::uint64_t memory = memory_of(*node);
     std::lock_guard lock(mutex);
     erase_locked(offset);
-    bytes += node->bytes;
-    lru.emplace_front(offset, std::move(node));
+    bytes += memory;
+    lru.push_front({offset, std::move(node), memory});
     index.emplace(offset, lru.begin());
     while (bytes > budget && lru.size() > 1) {
-      bytes -= lru.back().second->bytes;
-      index.erase(lru.back().first);
+      bytes -= lru.back().memory;
+      index.erase(lru.back().offset);
       lru.pop_back();
     }
   }
@@ -106,7 +124,7 @@ struct BTree::Cache {
   void erase_locked(std::uint64_t offset) {
     auto it = index.find(offset);
     if (it == index.end()) return;
-    bytes -= it->second->second->bytes;
+    bytes -= it->second->memory;
     lru.erase(it->second);
     index.erase(it);
   }

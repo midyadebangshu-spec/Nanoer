@@ -40,7 +40,7 @@ complete; M6 (on-disk metadata, migration, benchmark report; plan in
 - `include/nanoer/`: public headers. `src/core/`: the engine (`fs.cpp` is the
   POSIX layer, `journal.cpp` the log, `metadata.cpp` the operations).
   `src/fuse/`: `nanoerfs` (also `mount.nanoer`). `src/tools/`: `mkfs.nanoer`,
-  `nanoer` (also `fsck.nanoer`), `nanoer-fsx`. `src/core/check.cpp`: fsck.
+  `nanoer` (also `fsck.nanoer`), `nanoer-fsx`. `src/core/check.cpp`: fsck (`check_tree.cpp`: its streaming check of the tree).
   `src/core/gc.cpp`: garbage collection. `src/core/dedup.cpp`: the dedup
   index. `src/core/stats.cpp`: `nanoer stats`. `src/core/tier.cpp`: cold data
   (`nanoer tier`). `src/core/policy.cpp`: folder policies (`nanoer policy`). Packing is in `fs.cpp`'s

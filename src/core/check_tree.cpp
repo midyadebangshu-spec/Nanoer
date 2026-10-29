@@ -109,6 +109,13 @@ class TreeCheck {
   };
 
   void contents() {
+    // Exactly as many as the totals say (if they are sane), not twice that
+    // by doubling.
+    std::uint64_t inodes = meta_.counters.files + meta_.counters.directories + meta_.counters.other_inodes;
+    if (inodes < (std::uint64_t{1} << 32)) {
+      inodes_.reserve(inodes + 16);
+      entries_.reserve(inodes + 16);
+    }
     meta_.scan({}, [&](const TreeKey& k, ByteView v) {
       item(k, v);
       return true;

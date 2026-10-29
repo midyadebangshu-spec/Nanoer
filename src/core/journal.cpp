@@ -391,13 +391,23 @@ std::uint64_t claims_after(Store& store, const Superblock& sb, std::uint64_t ind
   if (index >= sb.segment_count || !seen.insert(index).second) return 0;
   std::uint64_t end = sb.segment_offset(index) + sb.segment_size();
   if (from >= end) return 0;
-  Bytes buf = store.read(from, static_cast<std::size_t>(end - from));
-  MemStore rest(buf);  // records are parsed from this copy, at offsets relative to `from`
+  // Read a window at a time (a whole segment at once costs its size in
+  // memory at every mount), looking for the record magic at every 8 bytes.
+  constexpr std::uint64_t kWindow = 1 << 20;
+  Bytes window;
+  std::uint64_t window_at = 0;
+  auto magic_at = [&](std::uint64_t at) {
+    if (window.empty() || at < window_at || at + 4 > window_at + window.size()) {
+      window_at = at;
+      window = store.read(at, static_cast<std::size_t>(std::min(kWindow, end - at)));
+    }
+    return load_le<std::uint32_t>(window.data() + (at - window_at));
+  };
   std::uint64_t claim = 0;
-  for (std::uint64_t pos = skip_first ? kRecordAlignment : 0; pos + kRecordHeaderSize <= buf.size();
-       pos += kRecordAlignment) {
-    if (load_le<std::uint32_t>(buf.data() + pos) != kRecordMagic) continue;  // cheap filter
-    std::optional<Record> r = try_read_record(rest, pos, buf.size(), seq);
+  for (std::uint64_t at = from + (skip_first ? kRecordAlignment : 0); at + kRecordHeaderSize <= end;
+       at += kRecordAlignment) {
+    if (magic_at(at) != kRecordMagic) continue;  // cheap filter
+    std::optional<Record> r = try_read_record(store, at, end, seq);
     if (!r) continue;
     claim = std::max(claim, durable_claim(*r));
     if (r->header.type == RecordType::segment_seal && r->extra.size() == kSealExtraSize) {
@@ -408,7 +418,7 @@ std::uint64_t claims_after(Store& store, const Superblock& sb, std::uint64_t ind
                                                kSegmentHeaderSize,
                                            false, seen));
     }
-    pos += r->stored_size() - kRecordAlignment;
+    at += r->stored_size() - kRecordAlignment;
   }
   return claim;
 }

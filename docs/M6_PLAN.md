@@ -226,7 +226,8 @@ docs/format.md, docs/BENCHMARKS.md, KNOWLEDGE.md, README.md
 3. **Safety:** crash points, `fsck` for the tree, fuzzing; the format
    document.
 4. **Upgrade and discard.**
-5. **Streaming `fsck`** (added 2026-10-29): walk the tree in key order
+5. **Streaming `fsck`** (added 2026-10-29; done: 149 MiB at 1M files
+   instead of 1,374, KNOWLEDGE.md §14): walk the tree in key order
    with per-record and per-inode counts only, and repair by changing
    items in the tree, instead of loading everything into memory (about
    860 MiB for 1M files × 4 chunks, so a boot-time check could fail on a
