@@ -80,10 +80,16 @@ class BTree {
   BTree& operator=(const BTree&) = delete;
 
   std::optional<Bytes> get(const TreeKey& key) const;
+  // Calls `fn` with the value of `key`, if there, without copying it;
+  // returns whether it was there.
+  bool read(const TreeKey& key, const std::function<void(ByteView)>& fn) const;
   // Inserts or replaces.
   void put(const TreeKey& key, ByteView value);
   // Returns whether the key was there.
   bool erase(const TreeKey& key);
+  // Removes every item with from <= key <= to, a leaf at a time; returns
+  // how many.
+  std::uint64_t erase_range(const TreeKey& from, const TreeKey& to);
   // Calls `fn` for each item with from <= key <= to, in order, until it
   // returns false.
   void scan(const TreeKey& from, const TreeKey& to,
@@ -151,6 +157,10 @@ class BTree {
   NodePtr writable_root();
   std::optional<Split> insert(Node& node, const TreeKey& key, ByteView value);
   bool remove(Node& node, const TreeKey& key);
+  // Removes the items from `first` (which is in the tree) to `to` that are
+  // in first's leaf; returns how many.
+  std::uint64_t remove_run(Node& node, const TreeKey& first, const TreeKey& to);
+  void shrink_root();
   void rebalance(Node& parent, std::size_t i);
   NodeRef write(Node& node);
   std::uint64_t count(const Node& node) const;

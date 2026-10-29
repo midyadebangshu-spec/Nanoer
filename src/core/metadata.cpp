@@ -1,7 +1,9 @@
 #include "nanoer/metadata.h"
 
 #include <algorithm>
+#include <array>
 #include <cstring>
+#include <mutex>
 
 #include <sys/stat.h>
 
@@ -111,6 +113,7 @@ ChunkRef decode_chunk_item(ByteView v) {
 
 Bytes encode_refs(const Refs& r) {
   Encoder out;
+  out.reserve(10 + r.users.size() * 12);
   out.varint(r.count);
   out.varint(r.users.size());
   for (const ChunkUser& u : r.users) {
@@ -126,6 +129,7 @@ Refs decode_refs(ByteView v) {
   r.count = u32(in.varint());
   std::uint64_t n = in.varint();
   if (n != r.count || n > v.size()) corrupt("reference count disagrees with its users");
+  r.users.reserve(n);
   for (std::uint64_t i = 0; i < n; ++i) {
     ChunkUser u;
     u.ino = in.varint();
@@ -195,6 +199,37 @@ class Metadata::Nodes final : public NodeStore {
   Metadata* owner;
 };
 
+// Decoded inodes by number, a slot each (direct-mapped): almost every
+// request reads an inode, often the same one several times (a lookup, then
+// its attributes, then the operation), and decoding one costs as much as
+// finding it. Updated with every inode item Metadata writes; emptied when
+// the tree is handed out for changes. About 450 KiB.
+struct Metadata::InodeCache {
+  static constexpr std::size_t kSlots = 4096;
+  std::mutex mutex;
+  std::array<std::optional<InodeAttrs>, kSlots> slots;
+
+  std::optional<InodeAttrs> get(InodeId ino) {
+    std::lock_guard lock(mutex);
+    const auto& s = slots[ino % kSlots];
+    if (s && s->id == ino) return s;
+    return std::nullopt;
+  }
+  void put(const InodeAttrs& a) {
+    std::lock_guard lock(mutex);
+    slots[a.id % kSlots] = a;
+  }
+  void erase(InodeId ino) {
+    std::lock_guard lock(mutex);
+    auto& s = slots[ino % kSlots];
+    if (s && s->id == ino) s.reset();
+  }
+  void clear() {
+    std::lock_guard lock(mutex);
+    for (auto& s : slots) s.reset();
+  }
+};
+
 // ---- construction --------------------------------------------------------------
 
 Metadata::Metadata(std::uint64_t data_start, unsigned segment_shift, const Options& options,
@@ -204,7 +239,8 @@ Metadata::Metadata(std::uint64_t data_start, unsigned segment_shift, const Optio
       options_(options),
       io_(std::move(io)),
       nodes_(std::make_unique<Nodes>(this)),
-      tree_(std::make_unique<BTree>(*nodes_, options.tree, root)) {
+      tree_(std::make_unique<BTree>(*nodes_, options.tree, root)),
+      inode_cache_(std::make_unique<InodeCache>()) {
   options_.cold_data = options_.shared_records && options_.cold_data;
 }
 
@@ -222,7 +258,8 @@ Metadata::Metadata(Metadata&& o) noexcept
       options_(o.options_),
       io_(std::move(o.io_)),
       nodes_(std::move(o.nodes_)),
-      tree_(std::move(o.tree_)) {
+      tree_(std::move(o.tree_)),
+      inode_cache_(std::move(o.inode_cache_)) {
   if (nodes_) nodes_->owner = this;
 }
 
@@ -240,6 +277,7 @@ Metadata& Metadata::operator=(Metadata&& o) noexcept {
   tree_.reset();
   nodes_ = std::move(o.nodes_);
   tree_ = std::move(o.tree_);
+  inode_cache_ = std::move(o.inode_cache_);
   if (nodes_) nodes_->owner = this;
   return *this;
 }
@@ -263,9 +301,16 @@ Metadata Metadata::empty(std::uint64_t data_start, unsigned segment_shift, const
 // ---- reading -------------------------------------------------------------------
 
 std::optional<InodeAttrs> Metadata::attrs(InodeId ino) const {
-  std::optional<Bytes> v = tree_->get(key(ino, item_kind::inode));
-  if (!v) return std::nullopt;
-  return decode_inode(*v);
+  if (std::optional<InodeAttrs> a = inode_cache_->get(ino)) return a;
+  std::optional<InodeAttrs> out;
+  tree_->read(key(ino, item_kind::inode), [&](ByteView v) { out = decode_inode(v); });
+  if (out) inode_cache_->put(*out);
+  return out;
+}
+
+BTree& Metadata::tree() {
+  inode_cache_->clear();
+  return *tree_;
 }
 
 InodeAttrs Metadata::need(InodeId ino) const {
@@ -275,8 +320,9 @@ InodeAttrs Metadata::need(InodeId ino) const {
 }
 
 InodeCounts Metadata::counts(InodeId ino) const {
-  std::optional<Bytes> v = tree_->get(key(ino, item_kind::counts));
-  return v ? decode_counts(*v) : InodeCounts{};
+  InodeCounts out;
+  tree_->read(key(ino, item_kind::counts), [&](ByteView v) { out = decode_counts(v); });
+  return out;
 }
 
 void Metadata::put_counts(InodeId ino, const InodeCounts& c) {
@@ -288,9 +334,9 @@ void Metadata::put_counts(InodeId ino, const InodeCounts& c) {
 }
 
 std::optional<ChunkRef> Metadata::chunk(InodeId ino, std::uint64_t index) const {
-  std::optional<Bytes> v = tree_->get(key(ino, item_kind::chunk, index));
-  if (!v) return std::nullopt;
-  return decode_chunk_item(*v);
+  std::optional<ChunkRef> out;
+  tree_->read(key(ino, item_kind::chunk, index), [&](ByteView v) { out = decode_chunk_item(v); });
+  return out;
 }
 
 void Metadata::chunks(InodeId ino, std::uint64_t from,
@@ -309,12 +355,13 @@ bool Metadata::has_chunk_from(InodeId ino, std::uint64_t from) const {
 }
 
 std::optional<InodeId> Metadata::entry(InodeId dir, std::string_view name) const {
-  std::optional<Bytes> v = tree_->get(key(dir, item_kind::entry, name_hash(name)));
-  if (!v) return std::nullopt;
-  for (const auto& [n, ino] : decode_entries(*v)) {
-    if (n == name) return ino;
-  }
-  return std::nullopt;
+  std::optional<InodeId> out;
+  tree_->read(key(dir, item_kind::entry, name_hash(name)), [&](ByteView v) {
+    for (const auto& [n, ino] : decode_entries(v)) {
+      if (n == name && !out) out = ino;
+    }
+  });
+  return out;
 }
 
 void Metadata::entries(InodeId dir, const std::function<bool(std::string_view, InodeId)>& fn) const {
@@ -517,7 +564,8 @@ void Metadata::apply(const Op& op) {
     c.data_bytes = c.data_bytes - std::min<std::uint64_t>(c.data_bytes, old ? old->size : 0) + ref.size;
     put_counts(ino, c);
   };
-  auto remove_chunks = [&](InodeId ino, std::uint64_t from, std::uint64_t to) {
+  // `deleting`: the inode goes too, with its counts and chunk items.
+  auto remove_chunks = [&](InodeId ino, std::uint64_t from, std::uint64_t to, bool deleting = false) {
     std::vector<std::pair<std::uint64_t, ChunkRef>> gone;
     chunks(ino, from, [&](std::uint64_t index, const ChunkRef& ref) {
       if (index > to) return false;
@@ -525,6 +573,10 @@ void Metadata::apply(const Op& op) {
       return true;
     });
     if (gone.empty()) return;
+    if (deleting) {
+      for (const auto& [index, ref] : gone) drop_ref(ref, {ino, index});
+      return;
+    }
     InodeCounts c = counts(ino);
     for (const auto& [index, ref] : gone) {
       drop_ref(ref, {ino, index});
@@ -541,6 +593,7 @@ void Metadata::apply(const Op& op) {
             if (std::optional<InodeAttrs> old = attrs(o.attrs.id)) count_inode(*old, -1);
             count_inode(o.attrs, +1);
             tree_->put(key(o.attrs.id, item_kind::inode), encode_inode(o.attrs));
+            inode_cache_->put(o.attrs);
             if (o.attrs.nlink == 0 && o.attrs.id != kRootInode) {
               tree_->put(key(0, item_kind::orphan, o.attrs.id), {});
             } else {
@@ -551,14 +604,10 @@ void Metadata::apply(const Op& op) {
           [&](const op::DeleteInode& o) {
             if (o.ino == kRootInode) corrupt("deleting the root directory");
             InodeAttrs a = need(o.ino);
-            remove_chunks(o.ino, 0, UINT64_MAX);
-            // Everything else under the inode: attributes, counts, xattrs, entries.
-            std::vector<TreeKey> keys;
-            tree_->scan(key(o.ino, 0, 0), key(o.ino, item_kind::entry, UINT64_MAX), [&](const TreeKey& k, ByteView) {
-              keys.push_back(k);
-              return true;
-            });
-            for (const TreeKey& k : keys) tree_->erase(k);
+            remove_chunks(o.ino, 0, UINT64_MAX, true);
+            // Everything under the inode: attributes, counts, xattrs, entries, chunks.
+            tree_->erase_range(key(o.ino, 0, 0), key(o.ino, UINT8_MAX, UINT64_MAX));
+            inode_cache_->erase(o.ino);
             tree_->erase(key(0, item_kind::orphan, o.ino));
             count_inode(a, -1);
           },

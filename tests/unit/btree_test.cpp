@@ -1,4 +1,5 @@
-// The copy-on-write B+tree on its own: against a std::map model, copy on
+// The copy-on-write B+tree on its own: against a std::map model (puts,
+// erases of keys and of ranges, gets, scans), copy on
 // write (old roots stay readable, exactly the replaced nodes released),
 // splits and merges at every level, relocation, the cache's budget, and
 // damaged nodes (docs/M6_PLAN.md §3).
@@ -124,6 +125,13 @@ TEST(BTree, RandomOperationsMatchAMap) {
         model[key(i)] = v;
       } else if (op < 85) {
         ASSERT_EQ(t->erase(key(i)), model.erase(key(i)) == 1) << "step " << step;
+      } else if (op < 87) {
+        // A run of keys, often across leaves.
+        TreeKey from = key(i), to = key(i + rng() % 60);
+        auto first = model.lower_bound(from), last = model.upper_bound(to);
+        auto n = static_cast<std::uint64_t>(std::distance(first, last));
+        model.erase(first, last);
+        ASSERT_EQ(t->erase_range(from, to), n) << "step " << step;
       } else if (op < 95) {
         auto got = t->get(key(i));
         auto it = model.find(key(i));

@@ -163,7 +163,9 @@ class Metadata {
   std::uint64_t dirty_bytes() const;  // changed since the last flush (roughly)
 
   const std::shared_ptr<NodeIO>& io() const { return io_; }
-  BTree& tree() { return *tree_; }
+  // Changing the tree directly (fsck) bypasses the inode cache: it is
+  // emptied here.
+  BTree& tree();
   const BTree& tree() const { return *tree_; }
 
   // The same files, entries, chunks and attributes (for tests): compares
@@ -184,6 +186,7 @@ class Metadata {
 
  private:
   class Nodes;  // the tree's NodeStore: space accounting around the NodeIO
+  struct InodeCache;  // decoded inodes, most recently read
 
   void claim(std::uint64_t offset, std::uint64_t bytes);
   void release(std::uint64_t offset, std::uint64_t bytes);
@@ -199,6 +202,7 @@ class Metadata {
   std::shared_ptr<NodeIO> io_;
   std::unique_ptr<Nodes> nodes_;
   std::unique_ptr<BTree> tree_;
+  std::unique_ptr<InodeCache> inode_cache_;
 };
 
 }  // namespace nanoer

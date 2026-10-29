@@ -4,12 +4,15 @@
 
 namespace nanoer {
 
-void Encoder::varint(std::uint64_t v) {
+void Encoder::long_varint(std::uint64_t v) {
+  std::uint8_t tmp[10];
+  std::size_t n = 0;
   while (v >= 0x80) {
-    buf_.push_back(static_cast<std::uint8_t>(v | 0x80));
+    tmp[n++] = static_cast<std::uint8_t>(v | 0x80);
     v >>= 7;
   }
-  buf_.push_back(static_cast<std::uint8_t>(v));
+  tmp[n++] = static_cast<std::uint8_t>(v);
+  buf_.insert(buf_.end(), tmp, tmp + n);
 }
 
 void Encoder::svarint(std::int64_t v) {
@@ -26,12 +29,7 @@ void Decoder::fail(const char* what) const {
                                  std::to_string(pos_));
 }
 
-std::uint8_t Decoder::u8() {
-  if (pos_ >= data_.size()) fail("unexpected end");
-  return data_[pos_++];
-}
-
-std::uint64_t Decoder::varint() {
+std::uint64_t Decoder::long_varint() {
   std::uint64_t v = 0;
   for (unsigned shift = 0; shift < 64; shift += 7) {
     std::uint8_t b = u8();
@@ -40,11 +38,6 @@ std::uint64_t Decoder::varint() {
     if (!(b & 0x80)) return v;
   }
   fail("integer too long");
-}
-
-std::int64_t Decoder::svarint() {
-  std::uint64_t v = varint();
-  return static_cast<std::int64_t>((v >> 1) ^ (0 - (v & 1)));
 }
 
 ByteView Decoder::raw(std::size_t n) {

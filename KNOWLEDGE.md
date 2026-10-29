@@ -688,6 +688,22 @@ flowchart TD
   memory. And replay read the rest of the last segment (up to 64 MiB) into
   memory, then copied it, to look for damage beyond the log's end: it now
   reads 1 MiB at a time.
+- **Speed of small operations** (step 6): deleting a file cost 8× its M5
+  price in the engine (42,000 instructions against 5,200: every lookup
+  walks the tree and decodes, where M5 read a hash map), enough to make
+  `rm -rf` 21 % slower on a mount. Five changes, each measured with
+  callgrind: values are read in place instead of copied; an inode's items
+  go with one range erase (`BTree::erase_range`) and no counts are
+  rewritten for an inode being deleted; the last 4,096 decoded inodes are
+  kept (direct-mapped by number, ≈ 450 KiB, updated with every inode item
+  written, emptied when fsck takes the tree); one-byte integers are
+  decoded and encoded inline; and a leaf keeps its values end to end in
+  one buffer with their end offsets, so removing or inserting an item
+  moves bytes instead of a few hundred separate vectors, and copying a
+  leaf is two allocations. Deletion now costs 21,000 instructions, file
+  creation 17,000 (M5: 8,000). Most of what is left is the list of users
+  of a pack, rewritten whole for every piece removed (back-references),
+  and the walks themselves.
 - **Filesystems from before M6** (no `metadata_tree`) are replayed as
   before into the in-memory form, converted to a tree in memory, and
   mounted read-only until upgraded; their checkpoints stay version 1 or 2.

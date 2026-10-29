@@ -12,10 +12,70 @@ namespace nanoer {
 
 // ---- nodes -----------------------------------------------------------------
 
+namespace {
+
+// A leaf's values, end to end in one buffer: removing or inserting an item
+// moves bytes, not hundreds of separately allocated vectors, and copying a
+// leaf (copy on write) is two allocations.
+class Values {
+ public:
+  std::size_t size() const { return ends_.size(); }
+  ByteView operator[](std::size_t i) const { return ByteView(blob_).subspan(start(i), ends_[i] - start(i)); }
+  void push_back(ByteView v) { insert(size(), v); }
+  void insert(std::size_t i, ByteView v) {
+    std::size_t at = start(i);
+    blob_.insert(blob_.begin() + static_cast<std::ptrdiff_t>(at), v.begin(), v.end());
+    ends_.insert(ends_.begin() + static_cast<std::ptrdiff_t>(i), static_cast<std::uint32_t>(at + v.size()));
+    for (std::size_t j = i + 1; j < ends_.size(); ++j) ends_[j] += static_cast<std::uint32_t>(v.size());
+  }
+  void replace(std::size_t i, ByteView v) {
+    std::size_t at = start(i), old = ends_[i] - at;
+    if (v.size() == old) {
+      std::copy(v.begin(), v.end(), blob_.begin() + static_cast<std::ptrdiff_t>(at));
+      return;
+    }
+    erase(i, 1);
+    insert(i, v);
+  }
+  void erase(std::size_t i, std::size_t n) {
+    if (n == 0) return;
+    std::size_t from = start(i), to = ends_[i + n - 1];
+    blob_.erase(blob_.begin() + static_cast<std::ptrdiff_t>(from), blob_.begin() + static_cast<std::ptrdiff_t>(to));
+    ends_.erase(ends_.begin() + static_cast<std::ptrdiff_t>(i), ends_.begin() + static_cast<std::ptrdiff_t>(i + n));
+    for (std::size_t j = i; j < ends_.size(); ++j) ends_[j] -= static_cast<std::uint32_t>(to - from);
+  }
+  // Items [from, to) as values of their own.
+  Values slice(std::size_t from, std::size_t to) const {
+    Values out;
+    std::size_t base = start(from);
+    out.blob_.assign(blob_.begin() + static_cast<std::ptrdiff_t>(base), blob_.begin() + static_cast<std::ptrdiff_t>(start(to)));
+    for (std::size_t j = from; j < to; ++j) out.ends_.push_back(static_cast<std::uint32_t>(ends_[j] - base));
+    return out;
+  }
+  void truncate(std::size_t n) {
+    blob_.resize(start(n));
+    ends_.resize(n);
+  }
+  void append(const Values& o) {
+    std::size_t base = blob_.size();
+    blob_.insert(blob_.end(), o.blob_.begin(), o.blob_.end());
+    for (std::uint32_t e : o.ends_) ends_.push_back(static_cast<std::uint32_t>(base + e));
+  }
+  std::size_t blob_capacity() const { return blob_.capacity(); }
+  std::size_t ends_capacity() const { return ends_.capacity(); }
+
+ private:
+  std::size_t start(std::size_t i) const { return i ? ends_[i - 1] : 0; }
+  Bytes blob_;
+  std::vector<std::uint32_t> ends_;
+};
+
+}  // namespace
+
 struct BTree::Node {
   std::uint8_t level = 0;
   std::vector<TreeKey> keys;  // leaves: the items' keys; inner: each child's first key
-  std::vector<Bytes> values;  // leaves
+  Values values;              // leaves
   struct Child {
     NodeRef ref;    // on disk (clean), or where the dirty copy came from
     NodePtr dirty;  // changed since the last flush
@@ -71,14 +131,12 @@ struct BTree::Cache {
   explicit Cache(std::uint64_t limit) : budget(limit) {}
 
   // The memory a decoded node takes, which is what the budget counts (its
-  // encoded size is several times less: every value is a vector of its own).
+  // encoded size is less: keys are decoded to 24 bytes, values get end offsets).
   static std::uint64_t memory_of(const Node& n) {
     auto heap = [](std::uint64_t size) { return size ? (size + 8 + 15) & ~std::uint64_t{15} : 0; };  // as malloc
-    std::uint64_t m = heap(sizeof(Node)) + 64 /* shared_ptr, cache entry */ +
-                      heap(n.keys.capacity() * sizeof(TreeKey)) + heap(n.values.capacity() * sizeof(Bytes)) +
-                      heap(n.children.capacity() * sizeof(Node::Child));
-    for (const Bytes& v : n.values) m += heap(v.capacity());
-    return m;
+    return heap(sizeof(Node)) + 64 /* shared_ptr, cache entry */ + heap(n.keys.capacity() * sizeof(TreeKey)) +
+           heap(n.values.blob_capacity()) + heap(n.values.ends_capacity() * sizeof(std::uint32_t)) +
+           heap(n.children.capacity() * sizeof(Node::Child));
   }
 
   std::uint64_t budget;
@@ -189,8 +247,10 @@ BTree::ConstNodePtr BTree::load(const NodeRef& ref) const {
   node->keys = std::move(d.keys);
   node->bytes = kHeaderBytes;
   if (node->leaf()) {
-    node->values = std::move(d.values);
-    for (const Bytes& v : node->values) node->bytes += item_bytes(v);
+    for (const Bytes& v : d.values) {
+      node->values.push_back(v);
+      node->bytes += item_bytes(v);
+    }
   } else {
     for (const NodeRef& c : d.children) node->children.push_back({c, nullptr});
     node->bytes += node->count() * (kKeyBytes + kChildBytes);
@@ -237,10 +297,16 @@ void BTree::drop(Node& node) {
 }
 
 std::optional<Bytes> BTree::get(const TreeKey& key) const {
+  std::optional<Bytes> out;
+  read(key, [&](ByteView v) { out.emplace(v.begin(), v.end()); });
+  return out;
+}
+
+bool BTree::read(const TreeKey& key, const std::function<void(ByteView)>& fn) const {
   const Node* node = root_.get();
   ConstNodePtr hold;
   if (!node) {
-    if (!root_ref_) return std::nullopt;
+    if (!root_ref_) return false;
     hold = load(root_ref_);
     node = hold.get();
   }
@@ -254,8 +320,9 @@ std::optional<Bytes> BTree::get(const TreeKey& key) const {
     }
   }
   auto it = std::lower_bound(node->keys.begin(), node->keys.end(), key);
-  if (it == node->keys.end() || *it != key) return std::nullopt;
-  return node->values[static_cast<std::size_t>(it - node->keys.begin())];
+  if (it == node->keys.end() || *it != key) return false;
+  fn(node->values[static_cast<std::size_t>(it - node->keys.begin())]);
+  return true;
 }
 
 void BTree::put(const TreeKey& key, ByteView value) {
@@ -280,10 +347,10 @@ std::optional<BTree::Split> BTree::insert(Node& node, const TreeKey& key, ByteVi
     auto i = static_cast<std::size_t>(it - node.keys.begin());
     if (it != node.keys.end() && *it == key) {
       node.bytes -= item_bytes(node.values[i]);
-      node.values[i].assign(value.begin(), value.end());
+      node.values.replace(i, value);
     } else {
       node.keys.insert(it, key);
-      node.values.insert(node.values.begin() + static_cast<std::ptrdiff_t>(i), Bytes(value.begin(), value.end()));
+      node.values.insert(i, value);
     }
     node.bytes += item_bytes(value);
     if (node.bytes <= options_.node_bytes || node.count() < 2) return std::nullopt;
@@ -295,14 +362,13 @@ std::optional<BTree::Split> BTree::insert(Node& node, const TreeKey& key, ByteVi
     auto right = std::make_shared<Node>();
     right->level = 0;
     right->keys.assign(node.keys.begin() + static_cast<std::ptrdiff_t>(at), node.keys.end());
-    right->values.assign(std::make_move_iterator(node.values.begin() + static_cast<std::ptrdiff_t>(at)),
-                         std::make_move_iterator(node.values.end()));
+    right->values = node.values.slice(at, node.count());
     node.keys.resize(at);
-    node.values.resize(at);
+    node.values.truncate(at);
     node.bytes = kHeaderBytes;
-    for (const Bytes& v : node.values) node.bytes += item_bytes(v);
+    for (std::size_t j = 0; j < at; ++j) node.bytes += item_bytes(node.values[j]);
     right->bytes = kHeaderBytes;
-    for (const Bytes& v : right->values) right->bytes += item_bytes(v);
+    for (std::size_t j = 0; j < right->count(); ++j) right->bytes += item_bytes(right->values[j]);
     dirty_bytes_ += options_.node_bytes;
     return Split{right->keys.front(), right};
   }
@@ -331,11 +397,32 @@ std::optional<BTree::Split> BTree::insert(Node& node, const TreeKey& key, ByteVi
 
 bool BTree::erase(const TreeKey& key) {
   if (!root_ && !root_ref_) return false;
-  if (!get(key)) return false;  // nothing to copy for a key that is not there
+  if (!read(key, [](ByteView) {})) return false;  // nothing to copy for a key that is not there
   NodePtr root = writable_root();
   remove(*root, key);
-  // A root with one child is replaced by it; an empty leaf root is an
-  // empty tree.
+  shrink_root();
+  return true;
+}
+
+std::uint64_t BTree::erase_range(const TreeKey& from, const TreeKey& to) {
+  std::uint64_t removed = 0;
+  while (root_ || root_ref_) {
+    std::optional<TreeKey> first;
+    scan(from, to, [&](const TreeKey& k, ByteView) {
+      first = k;
+      return false;
+    });
+    if (!first) break;
+    NodePtr root = writable_root();
+    removed += remove_run(*root, *first, to);
+    shrink_root();
+  }
+  return removed;
+}
+
+// A root with one child is replaced by it; an empty inner root is an empty
+// tree.
+void BTree::shrink_root() {
   while (!root_->leaf() && root_->count() <= 1) {
     if (root_->count() == 0) {  // everything removed: an empty leaf
       drop(*root_);
@@ -347,7 +434,6 @@ bool BTree::erase(const TreeKey& key) {
     drop(*root_);
     root_ = child;
   }
-  return true;
 }
 
 bool BTree::remove(Node& node, const TreeKey& key) {
@@ -357,12 +443,31 @@ bool BTree::remove(Node& node, const TreeKey& key) {
     auto i = static_cast<std::size_t>(it - node.keys.begin());
     node.bytes -= item_bytes(node.values[i]);
     node.keys.erase(it);
-    node.values.erase(node.values.begin() + static_cast<std::ptrdiff_t>(i));
+    node.values.erase(i, 1);
     return true;
   }
   std::size_t i = child_index(node, key);
   NodePtr child = child_for_write(node, i);
   bool removed = remove(*child, key);
+  if (child->count() > 0) node.keys[i] = child->keys.front();
+  if (child->count() == 0 || child->bytes < options_.node_bytes / 4) rebalance(node, i);
+  return removed;
+}
+
+std::uint64_t BTree::remove_run(Node& node, const TreeKey& first, const TreeKey& to) {
+  if (node.leaf()) {
+    auto from = std::lower_bound(node.keys.begin(), node.keys.end(), first);
+    auto end = std::upper_bound(from, node.keys.end(), to);
+    auto i = static_cast<std::ptrdiff_t>(from - node.keys.begin());
+    auto n = static_cast<std::ptrdiff_t>(end - from);
+    for (auto j = i; j < i + n; ++j) node.bytes -= item_bytes(node.values[static_cast<std::size_t>(j)]);
+    node.keys.erase(from, end);
+    node.values.erase(static_cast<std::size_t>(i), static_cast<std::size_t>(n));
+    return static_cast<std::uint64_t>(n);
+  }
+  std::size_t i = child_index(node, first);
+  NodePtr child = child_for_write(node, i);
+  std::uint64_t removed = remove_run(*child, first, to);
   if (child->count() > 0) node.keys[i] = child->keys.front();
   if (child->count() == 0 || child->bytes < options_.node_bytes / 4) rebalance(node, i);
   return removed;
@@ -386,8 +491,7 @@ void BTree::rebalance(Node& parent, std::size_t i) {
   if (payload <= options_.node_bytes) {
     left->keys.insert(left->keys.end(), right->keys.begin(), right->keys.end());
     if (left->leaf()) {
-      left->values.insert(left->values.end(), std::make_move_iterator(right->values.begin()),
-                          std::make_move_iterator(right->values.end()));
+      left->values.append(right->values);
     } else {
       left->children.insert(left->children.end(), std::make_move_iterator(right->children.begin()),
                             std::make_move_iterator(right->children.end()));
@@ -405,17 +509,17 @@ void BTree::rebalance(Node& parent, std::size_t i) {
   keys.insert(keys.end(), right->keys.begin(), right->keys.end());
   std::size_t at;
   if (left->leaf()) {
-    std::vector<Bytes> values = std::move(left->values);
-    values.insert(values.end(), std::make_move_iterator(right->values.begin()), std::make_move_iterator(right->values.end()));
+    Values values = std::move(left->values);
+    values.append(right->values);
     std::uint64_t half = payload / 2, acc = 0;
     at = 0;
     while (at + 1 < keys.size() && acc + item_bytes(values[at]) <= half) acc += item_bytes(values[at++]);
     if (at == 0) at = 1;
-    left->values.assign(std::make_move_iterator(values.begin()), std::make_move_iterator(values.begin() + static_cast<std::ptrdiff_t>(at)));
-    right->values.assign(std::make_move_iterator(values.begin() + static_cast<std::ptrdiff_t>(at)), std::make_move_iterator(values.end()));
+    left->values = values.slice(0, at);
+    right->values = values.slice(at, keys.size());
     left->bytes = right->bytes = kHeaderBytes;
-    for (const Bytes& v : left->values) left->bytes += item_bytes(v);
-    for (const Bytes& v : right->values) right->bytes += item_bytes(v);
+    for (std::size_t j = 0; j < at; ++j) left->bytes += item_bytes(values[j]);
+    for (std::size_t j = at; j < keys.size(); ++j) right->bytes += item_bytes(values[j]);
   } else {
     std::vector<Node::Child> children = std::move(left->children);
     children.insert(children.end(), std::make_move_iterator(right->children.begin()), std::make_move_iterator(right->children.end()));
@@ -478,7 +582,7 @@ NodeRef BTree::write(Node& node) {
   out.varint(node.count());
   for (const TreeKey& k : node.keys) put_key(out, k);
   if (node.leaf()) {
-    for (const Bytes& v : node.values) out.bytes(v);
+    for (std::size_t i = 0; i < node.count(); ++i) out.bytes(node.values[i]);
   } else {
     for (Node::Child& c : node.children) {
       if (c.dirty) {
