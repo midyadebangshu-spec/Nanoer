@@ -1,6 +1,7 @@
 add_library(nanoer_core STATIC
   core/cache.cpp
   core/check.cpp
+  core/check_tree.cpp
   core/checksum.cpp
   core/codec.cpp
   core/dedup.cpp

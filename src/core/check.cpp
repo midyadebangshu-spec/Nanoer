@@ -22,6 +22,7 @@
 #include "nanoer/metadata.h"
 #include "nanoer/record.h"
 #include "nanoer/segment.h"
+#include "check_tree.h"
 
 namespace nanoer {
 
@@ -196,8 +197,16 @@ class Checker {
     superblocks();
     if (!loaded_) return;
     log();
+    if (!replayed_) return;
+    if (has_metadata_tree(sb_) && !salvaged_) {
+      // Streaming: the tree is read in key order (check_tree.cpp).
+      bool changed = check_tree({store_, sb_, options_, report_, replayed_->meta, node_live_});
+      if (options_.repair) write_tree(changed);
+      return;
+    }
+    // Filesystems from before the tree (and a salvaged tree): everything
+    // in memory.
     if (!meta_) return;
-    derived();
     tree();
     space();
     if (options_.repair) repair();
@@ -322,8 +331,11 @@ class Checker {
       }
     }();
     try {
-      if (has_metadata_tree(sb)) walk_nodes(r);
-      loaded_meta_ = materialize(r);
+      if (has_metadata_tree(sb)) {
+        walk_nodes(r);
+      } else {
+        loaded_meta_ = materialize(r);
+      }
       // The tree's nodes hold space too.
       node_live_.clear();
       r.meta.tree().for_each_node([&](const NodeRef& ref) {
@@ -417,66 +429,6 @@ class Checker {
           }
         };
     visit(root, std::nullopt, {});
-  }
-
-  // Phase 2b (with the metadata tree): what the tree keeps besides the
-  // files themselves, derived from them, must agree with them. The repair
-  // writes the tree again, which derives it all afresh.
-  void derived() {
-    if (!has_metadata_tree(sb_) || salvaged_) return;  // (a salvaged tree is written again anyway)
-    const Metadata& m = replayed_->meta;
-    auto wrong = [&](const std::string& what) {
-      error(what);
-      new_checkpoint_ = true;
-    };
-    MetaCounters want;
-    std::size_t bad_counts = 0;
-    std::set<InodeId> orphans;
-    std::map<std::uint64_t, std::vector<ChunkUser>> users;
-    std::set<std::uint64_t> packs;
-    for (const auto& [id, inode] : meta_->inodes) {
-      InodeCounts c;
-      c.entries = inode.entries.size();
-      for (const auto& [index, ref] : inode.chunks) {
-        c.data_bytes += ref.size;
-        users[ref.offset].push_back({id, index});
-        if (ref.packed) packs.insert(ref.offset);
-      }
-      if (m.counts(id) != c) ++bad_counts;
-      if (inode.is_regular()) {
-        ++want.files;
-        want.logical_bytes += inode.size;
-      } else if (inode.is_dir()) {
-        ++want.directories;
-      } else {
-        ++want.other_inodes;
-      }
-      if (inode.nlink == 0 && id != kRootInode) orphans.insert(id);
-    }
-    for (const auto& [index, bytes] : node_live_) want.node_bytes += bytes;
-    if (bad_counts) wrong(std::to_string(bad_counts) + " inodes' entry or data counts are wrong");
-    if (!(m.counters == want)) wrong("the filesystem's totals (files, directories, sizes, tree size) are wrong");
-    std::vector<InodeId> listed = m.orphans();
-    if (std::set<InodeId>(listed.begin(), listed.end()) != orphans) wrong("the list of unlinked inodes is wrong");
-    // Back-references: a pack, and a record with several users, lists
-    // exactly its users; a record once shared may list its last one.
-    auto order = [](const ChunkUser& a, const ChunkUser& b) {
-      return std::pair(a.ino, a.index) < std::pair(b.ino, b.index);
-    };
-    std::size_t bad_refs = 0;
-    std::set<std::uint64_t> with_refs;
-    m.for_each_shared([&](std::uint64_t offset, const std::vector<ChunkUser>& list) {
-      with_refs.insert(offset);
-      std::vector<ChunkUser> a = list, b = users.contains(offset) ? users.at(offset) : std::vector<ChunkUser>{};
-      std::sort(a.begin(), a.end(), order);
-      std::sort(b.begin(), b.end(), order);
-      if (a != b) ++bad_refs;
-      return true;
-    });
-    for (const auto& [offset, list] : users) {
-      if ((list.size() > 1 || packs.contains(offset)) && !with_refs.contains(offset)) ++bad_refs;
-    }
-    if (bad_refs) wrong(std::to_string(bad_refs) + " records' lists of users are wrong");
   }
 
   // Phase 3.
@@ -807,6 +759,29 @@ class Checker {
       if (hash_key(h.data()) != ref.hash) return "its identity does not match its data";
     }
     return {};
+  }
+
+  // With the tree: the repaired tree (only its changed nodes) and a
+  // checkpoint; no transaction, so a crash before the superblock leaves
+  // the filesystem as it was.
+  void write_tree(bool changed) {
+    if (!(changed || new_checkpoint_ || rewrite_both_ || clear_errors_flag_)) return;
+    Metadata& meta = replayed_->meta;
+    Journal journal(store_, sb_, meta.segments, std::max(sb_.next_segment_seq, replayed_->max_seq + 1));
+    if (auto io = std::dynamic_pointer_cast<LogNodeIO>(meta.io())) io->set_journal(&journal);
+    journal.resume(replayed_->end, meta.last_txid);
+    LogPosition at = journal.append_checkpoint(meta);
+    journal.flush();
+    sb_.checkpoint_offset = at.offset;
+    sb_.checkpoint_seq = at.seq;
+    sb_.next_segment_seq = journal.next_seq();
+    sb_.state &= ~state_flags::errors;
+    write_superblock(store_, sb_);
+    if (rewrite_both_) write_superblock(store_, sb_);
+    journal.checkpoint_done(at);
+    for (std::string& e : report_.errors) report_.fixed.push_back(std::move(e));
+    report_.errors.clear();
+    if (clear_errors_flag_) report_.fixed.push_back("cleared the errors flag");
   }
 
   // Writes the repairs: one transaction, then a new checkpoint.

@@ -27,7 +27,15 @@ TreeKey refs_key(std::uint64_t record) { return {kRefsObject | record, item_kind
 bool is_dir(const InodeAttrs& a) { return S_ISDIR(a.mode); }
 bool is_regular(const InodeAttrs& a) { return S_ISREG(a.mode); }
 
-Bytes encode(const InodeAttrs& a) {
+}  // namespace
+
+// ---- items (docs/format.md §9.2), shared with fsck (meta_encoding.h) --------------
+
+namespace meta {
+
+TreeKey refs_key_of(std::uint64_t record) { return {kRefsObject | record, item_kind::refs, 0}; }
+
+Bytes encode_inode(const InodeAttrs& a) {
   Encoder out;
   encode_attrs(out, a);
   return out.take();
@@ -39,12 +47,6 @@ InodeAttrs decode_inode(ByteView v) {
   if (!in.done()) corrupt("trailing bytes in an inode item");
   return a;
 }
-
-// (name, value) pairs: entries (value an inode number) and xattrs.
-template <class V>
-struct Named {
-  std::vector<std::pair<std::string, V>> items;
-};
 
 Bytes encode_entries(const std::vector<std::pair<std::string, InodeId>>& list) {
   Encoder out;
@@ -107,11 +109,6 @@ ChunkRef decode_chunk_item(ByteView v) {
   return r;
 }
 
-struct Refs {
-  std::uint32_t count = 0;
-  std::vector<ChunkUser> users;
-};
-
 Bytes encode_refs(const Refs& r) {
   Encoder out;
   out.varint(r.count);
@@ -155,7 +152,7 @@ InodeCounts decode_counts(ByteView v) {
   return c;
 }
 
-}  // namespace
+}  // namespace meta
 
 std::uint64_t name_hash(std::string_view name) { return xxh3_64(as_bytes(name)); }
 
@@ -543,7 +540,7 @@ void Metadata::apply(const Op& op) {
             if (o.attrs.id == 0) corrupt("inode number 0");
             if (std::optional<InodeAttrs> old = attrs(o.attrs.id)) count_inode(*old, -1);
             count_inode(o.attrs, +1);
-            tree_->put(key(o.attrs.id, item_kind::inode), encode(o.attrs));
+            tree_->put(key(o.attrs.id, item_kind::inode), encode_inode(o.attrs));
             if (o.attrs.nlink == 0 && o.attrs.id != kRootInode) {
               tree_->put(key(0, item_kind::orphan, o.attrs.id), {});
             } else {
@@ -733,7 +730,7 @@ Metadata Metadata::from_legacy(const LegacyMetadata& old, const Options& options
   for (InodeId id : ids) {
     const Inode& inode = old.inodes.at(id);
     const InodeAttrs& a = inode;
-    m.tree_->put(key(id, item_kind::inode), encode(a));
+    m.tree_->put(key(id, item_kind::inode), encode_inode(a));
     m.count_inode(a, +1);
     if (a.nlink == 0 && id != kRootInode) m.tree_->put(key(0, item_kind::orphan, id), {});
     InodeCounts c;
