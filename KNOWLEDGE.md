@@ -2425,6 +2425,39 @@ first run, M5's spread there is 0.64–0.69 s, and cold reads load tree
 nodes from disk that M5 had in memory). Most of `rm -rf`'s remaining cost
 is the list of a pack's users, rewritten whole for each piece removed.
 
+### 2026-10-30: the workloads against M5 after 1A and 2A (M6 step 6)
+
+Two more runs of `bench/workloads_vs.sh` (3 rounds each), after the
+in-place pack lists, 8 request threads, compact lookup counts, packed
+pieces read in place (run 1), and the counts kept in the inode cache
+(run 2). The VM was much noisier than on 2026-10-29 (M5's own untar
+ranged 4.81–7.75 s in run 2):
+
+| Workload | Run 1 ÷ M5 | Run 2 ÷ M5 |
+|---|---:|---:|
+| untar | 0.99 | 1.09 |
+| git clone | 0.86 | 0.97 |
+| cmake configure | 1.05 | 0.94 |
+| compile | 1.01 | 0.94 |
+| find | 1.15 | 1.08 |
+| grep -r (warm) | 1.10 | 1.05 |
+| grep -r (cold) | 1.02 | 0.92 |
+| tar the tree (cold) | 1.00 | 1.03 |
+| rm -rf | 1.06 | 1.23 (M6 1.14–1.52 s, M5 1.14–1.32 s) |
+
+Taken apart, `rm -rf`: the untarred tree alone is 5 % slower than M5
+(0.90 against 0.86 s, nanoerfs CPU 0.56 against 0.49 s); with the clone
+and the build tree 9 % (1.20–1.25 against 1.04–1.10 s; CPU +0.13 s); a
+512 MB file is as fast (0.03 s). In nanoerfs (callgrind, `rm -rf` of the
+tree only) the deletes cost 123M instructions against M5's 37M: unlink
+and forget walk the tree about eight times per file where M5 read hash
+maps. Memory with 1M files: 501 MiB after reading, 539 after writing
+(peak 605), within the new target of 576 MiB.
+
+**Against the target:** everything within 10 % in run 2 except `rm -rf`,
+whose ratio moved from 1.06 to 1.23 between runs of the same build on
+this VM; three rounds cannot settle a 10 % question here.
+
 ### 2026-10-27: M5, cold data on real mounts
 
 Release build, image files on the VM's disk, 4 cores, default mount

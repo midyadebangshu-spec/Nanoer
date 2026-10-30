@@ -239,7 +239,9 @@ docs/format.md, docs/BENCHMARKS.md, KNOWLEDGE.md, README.md
    559 MiB after reads and 628 after writes, after limiting glibc's
    arenas (1,372 before); the workloads within 10 % of M5 except `rm -rf`
    (+13 %) and one cold `tar` (+19 %) after making small operations
-   cheaper.)
+   cheaper. 2026-10-30, after the approved 1A and 2A: 501 / 539 MiB, within
+   the new 576 MiB target; everything within 10 % except `rm -rf`, 1.06
+   and 1.23 in two runs on a noisy VM.)
 7. **The benchmark report.**
 8. Documentation and the report to you.
 
