@@ -264,27 +264,49 @@ class Metadata::Nodes final : public NodeStore {
 // Decoded inodes by number, a slot each (direct-mapped): almost every
 // request reads an inode, often the same one several times (a lookup, then
 // its attributes, then the operation), and decoding one costs as much as
-// finding it. Updated with every inode item Metadata writes; emptied when
-// the tree is handed out for changes. About 450 KiB.
+// finding it; listing a directory also reads each file's counts (its size
+// in blocks). Updated with every inode and counts item Metadata writes;
+// emptied when the tree is handed out for changes. About 600 KiB.
 struct Metadata::InodeCache {
   static constexpr std::size_t kSlots = 4096;
+  struct Slot {
+    InodeAttrs attrs;
+    std::optional<InodeCounts> counts;  // not read yet
+  };
   std::mutex mutex;
-  std::array<std::optional<InodeAttrs>, kSlots> slots;
+  std::array<std::optional<Slot>, kSlots> slots;
 
   std::optional<InodeAttrs> get(InodeId ino) {
     std::lock_guard lock(mutex);
     const auto& s = slots[ino % kSlots];
-    if (s && s->id == ino) return s;
+    if (s && s->attrs.id == ino) return s->attrs;
     return std::nullopt;
   }
   void put(const InodeAttrs& a) {
     std::lock_guard lock(mutex);
-    slots[a.id % kSlots] = a;
+    auto& s = slots[a.id % kSlots];
+    if (s && s->attrs.id == a.id) {
+      s->attrs = a;
+    } else {
+      s = Slot{a, std::nullopt};
+    }
+  }
+  std::optional<InodeCounts> get_counts(InodeId ino) {
+    std::lock_guard lock(mutex);
+    const auto& s = slots[ino % kSlots];
+    if (s && s->attrs.id == ino) return s->counts;
+    return std::nullopt;
+  }
+  // Only for an inode whose attributes are here.
+  void put_counts(InodeId ino, const InodeCounts& c) {
+    std::lock_guard lock(mutex);
+    auto& s = slots[ino % kSlots];
+    if (s && s->attrs.id == ino) s->counts = c;
   }
   void erase(InodeId ino) {
     std::lock_guard lock(mutex);
     auto& s = slots[ino % kSlots];
-    if (s && s->id == ino) s.reset();
+    if (s && s->attrs.id == ino) s.reset();
   }
   void clear() {
     std::lock_guard lock(mutex);
@@ -382,12 +404,15 @@ InodeAttrs Metadata::need(InodeId ino) const {
 }
 
 InodeCounts Metadata::counts(InodeId ino) const {
+  if (std::optional<InodeCounts> c = inode_cache_->get_counts(ino)) return *c;
   InodeCounts out;
   tree_->read(key(ino, item_kind::counts), [&](ByteView v) { out = decode_counts(v); });
+  inode_cache_->put_counts(ino, out);
   return out;
 }
 
 void Metadata::put_counts(InodeId ino, const InodeCounts& c) {
+  inode_cache_->put_counts(ino, c);
   if (c == InodeCounts{}) {
     tree_->erase(key(ino, item_kind::counts));
   } else {

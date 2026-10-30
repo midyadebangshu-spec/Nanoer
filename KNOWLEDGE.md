@@ -695,7 +695,7 @@ flowchart TD
   callgrind: values are read in place instead of copied; an inode's items
   go with one range erase (`BTree::erase_range`) and no counts are
   rewritten for an inode being deleted; the last 4,096 decoded inodes are
-  kept (direct-mapped by number, ≈ 450 KiB, updated with every inode item
+  kept, with their counts (direct-mapped by number, ≈ 600 KiB, updated with every inode and counts item
   written, emptied when fsck takes the tree); one-byte integers are
   decoded and encoded inline; and a leaf keeps its values end to end in
   one buffer with their end offsets, so removing or inserting an item
