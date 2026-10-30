@@ -18,7 +18,8 @@ and publish the report.
 
 1. **RAM is bounded.** `nanoerfs` with 1 million files and 4 million chunks
    (≈ 500 GB of data) stays within its configured budgets (safe space +
-   metadata cache + dedup index) plus at most 64 MiB, whatever the file
+   metadata cache + dedup index + unwritten data; changed 2026-10-30 to
+   count unwritten data, approved) plus at most 64 MiB, whatever the file
    count. Today: 857 MiB of metadata alone (§2).
 2. **Mount and checkpoints cost what changed, not what exists.** Mounting
    that filesystem takes under 1 s plus replaying the log since the last
