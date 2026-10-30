@@ -28,6 +28,7 @@
 #include "nanoer/format.h"
 #include "nanoer/gc.h"
 #include "nanoer/journal.h"
+#include "nanoer/lookup_counts.h"
 #include "nanoer/metadata.h"
 #include "nanoer/policy.h"
 #include "nanoer/stats.h"
@@ -248,7 +249,13 @@ class Filesystem {
   Attr create(InodeId parent, std::string_view name, std::uint32_t mode, std::uint64_t rdev,
               std::string_view target, const Caller& caller);
   Bytes load_chunk(InodeId ino, std::uint64_t index);  // shared lock is enough
-  std::shared_ptr<const Bytes> read_chunk(const ChunkRef& ref);  // shared lock is enough
+  // A chunk's bytes, and what keeps them alive (the cached record: a
+  // pack's piece is not copied out of it).
+  struct StoredChunk {
+    std::shared_ptr<const Bytes> owner;
+    ByteView data;
+  };
+  StoredChunk read_chunk(const ChunkRef& ref);  // shared lock is enough
   Bytes& dirty_chunk(InodeId ino, std::uint64_t index);
   void drop_dirty(InodeId ino, std::uint64_t first_index);
   void truncate(InodeAttrs& file, std::uint64_t size);
@@ -413,8 +420,8 @@ class Filesystem {
   std::set<std::pair<std::uint64_t, std::uint64_t>> tier_skip_;  // records found damaged
 
   std::mutex counts_mutex_;  // FUSE lookup and open counts
-  std::unordered_map<InodeId, std::uint64_t> lookups_;
-  std::unordered_map<InodeId, std::uint64_t> opens_;
+  LookupCounts lookups_;
+  LookupCounts opens_;
 
   std::mutex background_mutex_;
   std::condition_variable background_wake_;

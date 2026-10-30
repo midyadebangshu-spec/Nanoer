@@ -158,6 +158,68 @@ InodeCounts decode_counts(ByteView v) {
 
 }  // namespace meta
 
+namespace {
+
+// A refs item changed by one user without decoding its list: a pack's
+// item lists every piece, and is rewritten for each one added or removed
+// (KNOWLEDGE.md §7.5). The same encoding as encode_refs().
+std::uint32_t refs_count(Decoder& in) {
+  std::uint64_t count = in.varint();
+  if (count > UINT32_MAX || in.varint() != count) corrupt("reference count disagrees with its users");
+  return static_cast<std::uint32_t>(count);
+}
+
+// With `user` added at the end.
+Bytes refs_with(ByteView v, const ChunkUser& user) {
+  Decoder in(v);
+  std::uint32_t count = refs_count(in);
+  if (count == UINT32_MAX) corrupt("too many references to one record");
+  ByteView users = v.subspan(v.size() - in.remaining());
+  Encoder out;
+  out.reserve(v.size() + 24);
+  out.varint(count + 1);
+  out.varint(count + 1);
+  out.raw(users);
+  out.varint(user.ino);
+  out.varint(user.index);
+  return out.take();
+}
+
+// With one `user` removed (nothing if it is not listed); `left` is the
+// count after.
+std::optional<Bytes> refs_without(ByteView v, const ChunkUser& user, std::uint32_t& left) {
+  Decoder in(v);
+  std::uint32_t count = refs_count(in);
+  std::size_t from = 0, to = 0;
+  bool found = false;
+  for (std::uint32_t i = 0; i < count; ++i) {
+    std::size_t at = v.size() - in.remaining();
+    ChunkUser u;
+    u.ino = in.varint();
+    u.index = in.varint();
+    if (!found && u == user) {
+      found = true;
+      from = at;
+      to = v.size() - in.remaining();
+    }
+  }
+  if (!in.done()) corrupt("trailing bytes in a refs item");
+  if (!found) return std::nullopt;
+  left = count - 1;
+  Decoder head(v);
+  refs_count(head);
+  std::size_t body = v.size() - head.remaining();
+  Encoder out;
+  out.reserve(v.size());
+  out.varint(left);
+  out.varint(left);
+  out.raw(v.subspan(body, from - body));
+  out.raw(v.subspan(to));
+  return out.take();
+}
+
+}  // namespace
+
 std::uint64_t name_hash(std::string_view name) { return xxh3_64(as_bytes(name)); }
 
 // ---- nodes -------------------------------------------------------------------
@@ -477,24 +539,14 @@ void Metadata::add_ref(const ChunkRef& ref, bool share, const ChunkUser& user, c
   std::optional<Bytes> v = tree_->get(refs_key(ref.offset));
   if (ref.packed) {
     if (share) corrupt("a pack piece marked as shared");
-    Refs r = v ? decode_refs(*v) : Refs{};
     if (!v) claim(ref.offset, ref.stored_size);
-    if (r.count == UINT32_MAX) corrupt("too many references to one record");
-    ++r.count;
-    r.users.push_back(user);
-    tree_->put(refs_key(ref.offset), encode_refs(r));
+    tree_->put(refs_key(ref.offset), refs_with(v ? ByteView(*v) : ByteView(encode_refs({})), user));
   } else if (share) {
-    Refs r;
-    if (v) {
-      r = decode_refs(*v);
-    } else {
+    if (!v) {
       if (!owner) corrupt("a record shared for the first time without its owner");
-      r = {1, {*owner}};
+      v = encode_refs({1, {*owner}});
     }
-    if (r.count == UINT32_MAX) corrupt("too many references to one record");
-    ++r.count;
-    r.users.push_back(user);
-    tree_->put(refs_key(ref.offset), encode_refs(r));
+    tree_->put(refs_key(ref.offset), refs_with(*v, user));
   } else {
     if (v) corrupt("a new chunk at a location already in use");
     claim(ref.offset, ref.stored_size);
@@ -513,13 +565,11 @@ void Metadata::drop_ref(const ChunkRef& ref, const ChunkUser& user) {
     release(ref.offset, ref.stored_size);
     return;
   }
-  Refs r = decode_refs(*v);
-  auto it = std::find(r.users.begin(), r.users.end(), user);
-  if (it == r.users.end()) corrupt("a reference missing from its record's users");
-  r.users.erase(it);
-  --r.count;
-  if (r.count > 0) {
-    tree_->put(refs_key(ref.offset), encode_refs(r));
+  std::uint32_t left = 0;
+  std::optional<Bytes> rest = refs_without(*v, user, left);
+  if (!rest) corrupt("a reference missing from its record's users");
+  if (left > 0) {
+    tree_->put(refs_key(ref.offset), *rest);
     return;
   }
   tree_->erase(refs_key(ref.offset));

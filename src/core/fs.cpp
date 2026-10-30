@@ -388,7 +388,7 @@ void Filesystem::touch(InodeAttrs& i, bool content) {
 void Filesystem::count_lookup(InodeId ino) {
   if (!options_.count_lookups) return;
   std::lock_guard lock(counts_mutex_);
-  ++lookups_[ino];
+  lookups_.add(ino);
 }
 
 void Filesystem::maybe_free(InodeId ino) {
@@ -449,7 +449,7 @@ Attr Filesystem::make_attr(const InodeAttrs& i) const {
   return a;
 }
 
-std::shared_ptr<const Bytes> Filesystem::read_chunk(const ChunkRef& ref) {
+Filesystem::StoredChunk Filesystem::read_chunk(const ChunkRef& ref) {
   std::uint64_t segment = meta_.segment_of(ref.offset);
   auto it = meta_.segments.find(segment);
   if (it == meta_.segments.end()) throw Error(Errc::corrupt, "chunk in a free segment");
@@ -461,15 +461,16 @@ std::shared_ptr<const Bytes> Filesystem::read_chunk(const ChunkRef& ref) {
     return std::make_shared<const Bytes>(decode_data_chunk(record));
   });
   if (!ref.packed && data->size() != ref.size) throw Error(Errc::corrupt, "chunk has the wrong size");
-  if (!ref.packed) return data;
+  if (!ref.packed) return {data, ByteView(*data)};
   if (std::uint64_t{ref.piece} + ref.size > data->size()) throw Error(Errc::corrupt, "piece outside its pack");
-  return std::make_shared<const Bytes>(data->begin() + ref.piece, data->begin() + ref.piece + ref.size);
+  return {data, ByteView(*data).subspan(ref.piece, ref.size)};
 }
 
 Bytes Filesystem::load_chunk(InodeId ino, std::uint64_t index) {
   std::optional<ChunkRef> ref = meta_.chunk(ino, index);
   if (!ref) return {};
-  return *read_chunk(*ref);
+  ByteView data = read_chunk(*ref).data;
+  return Bytes(data.begin(), data.end());
 }
 
 bool Filesystem::has_data(InodeId ino, std::uint64_t index) const {
@@ -816,8 +817,8 @@ std::optional<std::pair<ChunkRef, std::optional<ChunkUser>>> Filesystem::find_du
       // A pack records no identity for its pieces: compare the bytes (a
       // small file's, from a pack the cache usually still holds).
       if (std::uint64_t{t->piece} + size > info.uncompressed_size) return std::nullopt;
-      std::shared_ptr<const Bytes> piece = read_chunk(ref);
-      if (!std::equal(piece->begin(), piece->end(), data.begin(), data.end())) return std::nullopt;
+      ByteView piece = read_chunk(ref).data;
+      if (!std::equal(piece.begin(), piece.end(), data.begin(), data.end())) return std::nullopt;
     }
   } catch (const Error&) {
     return std::nullopt;
@@ -917,11 +918,8 @@ void Filesystem::forget(InodeId ino, std::uint64_t count) {
   std::unique_lock lock(mutex_);
   {
     std::lock_guard counts(counts_mutex_);
-    auto it = lookups_.find(ino);
-    if (it == lookups_.end()) return;
-    it->second = it->second > count ? it->second - count : 0;
-    if (it->second != 0) return;
-    lookups_.erase(it);
+    std::optional<std::uint64_t> left = lookups_.drop(ino, count);
+    if (!left || *left != 0) return;
   }
   maybe_free(ino);
 }
@@ -1177,17 +1175,15 @@ void Filesystem::open(InodeId ino) {
   std::shared_lock lock(mutex_);
   get(ino);
   std::lock_guard counts(counts_mutex_);
-  ++opens_[ino];
+  opens_.add(ino);
 }
 
 void Filesystem::release(InodeId ino) {
   std::unique_lock lock(mutex_);
   {
     std::lock_guard counts(counts_mutex_);
-    auto it = opens_.find(ino);
-    if (it == opens_.end()) return;
-    if (--it->second != 0) return;
-    opens_.erase(it);
+    std::optional<std::uint64_t> left = opens_.drop(ino, 1);
+    if (!left || *left != 0) return;
   }
   maybe_free(ino);
 }
@@ -1209,10 +1205,10 @@ std::size_t Filesystem::read(InodeId ino, std::uint64_t offset, MutableByteView 
     std::size_t len = static_cast<std::size_t>(std::min<std::uint64_t>(n - done, cs - within));
     std::uint8_t* dst = out.data() + done;
     // Newest data first: uncommitted writes, then stored chunks, then holes.
-    const Bytes* source = nullptr;
-    std::shared_ptr<const Bytes> stored;
+    std::optional<ByteView> source;
+    StoredChunk stored;
     if (dirty != dirty_.end()) {
-      if (auto c = dirty->second.find(index); c != dirty->second.end()) source = &c->second;
+      if (auto c = dirty->second.find(index); c != dirty->second.end()) source = ByteView(c->second);
     }
     if (!source) {
       if (std::optional<ChunkRef> c = meta_.chunk(ino, index)) {
@@ -1229,7 +1225,7 @@ std::size_t Filesystem::read(InodeId ino, std::uint64_t offset, MutableByteView 
                        static_cast<unsigned long long>(index * cs + c->size - 1), e.what());
           throw;
         }
-        source = stored.get();
+        source = stored.data;
       }
     }
     std::size_t have = source && source->size() > within ? std::min(len, source->size() - within) : 0;

@@ -523,6 +523,9 @@ std::optional<std::uint64_t> parse_size(std::string_view text) {
 // budgets come to 512 MiB. Two arenas, and trimming them every 2 seconds,
 // keep it near 600 MiB, and reads no slower (KNOWLEDGE.md §14).
 constexpr int kArenas = 2;
+// Request threads: each holds a 1 MiB buffer for writes and one for reads.
+// 8 keep 4 CPUs busy with parallel reads (KNOWLEDGE.md §14); 16 cost 16 MiB more.
+constexpr unsigned kRequestThreads = 8;
 constexpr auto kTrimInterval = std::chrono::seconds(2);
 
 std::jthread start_trimming() {
@@ -677,7 +680,7 @@ int main(int argc, char** argv) {
         std::jthread trimming = start_trimming();
         fuse_loop_config* config = fuse_loop_cfg_create();
         fuse_loop_cfg_set_clone_fd(config, 0);
-        fuse_loop_cfg_set_max_threads(config, 16);
+        fuse_loop_cfg_set_max_threads(config, kRequestThreads);
         rc = fuse_session_loop_mt(se, config) == 0 ? 0 : 1;
         fuse_loop_cfg_destroy(config);
       }
